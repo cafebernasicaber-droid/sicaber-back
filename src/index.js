@@ -8,7 +8,7 @@ const app = express();
 // localhost (cualquier puerto) y los túneles de VS Code Ports/Codespaces
 // (dominio "https://<id-aleatorio>-<puerto>.app.github.dev", donde el
 // <id-aleatorio> cambia cada vez que se reinicia el túnel).
-const CORS_ORIGENES_ESTATICOS = ['http://localhost:3000', 'http://localhost:5000'];
+const CORS_ORIGENES_ESTATICOS = ['http://localhost:3000', 'http://localhost:5000', 'https://sicaber-front.onrender.com'];
 const CORS_REGEX_LOCALHOST = /^http:\/\/localhost:\d+$/;
 const CORS_REGEX_TUNNEL = /^https:\/\/[a-z0-9-]+\.app\.github\.dev$/;
 
