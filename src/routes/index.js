@@ -10,7 +10,119 @@ const { passwordValida, PASSWORD_ERROR } = require('../config/passwordPolicy');
 const r = express.Router();
 
 // ── ROLES ──────────────────────────────────────────────────
-r.use('/roles', crud('roles', ['nombre', 'descripcion', 'permisos']));
+// Antes esto era un CRUD genérico (crud('roles', [...])), que no validaba
+// absolutamente nada del lado del servidor — todas estas reglas (nombre
+// obligatorio, solo letras/números/espacios, nombre único, al menos un
+// permiso, no borrar un rol con usuarios asignados) solo existían en
+// RolForm.jsx/RolesPage.jsx del frontend, así que se podían saltar por
+// completo llamando la API directamente (ej. con curl/Postman). Este router
+// propio replica esas mismas reglas acá.
+//
+// La tabla "roles" (ver schema.sql) ya tiene nombre, descripcion, permisos
+// y created_at — los campos que pide la historia de usuario de "crear rol"
+// además del nombre — así que no hace falta ninguna migración para este
+// punto, solo las validaciones de abajo.
+const ROL_NOMBRE_REGEX = /^[a-zA-Z0-9À-ÿñÑ\s]+$/;
+
+// usuarios.rol NO es una FK al id de "roles": guarda el NOMBRE del rol como
+// texto plano (ver usrRouter/empRouter más abajo, que siempre insertan
+// "rol" con el nombre tal cual, nunca un id) — así que "¿hay usuarios con
+// este rol?" se resuelve comparando por nombre (sin distinguir mayúsculas),
+// no por una FK.
+const contarUsuariosConRol = async (nombreRol) => {
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM usuarios WHERE lower(rol) = lower($1)`, [nombreRol]);
+  return rows[0].n;
+};
+
+const rolNombreDuplicado = async (nombre, excluirId) => {
+  const params = excluirId ? [nombre, excluirId] : [nombre];
+  const cond = excluirId ? 'lower(nombre)=lower($1) AND id<>$2' : 'lower(nombre)=lower($1)';
+  const { rows } = await pool.query(`SELECT id FROM roles WHERE ${cond} LIMIT 1`, params);
+  return !!rows[0];
+};
+
+// Mismas reglas que el formulario del frontend, para POST y PUT:
+//   - nombre obligatorio (no solo espacios)
+//   - nombre solo letras/números/espacios (con acentos y ñ)
+//   - permisos: array con al menos un elemento
+// La duplicidad del nombre se revisa aparte (necesita await a la base de
+// datos, y en el PUT necesita excluir el propio id).
+const validarRolBody = (body) => {
+  const nombre = String(body.nombre ?? '').trim();
+  if (!nombre) return 'El nombre del rol es obligatorio.';
+  if (!ROL_NOMBRE_REGEX.test(nombre)) return 'El nombre del rol solo puede contener letras, números y espacios.';
+  if (!Array.isArray(body.permisos) || body.permisos.length === 0) return 'Selecciona al menos un permiso.';
+  return null;
+};
+
+const rolRouter = require('express').Router();
+rolRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
+rolRouter.get('/', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM roles ORDER BY id DESC');
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+rolRouter.get('/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM roles WHERE id=$1', [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+rolRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorValidacion = validarRolBody(req.body);
+    if (errorValidacion) return res.status(400).json({ error: errorValidacion });
+    const nombre = String(req.body.nombre).trim();
+    if (await rolNombreDuplicado(nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
+    }
+    const { rows } = await pool.query(
+      'INSERT INTO roles(nombre, descripcion, permisos) VALUES($1,$2,$3) RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos)]
+    );
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+rolRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorValidacion = validarRolBody(req.body);
+    if (errorValidacion) return res.status(400).json({ error: errorValidacion });
+    const nombre = String(req.body.nombre).trim();
+    if (await rolNombreDuplicado(nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
+    }
+    const { rows } = await pool.query(
+      'UPDATE roles SET nombre=$1, descripcion=$2, permisos=$3 WHERE id=$4 RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+// No se puede eliminar un rol que todavía tiene usuarios asignados — mismo
+// mensaje que ya usa el frontend (RolesPage.jsx), para que coincida
+// exactamente sin importar si el bloqueo lo hizo el frontend o el backend.
+rolRouter.delete('/:id', auth, async (req, res) => {
+  try {
+    const { rows: actual } = await pool.query('SELECT nombre FROM roles WHERE id=$1', [req.params.id]);
+    if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
+    const n = await contarUsuariosConRol(actual[0].nombre);
+    if (n > 0) {
+      return res.status(409).json({ error: `No se puede eliminar: hay ${n} usuario(s) con este rol asignado.` });
+    }
+    await pool.query('DELETE FROM roles WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/roles', rolRouter);
 
 // ── USUARIOS ───────────────────────────────────────────────
 const usrRouter = require('express').Router();
@@ -380,10 +492,66 @@ const obtenerComboPorId = async (idNumerico) => {
   return { tipo: 'combo', ...rows[0] };
 };
 
+// "Descuento vigente": el mismo cálculo que ya hacía el frontend
+// (fecha_inicio_desc <= hoy <= fecha_fin_desc, con NULL = sin límite en ese
+// extremo) pero ahora también en el backend — filtrando por CURRENT_DATE
+// dentro de la propia consulta SQL, no solo en el navegador. Un producto
+// con fecha_inicio_desc en el futuro (o con fecha_fin_desc ya vencida) sale
+// SIEMPRE con descuento=0 en las rutas públicas, sin importar qué cliente
+// las consulte ni qué valor de "descuento" tenga guardado en la tabla —
+// así nunca se puede saltar esta regla llamando la API directo. La ruta de
+// administración (GET /productos/todos, autenticada) sigue devolviendo el
+// valor real de "descuento" tal como está guardado, porque ahí sí hace
+// falta verlo/editarlo aunque todavía no esté vigente.
+const DESCUENTO_VIGENTE_EXPR = `
+  CASE
+    WHEN descuento > 0
+     AND (fecha_inicio_desc IS NULL OR fecha_inicio_desc <= CURRENT_DATE)
+     AND (fecha_fin_desc   IS NULL OR fecha_fin_desc   >= CURRENT_DATE)
+    THEN descuento ELSE 0
+  END
+`;
+// Columnas explícitas de "productos" (ver schema.sql) con "descuento"
+// reemplazado por el cálculo de arriba — se listan a mano (en vez de
+// "SELECT *, ... AS descuento") porque repetir el nombre "descuento" como
+// alias de una columna que también viene de "*" produce dos columnas con
+// el mismo nombre en el resultado, y cuál de las dos "gana" en el objeto
+// final que arma node-postgres no es algo en lo que valga la pena confiar.
+const PRODUCTO_COLS_PUBLICO = `
+  id, nombre, categoria, precio, ${DESCUENTO_VIGENTE_EXPR} AS descuento,
+  fecha_inicio_desc, fecha_fin_desc, descripcion, imagen, estado, created_at
+`;
+
+// Nombre único de producto — la tabla ya tiene un UNIQUE real sobre
+// "nombre" (productos_nombre_key, ver schema.sql), así que Postgres igual
+// lo habría rechazado con 23505 (con el mensaje genérico "Producto ya
+// existe" que ya capturaba el catch de abajo). Esta validación explícita
+// no reemplaza esa restricción — la deja como red de seguridad final ante
+// una carrera entre dos inserciones simultáneas — pero sí da un mensaje
+// más claro y evita depender solo de adivinar el código de error de
+// Postgres para saber qué fue lo que falló.
+const productoNombreDuplicado = async (nombre, excluirId) => {
+  if (!nombre) return false;
+  const params = excluirId ? [nombre, excluirId] : [nombre];
+  const cond = excluirId ? 'lower(nombre)=lower($1) AND id<>$2' : 'lower(nombre)=lower($1)';
+  const { rows } = await pool.query(`SELECT id FROM productos WHERE ${cond} LIMIT 1`, params);
+  return !!rows[0];
+};
+
+// fecha_inicio_desc no puede ser posterior a fecha_fin_desc — sin este
+// chequeo, un producto podía quedar guardado con un rango de descuento
+// invertido (ej. inicio 20/08, fin 10/08) que jamás estaría vigente para
+// DESCUENTO_VIGENTE_EXPR de arriba, pero que el formulario del frontend no
+// bloqueaba si se llamaba la API directamente.
+const fechasDescuentoInvalidas = (inicio, fin) => {
+  if (!inicio || !fin) return false;
+  return new Date(inicio).getTime() > new Date(fin).getTime();
+};
+
 const prodRouter = require('express').Router();
 prodRouter.get('/', async (req, res) => {
   try {
-  const { rows } = await pool.query(`SELECT * FROM productos WHERE estado='Activo' ORDER BY id`);
+  const { rows } = await pool.query(`SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos WHERE estado='Activo' ORDER BY id`);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -407,7 +575,11 @@ prodRouter.get('/:id', async (req, res) => {
       if (!combo) return res.status(404).json({ error: 'Combo no encontrado' });
       return res.json(combo);
     }
-    const { rows } = await pool.query('SELECT * FROM productos WHERE id=$1', [identificador.id]);
+    // Ruta pública (sin auth, la usa el carrito del Landing): mismo
+    // criterio de "descuento vigente" que GET /productos, para que un
+    // producto con descuento programado a futuro no vuelva a aparecer con
+    // descuento>0 solo por consultarlo directo por id.
+    const { rows } = await pool.query(`SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos WHERE id=$1`, [identificador.id]);
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json({ tipo: 'producto', ...rows[0] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -415,6 +587,12 @@ prodRouter.get('/:id', async (req, res) => {
 prodRouter.post('/', auth, async (req, res) => {
   const { nombre, categoria, precio, descuento, fecha_inicio_desc, fecha_fin_desc, descripcion, imagen, estado } = req.body;
   try {
+    if (fechasDescuentoInvalidas(fecha_inicio_desc, fecha_fin_desc)) {
+      return res.status(400).json({ error: 'La fecha de inicio del descuento no puede ser posterior a la fecha de fin.' });
+    }
+    if (await productoNombreDuplicado(nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un producto con este nombre.' });
+    }
     const { rows } = await pool.query(
       `INSERT INTO productos(nombre,categoria,precio,descuento,fecha_inicio_desc,fecha_fin_desc,descripcion,imagen,estado)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
@@ -422,7 +600,7 @@ prodRouter.post('/', auth, async (req, res) => {
     );
     res.status(201).json(rows[0]);
   } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Producto ya existe' });
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un producto con este nombre.' });
     res.status(500).json({ error: e.message });
   }
 });
@@ -434,17 +612,58 @@ prodRouter.put('/:id', auth, async (req, res) => {
   if (!/^\d+$/.test(String(req.params.id))) return res.status(400).json({ error: `ID inválido: "${req.params.id}"` });
   try {
   const { nombre, categoria, precio, descuento, fecha_inicio_desc, fecha_fin_desc, descripcion, imagen, estado } = req.body;
+  if (fechasDescuentoInvalidas(fecha_inicio_desc, fecha_fin_desc)) {
+    return res.status(400).json({ error: 'La fecha de inicio del descuento no puede ser posterior a la fecha de fin.' });
+  }
+  if (await productoNombreDuplicado(nombre, req.params.id)) {
+    return res.status(400).json({ error: 'Ya existe un producto con este nombre.' });
+  }
   const { rows } = await pool.query(
     `UPDATE productos SET nombre=$1,categoria=$2,precio=$3,descuento=$4,fecha_inicio_desc=$5,fecha_fin_desc=$6,descripcion=$7,imagen=$8,estado=$9 WHERE id=$10 RETURNING *`,
     [nombre, categoria, precio, descuento || 0, fecha_inicio_desc || null, fecha_fin_desc || null, descripcion, imagen, estado, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
   res.json(rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un producto con este nombre.' });
+    res.status(500).json({ error: e.message });
+  }
 });
+// No se puede eliminar un producto que ya aparece en un pedido con el pago
+// confirmado (o en una venta registrada a partir de un pedido) — borrarlo
+// rompería el historial de ventas, que sigue guardando ese producto dentro
+// de "pedidos.items" (jsonb). Solo se puede desactivar (estado='Inactivo',
+// ver PATCH /:id/estado del CRUD genérico que sigue aplicando a otras
+// tablas, o el propio PUT de arriba).
+//
+// ⚠️ Límite real de este chequeo: busca el id del producto directamente en
+// "items" (it->>'id' / it->>'producto_id' / it->>'id_producto' — los
+// mismos nombres de campo que ya usa idProductoDeItem/parseIdentificadorProducto
+// más abajo en este archivo), así que sí detecta el caso normal (producto
+// pedido suelto). Si el producto SOLO se vendió como parte de un combo
+// (id del pedido = "combo-5", el id del producto nunca queda como campo
+// propio de ese ítem), este chequeo no lo detecta — no pude confirmar
+// desde este repo si eso pasa en la práctica, porque no hay pedidos con
+// combos vendidos en esta base de datos para inspeccionar.
+const productoAsociadoAVenta = async (productoId) => {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM pedidos p
+       WHERE (p.pago_confirmado = true OR EXISTS (SELECT 1 FROM ventas v WHERE v.pedido_id = p.id))
+         AND EXISTS (
+           SELECT 1 FROM jsonb_array_elements(p.items) it
+            WHERE (it->>'id') = $1::text OR (it->>'producto_id') = $1::text OR (it->>'id_producto') = $1::text
+         )
+       LIMIT 1`,
+    [productoId]
+  );
+  return !!rows[0];
+};
 prodRouter.delete('/:id', auth, async (req, res) => {
   if (!/^\d+$/.test(String(req.params.id))) return res.status(400).json({ error: `ID inválido: "${req.params.id}"` });
   try {
+  if (await productoAsociadoAVenta(req.params.id)) {
+    return res.status(409).json({ error: 'No se puede eliminar: este producto ya está asociado a una venta o a un pedido confirmado. Desactívalo en su lugar.' });
+  }
   await pool.query('DELETE FROM productos WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -465,7 +684,11 @@ r.use('/toppings',  crud('toppings',  ['nombre', 'productos_ids', 'estado', 'ins
 // insumo_id/cantidad: de qué insumo y cuánto descuenta del stock vender
 // esta adición (mismo mecanismo que toppings.insumo_id/cantidad, pero sin
 // override por producto — ver calcularRecetaEfectiva más abajo).
-r.use('/adiciones', crud('adiciones', ['nombre', 'precio', 'estado', 'insumo_id', 'cantidad']));
+// 'descripcion': el whitelist de campos de este crud() no la incluía, así
+// que aunque el formulario del frontend la capturaba y la mandaba, el
+// helper genérico la descartaba antes del INSERT/UPDATE — nunca llegaba a
+// guardarse (columna agregada en config/db.js).
+r.use('/adiciones', crud('adiciones', ['nombre', 'precio', 'estado', 'insumo_id', 'cantidad', 'descripcion']));
 
 // ── COMBOS ─────────────────────────────────────────────────
 const comboRouter = require('express').Router();
@@ -496,20 +719,26 @@ comboRouter.get('/:id', async (req, res) => {
 });
 comboRouter.post('/', auth, async (req, res) => {
   try {
-  const { nombre, descripcion, precio, imagen, items } = req.body;
+  // Antes: fechaInicio/fechaFin llegaban del formulario pero nunca se
+  // incluían en el INSERT — las columnas fecha_inicio/fecha_fin de la
+  // tabla (que sí existen) quedaban NULL para siempre sin importar qué
+  // fecha eligiera el admin.
+  const { nombre, descripcion, precio, imagen, items, fechaInicio, fechaFin } = req.body;
   const { rows } = await pool.query(
-    `INSERT INTO combos(nombre,descripcion,precio,imagen,items) VALUES($1,$2,$3,$4,$5) RETURNING *`,
-    [nombre, descripcion, precio, imagen, JSON.stringify(items || [])]
+    `INSERT INTO combos(nombre,descripcion,precio,imagen,items,fecha_inicio,fecha_fin)
+     VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [nombre, descripcion, precio, imagen, JSON.stringify(items || []), fechaInicio || null, fechaFin || null]
   );
   res.status(201).json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 comboRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { nombre, descripcion, precio, imagen, items } = req.body;
+  const { nombre, descripcion, precio, imagen, items, fechaInicio, fechaFin } = req.body;
   const { rows } = await pool.query(
-    `UPDATE combos SET nombre=$1,descripcion=$2,precio=$3,imagen=$4,items=$5 WHERE id=$6 RETURNING *`,
-    [nombre, descripcion, precio, imagen, JSON.stringify(items || []), req.params.id]
+    `UPDATE combos SET nombre=$1,descripcion=$2,precio=$3,imagen=$4,items=$5,fecha_inicio=$6,fecha_fin=$7
+     WHERE id=$8 RETURNING *`,
+    [nombre, descripcion, precio, imagen, JSON.stringify(items || []), fechaInicio || null, fechaFin || null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Combo no encontrado' });
   res.json(rows[0]);
@@ -1312,6 +1541,18 @@ r.use('/compras', compRouter);
 // pedido (ver PATCH /:id/estado más abajo).
 const ESTADOS_PEDIDO_ORDEN = ['pendiente_verificacion', 'pendiente', 'en_proceso', 'listo', 'entregado'];
 const IDX_EN_PROCESO = ESTADOS_PEDIDO_ORDEN.indexOf('en_proceso');
+// Único conjunto de valores válidos para pedidos.estado en TODA la API —
+// la secuencia de arriba más 'cancelado' (que no vive en la secuencia
+// porque se puede dar en cualquier punto, no en un paso fijo). Antes, esta
+// lista solo se exigía en PATCH /:id/estado — POST /pedidos (creación)
+// aceptaba cualquier string que mandara el cliente en "estado" (o
+// "_meta.estado") sin validar nada, así que una petición directa a la API
+// (sin pasar por el formulario del frontend) podía crear un pedido con un
+// "estado" inventado (ej. "stop", o cualquier typo) que después rompía
+// cualquier pantalla que comparara contra esta lista. Coincide exactamente
+// con el CHECK pedidos_estado_check de config/db.js/schema.sql, que es la
+// misma regla aplicada también a nivel de base de datos.
+const ESTADOS_PEDIDO_VALIDOS = [...ESTADOS_PEDIDO_ORDEN, 'cancelado'];
 
 // Único conjunto de métodos de pago válido para pedidos NUEVOS — coincide
 // con el CHECK pedidos_pago_check de config/db.js/schema.sql (agregado con
@@ -1619,7 +1860,18 @@ pedRouter.post('/', async (req, res) => {
     // pago igual queda sin confirmar (pago_confirmado=false) hasta que el
     // cajero lo confirme a mano (ver PATCH /:id/confirmar-pago) — sin eso,
     // el pedido no puede pasar a 'en_proceso' (preparación).
-    const estadoInicial = comprobanteImgFinal ? 'pendiente_verificacion' : (estado || meta.estado || 'pendiente');
+    //
+    // El "estado" que llega del body solo se valida (y se usa) en el caso
+    // sin comprobante — con comprobante siempre se pisa por
+    // 'pendiente_verificacion' de todas formas. Antes esto no se validaba
+    // en absoluto acá (solo en PATCH /:id/estado), así que una petición
+    // directa a la API podía crear un pedido con cualquier "estado"
+    // inventado — ver ESTADOS_PEDIDO_VALIDOS más arriba.
+    const estadoSolicitado = estado || meta.estado || null;
+    if (estadoSolicitado && !ESTADOS_PEDIDO_VALIDOS.includes(estadoSolicitado)) {
+      return res.status(400).json({ error: `Estado inválido: "${estadoSolicitado}". Debe ser uno de: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.` });
+    }
+    const estadoInicial = comprobanteImgFinal ? 'pendiente_verificacion' : (estadoSolicitado || 'pendiente');
 
     const { rows } = await pool.query(
       `INSERT INTO pedidos(cliente_id,numero,cliente,tipo,pago,mesa,total,items,comprobante,comprobante_img,comprobante_hash,origen,direccion_alternativa,hora,estado,barista,domiciliario,sede,local_id)
@@ -1730,8 +1982,8 @@ pedRouter.patch('/:id/estado', auth, async (req, res) => {
   const { estado } = req.body;
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  if (estado !== 'cancelado' && !ESTADOS_PEDIDO_ORDEN.includes(estado)) {
-    return res.status(400).json({ error: `Estado inválido: "${estado}"` });
+  if (!ESTADOS_PEDIDO_VALIDOS.includes(estado)) {
+    return res.status(400).json({ error: `Estado inválido: "${estado}". Debe ser uno de: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.` });
   }
   try {
     const { rows: actual } = await pool.query('SELECT estado, pago, pago_confirmado FROM pedidos WHERE id=$1', [id]);

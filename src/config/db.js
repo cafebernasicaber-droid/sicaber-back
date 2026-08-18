@@ -144,6 +144,11 @@ const migrar = async () => {
     // más abajo, guardada por su propio try/catch.
     `ALTER TABLE adiciones ADD COLUMN IF NOT EXISTS insumo_id INTEGER`,
     `ALTER TABLE adiciones ADD COLUMN IF NOT EXISTS cantidad NUMERIC(10,3) DEFAULT 0`,
+    // Adiciones: la tabla nunca tuvo columna "descripcion", aunque el
+    // formulario del frontend siempre la pedía, la validaba (máx. 20
+    // palabras) y la enviaba al guardar — se perdía en silencio porque no
+    // había dónde guardarla (mismo caso que insumos.descripcion arriba).
+    `ALTER TABLE adiciones ADD COLUMN IF NOT EXISTS descripcion TEXT`,
     // Pedidos: el cobro debe quedar confirmado antes de que el pedido
     // pueda pasar a 'en_proceso' — ver PATCH /pedidos/:id/estado,
     // /comprobante/aprobar y /confirmar-pago en routes/index.js.
@@ -307,6 +312,17 @@ const migrar = async () => {
     // en línea por el mismo motivo que toppings.insumo_id: la FK real se
     // agrega aparte más abajo, guardada por su propio try/catch.
     `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS local_id INTEGER`,
+    // Reclasifica cualquier pedido con un "estado" fuera del flujo real
+    // (pendiente_verificacion, pendiente, en_proceso, listo, entregado,
+    // cancelado) — por ejemplo un valor tipo "stop" u otro dato/typo suelto
+    // que se haya guardado alguna vez sin pasar por la validación de
+    // ESTADOS_PEDIDO_VALIDOS de routes/index.js (esa validación es nueva:
+    // antes POST /pedidos no exigía nada sobre "estado" al crear un
+    // pedido). Se reclasifica a 'cancelado' — no se borra el pedido, para
+    // no perder su historial — y corre en cada arranque: si no hay ningún
+    // valor fuera de lista, es un UPDATE de 0 filas, no hace nada.
+    `UPDATE pedidos SET estado = 'cancelado'
+       WHERE estado NOT IN ('pendiente_verificacion','pendiente','en_proceso','listo','entregado','cancelado')`,
   ];
   for (const sql of alters) {
     try { await pool.query(sql); }
@@ -373,19 +389,35 @@ const migrar = async () => {
   // Mismo tratamiento para pedidos.local_id: se crea aparte y sin detener
   // el arranque si falla (p. ej. si ya hay pedidos con un local_id que ya
   // no corresponde a ningún local existente).
+  //
+  // Se revisa además confdeltype (la regla ON DELETE real de la FK, no solo
+  // si existe): una instalación donde esta FK se llegó a crear ANTES de que
+  // el ALTER TABLE de abajo incluyera "ON DELETE SET NULL" se quedó con la
+  // constraint ya creada bajo ese nombre pero sin esa regla (ON DELETE NO
+  // ACTION, el default de Postgres) — y como el chequeo de antes solo
+  // miraba "¿existe una constraint con este nombre?", nunca la corregía en
+  // ningún arranque siguiente. Sin ON DELETE SET NULL, borrar un local que
+  // todavía tuviera pedidos apuntándole fallaría con una violación de FK en
+  // vez de dejar esos pedidos con local_id=NULL. 'n' = SET NULL (ver
+  // confdeltype en la documentación de pg_constraint).
   try {
     const { rows } = await pool.query(
-      `SELECT 1 FROM information_schema.table_constraints
-        WHERE constraint_name = 'pedidos_local_id_fkey'`
+      `SELECT confdeltype FROM pg_constraint WHERE conname = 'pedidos_local_id_fkey'`
     );
     if (rows.length === 0) {
       await pool.query(
         `ALTER TABLE pedidos ADD CONSTRAINT pedidos_local_id_fkey
            FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE SET NULL`
       );
+    } else if (rows[0].confdeltype !== 'n') {
+      await pool.query(`ALTER TABLE pedidos DROP CONSTRAINT pedidos_local_id_fkey`);
+      await pool.query(
+        `ALTER TABLE pedidos ADD CONSTRAINT pedidos_local_id_fkey
+           FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE SET NULL`
+      );
     }
   } catch (e) {
-    console.error('⚠️  No se pudo crear la FK pedidos_local_id_fkey (la columna local_id sigue utilizable sin ella):', e.message);
+    console.error('⚠️  No se pudo crear/corregir la FK pedidos_local_id_fkey (la columna local_id sigue utilizable sin ella):', e.message);
   }
 
   // Mismo tratamiento para la FK de producto_id: se crea aparte y sin
@@ -489,6 +521,35 @@ const migrar = async () => {
     );
   } catch (e) {
     console.error('⚠️  No se pudo recrear el CHECK pedidos_pago_check:', e.message);
+  }
+
+  // Único conjunto de valores válidos para pedidos.estado a nivel de base de
+  // datos — mismo conjunto que ESTADOS_PEDIDO_VALIDOS en routes/index.js
+  // (la fuente de verdad real, la que valida POST /pedidos y PATCH
+  // /:id/estado). Este CHECK es la última línea de defensa: aunque alguien
+  // llame a Postgres directo (o una futura ruta se olvide de validar), la
+  // base de datos igual rechaza cualquier "estado" que no sea uno de estos
+  // 6 valores — así ya no puede volver a colarse algo como "stop" (o
+  // cualquier otro typo) en esta columna.
+  //
+  // Sin NOT VALID a propósito, a diferencia de pedidos_pago_check: el paso
+  // de arriba (dentro de "alters") ya reclasificó a 'cancelado' cualquier
+  // fila que no cumpliera esta lista, así que para cuando se llega acá
+  // todas las filas existentes ya son válidas y Postgres puede validarlas
+  // de una vez sin que el CHECK falle al crearse.
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'pedidos_estado_check'`
+    );
+    if (rows.length === 0) {
+      await pool.query(
+        `ALTER TABLE pedidos ADD CONSTRAINT pedidos_estado_check
+           CHECK (estado IN ('pendiente_verificacion','pendiente','en_proceso','listo','entregado','cancelado'))`
+      );
+    }
+  } catch (e) {
+    console.error('⚠️  No se pudo crear el CHECK pedidos_estado_check (probablemente hay pedidos con un estado fuera de lista que la reclasificación de arriba no cubrió) :', e.message);
   }
 };
 
