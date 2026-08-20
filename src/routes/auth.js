@@ -9,6 +9,9 @@ const { auth } = require('../middleware/auth');
 // de campo, en vez de un subconjunto recortado.
 const { CLIENTE_COLS } = require('../config/clienteCols');
 const { passwordValida, PASSWORD_ERROR } = require('../config/passwordPolicy');
+// Validaciones compartidas de texto (ver config/validaciones.js): nombre no
+// vacío / no solo espacios y tope de longitud en el registro de clientes.
+const { textoLimpio, nombreNormalizado, errorNombre, LIMITES } = require('../config/validaciones');
 const { enviarTokenRegistro, enviarTokenRecuperacion } = require('../services/mailer');
 
 const sign = (payload) => jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
@@ -20,7 +23,7 @@ router.post('/login', async (req, res) => {
   const { username, password } = req.body;
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM usuarios WHERE username=$1 OR correo=$1 OR nombre ILIKE $1',
+      'SELECT * FROM usuarios WHERE lower(username)=lower($1) OR lower(correo)=lower($1) OR nombre ILIKE $1',
       [username]
     );
     if (!rows[0]) return res.status(401).json({ error: 'Credenciales inválidas' });
@@ -37,8 +40,25 @@ router.post('/login', async (req, res) => {
 
 // ── CLIENTE REGISTRO — envía token al correo ───────────────────────────────
 router.post('/cliente/registro', async (req, res) => {
-  const { nombre, correo, password, telefono, username, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion } = req.body;
+  const {
+    nombre: nombre_, correo: correo_, username: username_,
+    password, telefono, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion,
+  } = req.body;
   try {
+    // El nombre nunca se revisaba: un registro con nombre = "   " quedaba
+    // guardado tal cual. El correo se normaliza a minúsculas porque es la
+    // llave de inicio de sesión y del envío del token de verificación:
+    // "ana@gmail.com" y "Ana@Gmail.com" son la MISMA cuenta, pero antes se
+    // registraban dos veces.
+    const errorNom = errorNombre(nombre_, 'El nombre', LIMITES.NOMBRE);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(nombre_);
+
+    const correo = textoLimpio(correo_).toLowerCase();
+    if (!correo) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
+
+    const username = username_ ? nombreNormalizado(username_) : null;
+
     // El campo "Otros" del tipo de documento siempre debe llegar ya resuelto
     // al nombre real que escribió el usuario (ej. "Pasaporte"); si llega el
     // valor literal "Otros" es que el frontend no lo resolvió o alguien
@@ -49,10 +69,12 @@ router.post('/cliente/registro', async (req, res) => {
 
     // Verificar duplicados. El correo se valida aparte porque es el caso
     // más común y necesita un mensaje claro y específico.
-    const existeCorreo = await pool.query('SELECT id FROM clientes WHERE correo=$1', [correo]);
+    // lower() a ambos lados: así también se detectan las cuentas viejas que
+    // ya quedaron guardadas con mayúsculas antes de esta corrección.
+    const existeCorreo = await pool.query('SELECT id FROM clientes WHERE lower(correo)=lower($1)', [correo]);
     if (existeCorreo.rows[0]) return res.status(400).json({ error: 'Este correo electrónico ya se encuentra registrado.' });
     if (username) {
-      const existeUser = await pool.query('SELECT id FROM clientes WHERE username=$1', [username]);
+      const existeUser = await pool.query('SELECT id FROM clientes WHERE lower(username)=lower($1)', [username]);
       if (existeUser.rows[0]) return res.status(400).json({ error: 'Ese nombre de usuario ya está en uso.' });
     }
 
@@ -87,17 +109,17 @@ router.post('/cliente/verificar', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT * FROM tokens_verificacion 
-       WHERE correo=$1 AND token=$2 AND tipo='registro' AND usado=false AND expires_at > NOW()`,
+       WHERE lower(correo)=lower($1) AND token=$2 AND tipo='registro' AND usado=false AND expires_at > NOW()`,
       [correo, token]
     );
     if (!rows[0]) return res.status(400).json({ error: 'Código inválido o expirado.' });
 
     // Marcar verificado
-    await pool.query('UPDATE clientes SET verificado=true WHERE correo=$1', [correo]);
+    await pool.query('UPDATE clientes SET verificado=true WHERE lower(correo)=lower($1)', [correo]);
     await pool.query('UPDATE tokens_verificacion SET usado=true WHERE id=$1', [rows[0].id]);
 
     // Devolver JWT
-    const cli = await pool.query('SELECT * FROM clientes WHERE correo=$1', [correo]);
+    const cli = await pool.query('SELECT * FROM clientes WHERE lower(correo)=lower($1)', [correo]);
     const c = cli.rows[0];
     const jwtToken = sign({ id: c.id, correo: c.correo, rol: 'Cliente' });
     res.json({ token: jwtToken, cliente: { id: c.id, nombre: c.nombre, correo: c.correo } });
@@ -109,7 +131,7 @@ router.post('/cliente/login', async (req, res) => {
   const { correo, password } = req.body; // correo puede ser correo, username o nombre
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM clientes WHERE correo=$1 OR username=$1 OR nombre ILIKE $1',
+      'SELECT * FROM clientes WHERE lower(correo)=lower($1) OR lower(username)=lower($1) OR nombre ILIKE $1',
       [correo]
     );
     if (!rows[0]) return res.status(401).json({ error: 'Credenciales inválidas' });
@@ -132,7 +154,7 @@ router.post('/cliente/login', async (req, res) => {
 router.post('/cliente/recuperar', async (req, res) => {
   const { correo } = req.body;
   try {
-    const { rows } = await pool.query('SELECT id,nombre FROM clientes WHERE correo=$1', [correo]);
+    const { rows } = await pool.query('SELECT id,nombre FROM clientes WHERE lower(correo)=lower($1)', [correo]);
     if (!rows[0]) return res.status(404).json({ error: 'No existe una cuenta con ese correo.' });
 
     const token = genToken();
@@ -153,13 +175,13 @@ router.post('/cliente/reset-password', async (req, res) => {
 
     const { rows } = await pool.query(
       `SELECT * FROM tokens_verificacion
-       WHERE correo=$1 AND token=$2 AND tipo='recuperacion' AND usado=false AND expires_at > NOW()`,
+       WHERE lower(correo)=lower($1) AND token=$2 AND tipo='recuperacion' AND usado=false AND expires_at > NOW()`,
       [correo, token]
     );
     if (!rows[0]) return res.status(400).json({ error: 'Código inválido o expirado.' });
 
     const hash = await bcrypt.hash(nuevaPassword, 10);
-    await pool.query('UPDATE clientes SET password=$1 WHERE correo=$2', [hash, correo]);
+    await pool.query('UPDATE clientes SET password=$1 WHERE lower(correo)=lower($2)', [hash, correo]);
     await pool.query('UPDATE tokens_verificacion SET usado=true WHERE id=$1', [rows[0].id]);
 
     res.json({ mensaje: 'Contraseña actualizada correctamente.' });

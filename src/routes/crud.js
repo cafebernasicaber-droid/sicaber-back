@@ -5,13 +5,60 @@ const router = require('express').Router;
 const pool   = require('../config/db');
 const { auth } = require('../middleware/auth');
 const validateId = require('../middleware/validateId');
+const {
+  nombreNormalizado, errorNombre, errorLongitud, nombreDuplicado, LIMITES,
+} = require('../config/validaciones');
 
 // Devuelve un router con GET/POST/PUT/DELETE para una tabla
-const crud = (table, fields) => {
+//
+// `opciones` (tercer parámetro, OPCIONAL — sin él el comportamiento es
+// exactamente el de antes, para no alterar ningún uso existente):
+//   {
+//     etiqueta:      'La categoría',   // cómo se nombra el registro en los mensajes
+//     validarNombre: true,             // exige nombre no vacío / no solo espacios
+//     maxNombre:     100,              // tope de caracteres del nombre
+//     nombreUnico:   true,             // rechaza duplicados ignorando may/min y espacios
+//     limites:       { descripcion: 500 },  // topes de otros campos de texto
+//   }
+const crud = (table, fields, opciones = {}) => {
   const r = router();
   const cols  = fields.join(', ');
   const nums  = fields.map((_, i) => `$${i + 1}`).join(', ');
   const sets  = fields.map((f, i) => `${f}=$${i + 1}`).join(', ');
+
+  const {
+    etiqueta      = 'El nombre',
+    validarNombre = false,
+    maxNombre     = LIMITES.NOMBRE_CORTO,
+    nombreUnico   = false,
+    limites       = {},
+  } = opciones;
+
+  // Corre las validaciones configuradas y devuelve el mensaje de error, o
+  // null si todo está bien. `excluirId` solo se usa en el PUT.
+  const validarBody = async (body, excluirId = null) => {
+    if (validarNombre) {
+      const err = errorNombre(body.nombre, etiqueta, maxNombre);
+      if (err) return err;
+    }
+    for (const [campo, max] of Object.entries(limites)) {
+      const err = errorLongitud(body[campo], `El campo "${campo}"`, max);
+      if (err) return err;
+    }
+    if (nombreUnico && await nombreDuplicado(pool, table, body.nombre, excluirId)) {
+      return `Ya existe un registro con ese nombre.`;
+    }
+    return null;
+  };
+
+  // Guarda el nombre ya normalizado (sin espacios sobrantes al inicio, al
+  // final, ni repetidos en medio), para que la detección de duplicados de
+  // arriba siga siendo consistente con lo que quedó realmente en la tabla.
+  const normalizarBody = (body) => {
+    if (!validarNombre && !nombreUnico) return body;
+    if (body.nombre === undefined || body.nombre === null) return body;
+    return { ...body, nombre: nombreNormalizado(body.nombre) };
+  };
 
   // Todas las tablas usadas con este CRUD genérico (roles, categorias,
   // toppings, adiciones) tienen id integer/SERIAL. Valida el :id antes de
@@ -39,31 +86,38 @@ const crud = (table, fields) => {
   const toDbValue = (v) => (v !== null && typeof v === 'object') ? JSON.stringify(v) : v;
 
   r.post('/', auth, async (req, res) => {
-    const vals = fields.map(f => toDbValue(req.body[f] ?? null));
     try {
+      const errorValidacion = await validarBody(req.body, null);
+      if (errorValidacion) return res.status(400).json({ error: errorValidacion });
+
+      const body = normalizarBody(req.body);
+      const vals = fields.map(f => toDbValue(body[f] ?? null));
       const { rows } = await pool.query(
         `INSERT INTO ${table}(${cols}) VALUES(${nums}) RETURNING *`, vals
       );
       res.status(201).json(rows[0]);
     } catch (e) {
-      // 🔍 DEBUG TEMPORAL: si vuelve a fallar, esto imprime en la consola
-      // del servidor exactamente qué valores se intentaron insertar.
-      // Bórralo una vez confirmes que ya funciona.
-      console.error(`[crud:${table}] INSERT falló`, { body: req.body, vals, dbError: e.message });
       if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese nombre' });
       res.status(500).json({ error: e.message });
     }
   });
 
   r.put('/:id', auth, async (req, res) => {
-    const vals = [...fields.map(f => toDbValue(req.body[f] ?? null)), req.params.id];
     try {
+      const errorValidacion = await validarBody(req.body, req.params.id);
+      if (errorValidacion) return res.status(400).json({ error: errorValidacion });
+
+      const body = normalizarBody(req.body);
+      const vals = [...fields.map(f => toDbValue(body[f] ?? null)), req.params.id];
       const { rows } = await pool.query(
         `UPDATE ${table} SET ${sets} WHERE id=$${fields.length + 1} RETURNING *`, vals
       );
       if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
       res.json(rows[0]);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) {
+      if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese nombre' });
+      res.status(500).json({ error: e.message });
+    }
   });
 
   r.patch('/:id/estado', auth, async (req, res) => {
