@@ -149,6 +149,41 @@ const migrar = async () => {
     // palabras) y la enviaba al guardar — se perdía en silencio porque no
     // había dónde guardarla (mismo caso que insumos.descripcion arriba).
     `ALTER TABLE adiciones ADD COLUMN IF NOT EXISTS descripcion TEXT`,
+    // Adiciones: fecha de última actualización, para que el panel admin
+    // pueda mostrarla junto a created_at (ver GET /adiciones, que ya expone
+    // ambas con el SELECT * genérico de crud.js). Se completa con un
+    // trigger (más abajo) en vez de fijarla a mano en cada UPDATE de
+    // routes/index.js/crud.js: así queda garantizada SIEMPRE que la fila
+    // cambie, sin importar por qué ruta (o herramienta externa) se haga el
+    // UPDATE. Arranca en NULL para las filas existentes; el backfill de
+    // abajo la deja igual a created_at para que nunca se vea "más vieja"
+    // que la fecha de creación.
+    `ALTER TABLE adiciones ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP`,
+    `UPDATE adiciones SET updated_at = created_at WHERE updated_at IS NULL`,
+    // Función genérica reutilizable por cualquier tabla que necesite el
+    // mismo "updated_at automático" más adelante (no solo adiciones) — solo
+    // asume que la tabla tiene una columna updated_at.
+    `CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $f$
+       BEGIN
+         NEW.updated_at = NOW();
+         RETURN NEW;
+       END;
+     $f$ LANGUAGE plpgsql`,
+    // CREATE OR REPLACE no existe para triggers, así que se elimina primero
+    // (si ya existía) y se vuelve a crear — ambos pasos son idempotentes y
+    // corren en cada arranque sin problema.
+    `DROP TRIGGER IF EXISTS adiciones_set_updated_at ON adiciones`,
+    `CREATE TRIGGER adiciones_set_updated_at
+       BEFORE UPDATE ON adiciones
+       FOR EACH ROW EXECUTE FUNCTION set_updated_at()`,
+    // Combos: fecha_inicio/fecha_fin nunca se creaban en ninguna migración
+    // (solo existían en el esquema si alguien las agregó a mano en la base
+    // de datos) aunque POST/PUT /combos en routes/index.js siempre las
+    // insertaba/actualizaba — en una instalación nueva ese INSERT habría
+    // fallado con "no existe la columna «fecha_inicio»". Se agregan aquí,
+    // igual que cualquier otra columna que el código ya asume que existe.
+    `ALTER TABLE combos ADD COLUMN IF NOT EXISTS fecha_inicio DATE`,
+    `ALTER TABLE combos ADD COLUMN IF NOT EXISTS fecha_fin DATE`,
     // Pedidos: el cobro debe quedar confirmado antes de que el pedido
     // pueda pasar a 'en_proceso' — ver PATCH /pedidos/:id/estado,
     // /comprobante/aprobar y /confirmar-pago en routes/index.js.
