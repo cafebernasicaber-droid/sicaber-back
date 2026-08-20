@@ -851,9 +851,22 @@ r.use('/adiciones', crud('adiciones', ['nombre', 'precio', 'estado', 'insumo_id'
 // ── COMBOS ─────────────────────────────────────────────────
 const comboRouter = require('express').Router();
 comboRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
+// Catálogo público (Landing). Mismo criterio que PRODUCTO_COLS_PUBLICO /
+// DESCUENTO_VIGENTE_EXPR arriba: un combo con fecha_inicio en el futuro es
+// un combo "programado" y no debe verse ni pedirse todavía, aunque su
+// estado ya esté en 'Activo' — fecha_inicio NULL significa "sin fecha de
+// inicio programada", así que se muestra de una vez. GET /combos/todos
+// (autenticado, panel admin) sigue devolviendo todos los combos activos
+// tal cual, con y sin fecha futura, para que el admin los vea como
+// "programados" antes de que empiecen a mostrarse al público.
 comboRouter.get('/', async (req, res) => {
   try {
-  const { rows } = await pool.query(`SELECT * FROM combos WHERE estado='Activo' ORDER BY id`);
+  const { rows } = await pool.query(
+    `SELECT * FROM combos
+      WHERE estado='Activo'
+        AND (fecha_inicio IS NULL OR fecha_inicio <= CURRENT_DATE)
+      ORDER BY id`
+  );
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
