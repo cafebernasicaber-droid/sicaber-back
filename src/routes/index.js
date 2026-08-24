@@ -950,13 +950,53 @@ r.use('/combos', comboRouter);
 // (ProveedorForm.jsx, ProveedoresPage.jsx) ya esperaba ambos contratos
 // (duplicateFields, { ok, insumosEliminados, nombresInsumos }) — solo
 // faltaba implementarlos aquí.
-const PROVEEDOR_FIELDS = ['nombre', 'nit', 'telefono', 'correo', 'direccion', 'ciudad', 'observaciones', 'estado'];
+// [columna en la BD, clave que manda el formulario] — nombres, apellidos y
+// los campos heredados coinciden en ambos lados; tipoPersona/tipoDocumento/
+// numeroDocumento son snake_case en la BD pero camelCase en el payload.
+const PROVEEDOR_FIELD_MAP = [
+  ['nombre', 'nombre'], ['nit', 'nit'], ['telefono', 'telefono'], ['correo', 'correo'],
+  ['direccion', 'direccion'], ['ciudad', 'ciudad'], ['observaciones', 'observaciones'], ['estado', 'estado'],
+  ['tipo_persona', 'tipoPersona'], ['nombres', 'nombres'], ['apellidos', 'apellidos'],
+  ['tipo_documento', 'tipoDocumento'], ['numero_documento', 'numeroDocumento'],
+];
+const PROVEEDOR_FIELDS = PROVEEDOR_FIELD_MAP.map(([col]) => col);
 
-// Revisa nombre/nit/correo/teléfono uno por uno para poder señalar
-// exactamente cuál está duplicado (excluyendo el propio registro al editar).
-const buscarDuplicadosProveedor = async ({ nombre, nit, telefono, correo }, excluirId) => {
+// Revisa nombre/correo/teléfono siempre; NIT solo si es Persona Jurídica,
+// número de documento solo si es Persona Natural (con el mismo tipo de
+// documento) — mismo alcance que ya usa el frontend en su verificación
+// local antes de enviar. Acumula TODOS los conflictos a la vez (no se
+// detiene en el primero) para poder mostrarlos todos juntos, tal como se
+// pidió para los 3 módulos.
+const buscarDuplicadosProveedor = async ({ nombre, nit, telefono, correo, tipoPersona, tipoDocumento, numeroDocumento }, excluirId) => {
   const dup = [];
-  const checks = [['nombre', nombre], ['nit', nit], ['telefono', telefono], ['correo', correo]];
+  const checks = [['nombre', nombre], ['telefono', telefono], ['correo', correo]];
+
+  // El NIT vive en el mismo espacio de identificación sin importar si
+  // viene de un proveedor Jurídico (columna nit) o de uno Natural que
+  // eligió "NIT" como tipo de documento (columna numero_documento) —
+  // antes cada uno se comparaba solo contra su propia columna, así que
+  // un mismo NIT se podía repetir cruzando de un lado al otro.
+  const nitDelRegistro = tipoPersona === 'Natural' ? (tipoDocumento === 'NIT' ? numeroDocumento : null) : nit;
+  if (nitDelRegistro) {
+    const params = excluirId ? [nitDelRegistro, excluirId] : [nitDelRegistro];
+    const cond = excluirId
+      ? `(nit=$1 OR (numero_documento=$1 AND tipo_documento='NIT')) AND id<>$2`
+      : `(nit=$1 OR (numero_documento=$1 AND tipo_documento='NIT'))`;
+    const { rows } = await pool.query(`SELECT id FROM proveedores WHERE ${cond} LIMIT 1`, params);
+    if (rows[0]) dup.push(tipoPersona === 'Natural' ? 'numeroDocumento' : 'nit');
+  }
+
+  // El resto de tipos de documento (CC, TI, CE, Pasaporte) sí quedan
+  // separados por tipo — solo NIT comparte espacio entre Natural y
+  // Jurídica.
+  if (tipoPersona === 'Natural' && tipoDocumento !== 'NIT' && numeroDocumento) {
+    const params = excluirId ? [numeroDocumento, tipoDocumento, excluirId] : [numeroDocumento, tipoDocumento];
+    const cond = excluirId
+      ? `numero_documento=$1 AND tipo_documento=$2 AND tipo_persona='Natural' AND id<>$3`
+      : `numero_documento=$1 AND tipo_documento=$2 AND tipo_persona='Natural'`;
+    const { rows } = await pool.query(`SELECT id FROM proveedores WHERE ${cond} LIMIT 1`, params);
+    if (rows[0]) dup.push('numeroDocumento');
+  }
   for (const [campo, valor] of checks) {
     if (!valor) continue;
     const params = excluirId ? [valor, excluirId] : [valor];
@@ -967,16 +1007,22 @@ const buscarDuplicadosProveedor = async ({ nombre, nit, telefono, correo }, excl
   return dup;
 };
 
+const PROVEEDOR_SELECT = `
+  SELECT id, nombre, nit, telefono, correo, direccion, ciudad, observaciones, estado, created_at,
+         tipo_persona AS "tipoPersona", nombres, apellidos,
+         tipo_documento AS "tipoDocumento", numero_documento AS "numeroDocumento"
+  FROM proveedores`;
+
 const provRouter = require('express').Router();
 provRouter.get('/', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT * FROM proveedores ORDER BY id DESC`);
+    const { rows } = await pool.query(`${PROVEEDOR_SELECT} ORDER BY id DESC`);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 provRouter.get('/:id', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT * FROM proveedores WHERE id=$1`, [req.params.id]);
+    const { rows } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -995,12 +1041,13 @@ provRouter.post('/', auth, async (req, res) => {
     if (dup.length) {
       return res.status(400).json({ error: 'Ya existe un proveedor con ese ' + dup.join(', ') + '.', duplicateFields: dup });
     }
-    const vals = PROVEEDOR_FIELDS.map(f => body[f] ?? null);
+    const vals = PROVEEDOR_FIELD_MAP.map(([, key]) => body[key] ?? null);
     const { rows } = await pool.query(
-      `INSERT INTO proveedores(${PROVEEDOR_FIELDS.join(',')}) VALUES(${PROVEEDOR_FIELDS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING *`,
+      `INSERT INTO proveedores(${PROVEEDOR_FIELDS.join(',')}) VALUES(${PROVEEDOR_FIELDS.map((_, i) => `$${i + 1}`).join(',')}) RETURNING id`,
       vals
     );
-    res.status(201).json(rows[0]);
+    const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese dato.' });
     res.status(500).json({ error: e.message });
@@ -1018,13 +1065,30 @@ provRouter.put('/:id', auth, async (req, res) => {
     if (dup.length) {
       return res.status(400).json({ error: 'Ya existe un proveedor con ese ' + dup.join(', ') + '.', duplicateFields: dup });
     }
-    const vals = [...PROVEEDOR_FIELDS.map(f => body[f] ?? null), req.params.id];
+    const { rows: actual } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
+    if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
+    const seDesactiva = actual[0].estado === 'Activo' && body.estado === 'Inactivo';
+
+    const vals = [...PROVEEDOR_FIELD_MAP.map(([, key]) => body[key] ?? null), req.params.id];
     const { rows } = await pool.query(
-      `UPDATE proveedores SET ${PROVEEDOR_FIELDS.map((f, i) => `${f}=$${i + 1}`).join(',')} WHERE id=$${PROVEEDOR_FIELDS.length + 1} RETURNING *`,
+      `UPDATE proveedores SET ${PROVEEDOR_FIELDS.map((f, i) => `${f}=$${i + 1}`).join(',')} WHERE id=$${PROVEEDOR_FIELDS.length + 1} RETURNING id`,
       vals
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
-    res.json(rows[0]);
+
+    // Al desactivar un proveedor desde el formulario de edición, sus
+    // insumos activos también quedan inactivos — igual que ya pasaba con
+    // el interruptor rápido, pero acá nunca se aplicaba.
+    let insumosDesactivados = [];
+    if (seDesactiva) {
+      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+      if (afectados.length) {
+        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+        insumosDesactivados = afectados;
+      }
+    }
+    const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
+    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese dato.' });
     res.status(500).json({ error: e.message });
@@ -1032,11 +1096,22 @@ provRouter.put('/:id', auth, async (req, res) => {
 });
 provRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
+    const { rows: antes } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
+    if (!antes[0]) return res.status(404).json({ error: 'No encontrado' });
     const { rows } = await pool.query(
-      `UPDATE proveedores SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
+      `UPDATE proveedores SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING estado`,
       [req.params.id]
     );
-    res.json(rows[0]);
+    let insumosDesactivados = [];
+    if (antes[0].estado === 'Activo' && rows[0].estado === 'Inactivo') {
+      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+      if (afectados.length) {
+        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+        insumosDesactivados = afectados;
+      }
+    }
+    const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
+    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // No se puede eliminar un proveedor con compras (activas o anuladas) — solo
@@ -1306,9 +1381,9 @@ insRouter.put('/:id', auth, async (req, res) => {
     return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor.' });
   }
   const { rows } = await pool.query(
-    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock=$4,stock_minimo=$5,precio_unitario=$6,proveedor_id=$7,descripcion=$8,estado=$9,es_topping=$10
-     WHERE id=$11 RETURNING id`,
-    [nombre, categoriaId || null, unidadEnviada, stockActual, stockMinimo, precioUnitario, proveedorId || null, descripcion || null, estado, !!esTopping, req.params.id]
+    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock_minimo=$4,precio_unitario=$5,proveedor_id=$6,descripcion=$7,estado=$8,es_topping=$9
+     WHERE id=$10 RETURNING id`,
+    [nombre, categoriaId || null, unidadEnviada, stockMinimo, precioUnitario, proveedorId || null, descripcion || null, estado, !!esTopping, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [req.params.id]);
@@ -1354,6 +1429,7 @@ const COMPRA_COLS = `
   c.id, c.codigo, c.proveedor_id AS "proveedorId", p.nombre AS "proveedorNombre",
   c.fecha, c.descuento, c.total, c.estado, c.observaciones, c.items,
   c.comprobante_url, c.comprobante_verificado, c.comprobante_total_ocr,
+  c.ocr_resultado AS "ocrResultado",
   c.motivo_anulacion AS "motivoAnulacion",
   c.created_at AS "fechaCreacion", c.fecha_anulacion AS "fechaAnulacion"
 `;
@@ -1396,17 +1472,46 @@ const PRESENTACIONES_VALIDAS = ['Caja', 'Paquete', 'Bolsa', 'Docena'];
 // contenido_por_presentacion en 0 dejaría el stock sumado mal calculado
 // (o en 0) sin que nada lo impidiera.
 const validarItemCompra = (item, index) => {
-  if (item?.modo !== 'presentacion') return null; // "directo" no cambia: sin validación nueva
-  const etiqueta = item.insumo || `ítem #${index + 1}`;
-  if (!PRESENTACIONES_VALIDAS.includes(item.tipo_presentacion)) {
-    return `"${etiqueta}": tipo_presentacion debe ser una de: ${PRESENTACIONES_VALIDAS.join(', ')}.`;
+  const etiqueta = item?.insumo || `ítem #${index + 1}`;
+
+  // Cantidad: obligatoria, positiva, sin letras/símbolos, tope 999.999,99,
+  // máximo 2 decimales. El propio frontend ya calcula y envía el valor
+  // final (convertido a la unidad real, incluso en modo "por
+  // presentación"), así que se valida siempre como un número plano.
+  const cantidad = Number(item?.cantidad);
+  if (item?.cantidad === undefined || item?.cantidad === null || item?.cantidad === '' || Number.isNaN(cantidad)) {
+    return `"${etiqueta}": la cantidad es obligatoria y debe ser un número.`;
   }
-  if (!Number.isInteger(item.cantidad_presentaciones) || item.cantidad_presentaciones <= 0) {
-    return `"${etiqueta}": cantidad_presentaciones debe ser un número entero mayor a 0.`;
+  if (cantidad <= 0) return `"${etiqueta}": la cantidad no puede ser 0 ni negativa.`;
+  if (cantidad > 999999.99) return `"${etiqueta}": la cantidad no puede superar 999.999,99.`;
+  const decimalesCantidad = (String(item.cantidad).split('.')[1] || '').length;
+  if (decimalesCantidad > 2) return `"${etiqueta}": la cantidad admite máximo 2 decimales.`;
+
+  // Precio: obligatorio, positivo, sin letras/símbolos, tope
+  // 999.999.999,9, máximo 1 decimal.
+  const precio = Number(item?.precioUnitario);
+  if (item?.precioUnitario === undefined || item?.precioUnitario === null || item?.precioUnitario === '' || Number.isNaN(precio)) {
+    return `"${etiqueta}": el precio es obligatorio y debe ser un número.`;
   }
-  const contenido = Number(item.contenido_por_presentacion);
-  if (!Number.isFinite(contenido) || contenido <= 0) {
-    return `"${etiqueta}": contenido_por_presentacion debe ser mayor a 0.`;
+  if (precio <= 0) return `"${etiqueta}": el precio no puede ser 0 ni negativo.`;
+  if (precio > 999999999.9) return `"${etiqueta}": el precio no puede superar 999.999.999,9.`;
+  const decimalesPrecio = (String(item.precioUnitario).split('.')[1] || '').length;
+  if (decimalesPrecio > 1) return `"${etiqueta}": el precio admite máximo 1 decimal.`;
+
+  // "Por presentación" es solo informativa (auditoría/despliegue en el
+  // detalle) — el frontend la manda anidada en item.presentacion, ya
+  // convertida a cantidad/precioUnitario reales arriba.
+  if (item?.presentacion) {
+    const p = item.presentacion;
+    if (!PRESENTACIONES_VALIDAS.includes(p.tipo)) {
+      return `"${etiqueta}": tipo de presentación inválido.`;
+    }
+    if (!Number.isInteger(p.cantidad) || p.cantidad <= 0) {
+      return `"${etiqueta}": la cantidad de presentaciones debe ser un entero mayor a 0.`;
+    }
+    if (!Number.isFinite(Number(p.contenidoPorPresentacion)) || Number(p.contenidoPorPresentacion) <= 0) {
+      return `"${etiqueta}": el contenido por presentación debe ser mayor a 0.`;
+    }
   }
   return null;
 };
@@ -1673,8 +1778,18 @@ compRouter.post('/', auth, async (req, res) => {
   // esto se leía mal y el proveedor de la compra quedaba siempre en NULL.
   const {
     proveedorId, fecha, total, descuento, items, observaciones,
-    comprobante_url, comprobante_verificado, comprobante_total_ocr,
+    comprobante_url, comprobante_verificado, comprobante_total_ocr, ocr_resultado,
   } = req.body;
+
+  // Una compra es un hecho ya ocurrido: no se puede registrar con una
+  // fecha posterior al día de hoy. El frontend ya bloquea esto en el
+  // propio calendario, pero acá queda la garantía real.
+  if (fecha) {
+    const hoy = new Date().toISOString().slice(0, 10);
+    if (String(fecha).slice(0, 10) > hoy) {
+      return res.status(400).json({ error: 'La fecha no puede ser futura — una compra es un hecho ya ocurrido.' });
+    }
+  }
 
   // El descuento es opcional (0 por defecto) pero, si llega, tiene que ser
   // un porcentaje válido entre 0 y 100. Sin esta validación un valor como
@@ -1719,12 +1834,13 @@ compRouter.post('/', auth, async (req, res) => {
     const codigo = await generarCodigoCompra();
     try {
       const { rows } = await pool.query(
-        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,estado)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'activa') RETURNING id`,
+        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,ocr_resultado,estado)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'activa') RETURNING id`,
         [
           codigo, proveedorId || null, fecha || new Date(), descuentoNum, totalFinal,
           JSON.stringify(items || []), observaciones || null, comprobante_url || null,
           comprobante_verificado || false, comprobante_total_ocr ?? null,
+          ocr_resultado ? JSON.stringify(ocr_resultado) : null,
         ]
       );
       compraId = rows[0].id;

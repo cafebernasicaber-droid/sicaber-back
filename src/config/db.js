@@ -199,6 +199,11 @@ const migrar = async () => {
     `ALTER TABLE compras ADD COLUMN IF NOT EXISTS comprobante_url TEXT`,
     `ALTER TABLE compras ADD COLUMN IF NOT EXISTS comprobante_verificado BOOLEAN DEFAULT FALSE`,
     `ALTER TABLE compras ADD COLUMN IF NOT EXISTS comprobante_total_ocr NUMERIC(12,2)`,
+    // Resultado completo del análisis OCR (fecha/NIT detectados, confianza,
+    // si el proveedor coincide, advertencias) — antes solo se guardaba el
+    // total detectado; el resto se calculaba en pantalla y se perdía al
+    // guardar, así que "Ver Compra" no tenía nada más que mostrar.
+    `ALTER TABLE compras ADD COLUMN IF NOT EXISTS ocr_resultado JSONB`,
     `ALTER TABLE compras ADD COLUMN IF NOT EXISTS fecha_anulacion TIMESTAMP`,
     // Mismo problema de mayúsculas que ya se corrigió en ventas/devoluciones:
     // la tabla guardaba 'Activa'/'Anulada' pero TODO el frontend de Compras
@@ -272,6 +277,15 @@ const migrar = async () => {
     // visible (la ruta CRUD genérica solo inserta las columnas que conoce).
     `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS ciudad VARCHAR(100)`,
     `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS observaciones TEXT`,
+    // Persona Natural / Jurídica: el frontend ya tiene el selector completo
+    // (toggle, Nombres/Apellidos/Tipo de documento para Natural, Razón
+    // social/NIT para Jurídica) pero estas columnas nunca se agregaron acá,
+    // así que ese dato se perdía al guardar sin ningún error visible.
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS tipo_persona VARCHAR(20) NOT NULL DEFAULT 'Juridica'`,
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS nombres VARCHAR(150)`,
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS apellidos VARCHAR(150)`,
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS tipo_documento VARCHAR(20)`,
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS numero_documento VARCHAR(20)`,
     // Locales físicos para "recoger en el local" (tipo de entrega 'local').
     // NO es lo mismo que "sede" en pedidos/usuarios/empleados ('Local 1'/
     // 'Local 2'/'Ambos', la asignación operativa interna de qué cajero/
