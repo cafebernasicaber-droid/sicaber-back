@@ -85,9 +85,13 @@ rolRouter.post('/', auth, async (req, res) => {
     if (await rolNombreDuplicado(nombre, null)) {
       return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
     }
+    // BUG CORREGIDO: "color" llegaba en req.body (RolFormPage.jsx sí lo
+    // manda) pero nunca se leía ni se incluía en el INSERT — se descartaba
+    // en silencio y todo rol nuevo quedaba con color=NULL, cayendo siempre
+    // al azul por defecto en el listado (RolesPage.jsx -> getColor()).
     const { rows } = await pool.query(
-      'INSERT INTO roles(nombre, descripcion, permisos) VALUES($1,$2,$3) RETURNING *',
-      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos)]
+      'INSERT INTO roles(nombre, descripcion, permisos, color) VALUES($1,$2,$3,$4) RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.body.color || null]
     );
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -103,9 +107,11 @@ rolRouter.put('/:id', auth, async (req, res) => {
     if (await rolNombreDuplicado(nombre, req.params.id)) {
       return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
     }
+    // Mismo bug que en el POST de arriba: "color" faltaba en el UPDATE, así
+    // que editar el color de un rol existente tampoco se guardaba nunca.
     const { rows } = await pool.query(
-      'UPDATE roles SET nombre=$1, descripcion=$2, permisos=$3 WHERE id=$4 RETURNING *',
-      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.params.id]
+      'UPDATE roles SET nombre=$1, descripcion=$2, permisos=$3, color=$4 WHERE id=$5 RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.body.color || null, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json(rows[0]);
@@ -2678,19 +2684,144 @@ devRouter.get('/', auth, async (req, res) => {
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Tope de 20 palabras en el motivo de la devolución — igual que ya exige la
+// pantalla web, pero ahora también acá para que no se pueda saltar llamando
+// la API directo. Es UN solo motivo por devolución, compartido entre TODOS
+// los productos seleccionados en esa misma devolución (no hay tope "por
+// producto": pedir 3 productos en una sola devolución sigue exigiendo un
+// único motivo de máximo 20 palabras en total, no 20 por cada uno).
+const MOTIVO_DEVOLUCION_MAX_PALABRAS = 20;
+const contarPalabras = (texto) => textoLimpio(texto).split(/\s+/).filter(Boolean).length;
+
+// Identificador de una línea de "pedidos.items" tal como quedó guardada al
+// crear el pedido — mismo criterio de campos que idProductoDeItem (id /
+// id_producto / producto_id), pero SIN pasar por parseIdentificadorProducto:
+// acá interesa el identificador tal cual (incluido el "combo-5" sintético de
+// un combo), no separarlo en tipo/id, para poder comparar contra lo que
+// mande el cliente sin perder la posibilidad de devolver un combo completo.
+const identificadorLineaPedido = (it) => {
+  const raw = it?.id ?? it?.id_producto ?? it?.producto_id;
+  return (raw === undefined || raw === null || raw === '') ? null : String(raw);
+};
+
+// Acepta tanto el formato nuevo ("items": [{producto_id o item_index,
+// cantidad}, ...]) como el formato viejo (producto_id o item_index sueltos,
+// junto a "cantidad", directo en el body) — se normalizan a la misma forma
+// de lista para que el resto del handler no tenga que distinguir entre los
+// dos. Un "items" vacío no cae al formato viejo (evita que {items: []} se
+// confunda con "no mandaron items").
+const normalizarItemsSolicitados = (body) => {
+  if (Array.isArray(body.items) && body.items.length > 0) {
+    return body.items.map(it => ({
+      producto_id: it?.producto_id ?? it?.id ?? null,
+      item_index:  it?.item_index,
+      cantidad:    it?.cantidad,
+    }));
+  }
+  if (body.producto_id !== undefined || body.item_index !== undefined) {
+    return [{ producto_id: body.producto_id, item_index: body.item_index, cantidad: body.cantidad }];
+  }
+  return [];
+};
+
 devRouter.post('/', auth, async (req, res) => {
   try {
- 
-  const { pedido_id, monto, items, tipo } = req.body;
+
+  const { pedido_id, monto, tipo } = req.body;
   if (!pedido_id) return res.status(400).json({ error: 'pedido_id es requerido' });
- 
+
   const motivoLimpio = textoLimpio(req.body.motivo);
   if (!motivoLimpio) {
     return res.status(400).json({ error: 'El motivo de la devolución es obligatorio y no puede contener solo espacios en blanco.' });
   }
   const errorMotivo = errorLongitud(motivoLimpio, 'El motivo de la devolución', LIMITES.MOTIVO, LIMITES.MOTIVO_MINIMO);
   if (errorMotivo) return res.status(400).json({ error: errorMotivo });
+  if (contarPalabras(motivoLimpio) > MOTIVO_DEVOLUCION_MAX_PALABRAS) {
+    return res.status(400).json({ error: `El motivo de la devolución no puede superar las ${MOTIVO_DEVOLUCION_MAX_PALABRAS} palabras.` });
+  }
   const motivo = motivoLimpio;
+
+  const solicitados = normalizarItemsSolicitados(req.body);
+  if (solicitados.length === 0) {
+    return res.status(400).json({ error: 'Debes indicar al menos un producto a devolver ("items", o "producto_id"/"item_index" sueltos).' });
+  }
+
+  // Los productos/cantidades a devolver NUNCA se toman de lo que mande el
+  // cliente: se resuelven contra "pedidos.items" ya guardado en el backend
+  // (ver comentario de enriquecerItemsPedido más arriba — ese mismo array es
+  // la fuente de verdad de qué y cuánto se compró en este pedido), así un
+  // cliente no puede inventar un producto que no estaba en el pedido ni
+  // pedir devolver más unidades de las que realmente compró.
+  const { rows: pedidoRows } = await pool.query('SELECT id, items FROM pedidos WHERE id=$1', [pedido_id]);
+  if (!pedidoRows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+  const pedidoItems = Array.isArray(pedidoRows[0].items) ? pedidoRows[0].items : [];
+
+  const itemsResueltos = [];
+  const acumuladoPorId = new Map(); // suma lo pedido en ESTA devolución por identificador, para el tope de "no exceder lo comprado" cuando el mismo producto aparece más de una vez en la solicitud
+  for (let i = 0; i < solicitados.length; i++) {
+    const solicitado = solicitados[i];
+    const numeroItem = i + 1;
+
+    let idx = null;
+    if (solicitado.item_index !== undefined && solicitado.item_index !== null && solicitado.item_index !== '') {
+      const n = Number(solicitado.item_index);
+      if (!Number.isInteger(n) || n < 0 || n >= pedidoItems.length) {
+        return res.status(400).json({ error: `item_index inválido en el ítem ${numeroItem}: no existe esa línea en el pedido ${pedido_id}.` });
+      }
+      idx = n;
+    }
+
+    const idPorIndex = idx !== null ? identificadorLineaPedido(pedidoItems[idx]) : null;
+    const idPedido = idx !== null
+      ? idPorIndex
+      : (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
+          ? String(solicitado.producto_id) : null);
+    if (!idPedido) {
+      return res.status(400).json({ error: `Cada ítem debe indicar "producto_id" o "item_index" (ítem ${numeroItem}).` });
+    }
+
+    if (idx === null) {
+      idx = pedidoItems.findIndex(it => identificadorLineaPedido(it) === idPedido);
+      if (idx === -1) {
+        return res.status(400).json({ error: `El producto (${idPedido}) no pertenece al pedido ${pedido_id}.` });
+      }
+    } else if (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
+               && String(solicitado.producto_id) !== idPorIndex) {
+      return res.status(400).json({ error: `"producto_id" no coincide con "item_index" en el ítem ${numeroItem}.` });
+    }
+
+    const cantidad = Number(solicitado.cantidad);
+    if (!Number.isInteger(cantidad) || cantidad <= 0) {
+      return res.status(400).json({ error: `La cantidad a devolver del ítem ${numeroItem} debe ser un número entero mayor que cero.` });
+    }
+
+    // Cantidad comprada de este producto en TODO el pedido — sumada entre
+    // todas las líneas que compartan el mismo identificador (ej. el mismo
+    // producto pedido dos veces con toppings distintos), no solo la línea
+    // puntual que resolvió este ítem.
+    const totalComprado = pedidoItems.reduce(
+      (suma, it) => identificadorLineaPedido(it) === idPedido ? suma + (Number(it.cantidad) || 1) : suma,
+      0
+    );
+    const previoEnEstaSolicitud = acumuladoPorId.get(idPedido) || 0;
+    if (previoEnEstaSolicitud + cantidad > totalComprado) {
+      const linea = pedidoItems[idx];
+      return res.status(400).json({
+        error: `La cantidad a devolver de "${linea?.nombre ?? idPedido}" (${previoEnEstaSolicitud + cantidad}) excede lo comprado en el pedido (${totalComprado}).`,
+      });
+    }
+    acumuladoPorId.set(idPedido, previoEnEstaSolicitud + cantidad);
+
+    const linea = pedidoItems[idx];
+    itemsResueltos.push({
+      producto_id: idPedido,
+      item_index: idx,
+      nombre: linea?.nombre ?? null,
+      precio: linea?.precio ?? null,
+      cantidad,
+    });
+  }
+
   const { rows } = await pool.query(
     // El default de la columna quedó en 'Pendiente' (con mayúscula) pero
     // todo el frontend compara contra 'pendiente' en minúscula; sin este
@@ -2698,7 +2829,7 @@ devRouter.post('/', auth, async (req, res) => {
     // ningún filtro ni mostraba los botones de aprobar/rechazar.
     `INSERT INTO devoluciones(pedido_id,motivo,monto,items,tipo,estado)
      VALUES($1,$2,$3,$4,$5,'pendiente') RETURNING id`,
-    [pedido_id, motivo, monto || 0, JSON.stringify(items || []), tipo || 'total']
+    [pedido_id, motivo, monto || 0, JSON.stringify(itemsResueltos), tipo || (itemsResueltos.length > 1 ? 'parcial' : 'total')]
   );
   const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [rows[0].id]);
   res.status(201).json(full[0]);

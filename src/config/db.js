@@ -42,6 +42,17 @@ pool.on('error', (err) => {
 
 const migrar = async () => {
   const alters = [
+    // roles: color identificador elegido en el formulario de Roles
+    // (RolFormPage.jsx) para la franja de la tarjeta en el listado
+    // (RolesPage.jsx). BUG CORREGIDO: la columna nunca existió — schema.sql
+    // solo definía id/nombre/descripcion/permisos/created_at, y las rutas
+    // POST/PUT /roles tampoco lo leían de req.body ni lo incluían en el
+    // INSERT/UPDATE, así que el color elegido se descartaba en silencio
+    // (nunca llegaba ni a intentar guardarse) y todo rol quedaba con
+    // rol.color=undefined, cayendo siempre al azul por defecto
+    // (rolesService.getColor -> COLORES[5]) sin importar qué color se
+    // hubiera elegido al crearlo.
+    `ALTER TABLE roles ADD COLUMN IF NOT EXISTS color VARCHAR(10)`,
     // usuarios (login con correo o usuario)
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS correo VARCHAR(150)`,
     // usuarios: marca del Superadministrador único e inmodificable
