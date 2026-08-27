@@ -1014,6 +1014,7 @@ const PROVEEDOR_FIELD_MAP = [
   ['direccion', 'direccion'], ['ciudad', 'ciudad'], ['observaciones', 'observaciones'], ['estado', 'estado'],
   ['tipo_persona', 'tipoPersona'], ['nombres', 'nombres'], ['apellidos', 'apellidos'],
   ['tipo_documento', 'tipoDocumento'], ['numero_documento', 'numeroDocumento'],
+  ['persona_contacto', 'personaContacto'],
 ];
 const PROVEEDOR_FIELDS = PROVEEDOR_FIELD_MAP.map(([col]) => col);
 
@@ -1066,7 +1067,8 @@ const buscarDuplicadosProveedor = async ({ nombre, nit, telefono, correo, tipoPe
 const PROVEEDOR_SELECT = `
   SELECT id, nombre, nit, telefono, correo, direccion, ciudad, observaciones, estado, created_at,
          tipo_persona AS "tipoPersona", nombres, apellidos,
-         tipo_documento AS "tipoDocumento", numero_documento AS "numeroDocumento"
+         tipo_documento AS "tipoDocumento", numero_documento AS "numeroDocumento",
+         persona_contacto AS "personaContacto"
   FROM proveedores`;
 
 const provRouter = require('express').Router();
@@ -1086,8 +1088,12 @@ provRouter.get('/:id', auth, async (req, res) => {
 provRouter.post('/', auth, async (req, res) => {
   try {
     // El nombre se guardaba tal cual llegaba, sin revisar que tuviera
-    // contenido real, y las observaciones no tenían ningún tope.
-    const errorNom = errorNombre(req.body.nombre, 'El nombre del proveedor', LIMITES.NOMBRE);
+    // contenido real, y las observaciones no tenían ningún tope. El
+    // límite depende del tipo de persona: Natural usa "Nombre completo"
+    // (100), Jurídica usa "Razón Social" (60) — mismo tope que ya aplica
+    // el frontend en cada caso.
+    const maxNombreProveedor = req.body.tipoPersona === 'Natural' ? 100 : 60;
+    const errorNom = errorNombre(req.body.nombre, req.body.tipoPersona === 'Natural' ? 'El nombre completo' : 'La razón social', maxNombreProveedor);
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
@@ -1111,7 +1117,8 @@ provRouter.post('/', auth, async (req, res) => {
 });
 provRouter.put('/:id', auth, async (req, res) => {
   try {
-    const errorNom = errorNombre(req.body.nombre, 'El nombre del proveedor', LIMITES.NOMBRE);
+    const maxNombreProveedor = req.body.tipoPersona === 'Natural' ? 100 : 60;
+    const errorNom = errorNombre(req.body.nombre, req.body.tipoPersona === 'Natural' ? 'El nombre completo' : 'La razón social', maxNombreProveedor);
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
@@ -1304,6 +1311,73 @@ catInsRouter.delete('/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/categorias-insumos', catInsRouter);
+
+// ── TIPOS DE PRESENTACIÓN (Compras) ───────────────────────────
+// Antes una lista fija en el código del formulario de compra (Caja,
+// Paquete, Bolsa) — ahora un catálogo gestionable, mismo patrón que
+// categorias_insumos de arriba. Deliberadamente más simple: a diferencia
+// de una categoría de insumo, un tipo de presentación no queda "pegado" a
+// una entidad persistente (solo se usa en el momento de definir una
+// compra puntual), así que no necesita ni bloqueo de eliminación por
+// tener registros asociados, ni un flujo de recategorización — una compra
+// ya registrada conserva el nombre del tipo que usó en su propio registro,
+// sin importar si ese tipo sigue existiendo o activo en este catálogo.
+const tiposPresentacionRouter = require('express').Router();
+tiposPresentacionRouter.param('id', validateId);
+tiposPresentacionRouter.get('/', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM tipos_presentacion ORDER BY id ASC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+tiposPresentacionRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del tipo de presentación', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'tipos_presentacion', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    }
+    if (nombre.toLowerCase() === 'unitario') {
+      return res.status(400).json({ error: '"Unitario" es una opción fija del sistema, no se puede crear como tipo gestionable.' });
+    }
+    const { rows } = await pool.query(`INSERT INTO tipos_presentacion(nombre) VALUES($1) RETURNING *`, [nombre]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+tiposPresentacionRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del tipo de presentación', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'tipos_presentacion', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    }
+    if (nombre.toLowerCase() === 'unitario') {
+      return res.status(400).json({ error: '"Unitario" es una opción fija del sistema, no se puede usar como nombre de un tipo gestionable.' });
+    }
+    const { rows } = await pool.query(`UPDATE tipos_presentacion SET nombre=$1 WHERE id=$2 RETURNING *`, [nombre, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+tiposPresentacionRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE tipos_presentacion SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/tipos-presentacion', tiposPresentacionRouter);
 
 // ── INSUMOS ────────────────────────────────────────────────
 // Alias camelCase → exactamente los nombres que ya usa el frontend
@@ -1521,13 +1595,11 @@ const ajustarStockInsumo = async (nombreInsumo, delta) => {
 //     caja). El stock del insumo NUNCA queda expresado en cajas/paquetes/
 //     bolsas/docenas: siempre se convierte a la unidad real antes de
 //     sumarlo o restarlo.
-const PRESENTACIONES_VALIDAS = ['Caja', 'Paquete', 'Bolsa', 'Docena'];
-
 // Valida la forma de un ítem de compra en modo "presentacion" antes de
 // guardarlo. Sin esto, un cantidad_presentaciones decimal/negativo o un
 // contenido_por_presentacion en 0 dejaría el stock sumado mal calculado
 // (o en 0) sin que nada lo impidiera.
-const validarItemCompra = (item, index) => {
+const validarItemCompra = async (item, index) => {
   const etiqueta = item?.insumo || `ítem #${index + 1}`;
 
   // Cantidad: obligatoria, positiva, sin letras/símbolos, tope 999.999,99,
@@ -1543,24 +1615,49 @@ const validarItemCompra = (item, index) => {
   const decimalesCantidad = (String(item.cantidad).split('.')[1] || '').length;
   if (decimalesCantidad > 2) return `"${etiqueta}": la cantidad admite máximo 2 decimales.`;
 
-  // Precio: obligatorio, positivo, sin letras/símbolos, tope
-  // 999.999.999,9, máximo 1 decimal.
+  // Precio por unidad real (kg/L/unidad/etc.): es un valor CALCULADO
+  // (precio total ÷ cantidad real), nunca lo que el usuario escribió
+  // directamente — legítimamente puede tener decimales infinitos (ej. 3 kg
+  // por $10.000 = $3.333,33... por kg) y eso no es un error. Por eso aquí
+  // solo se valida que sea positivo y esté dentro de un rango razonable;
+  // la exigencia de "entero, sin decimales" se aplica más abajo, al precio
+  // que el usuario SÍ escribió a mano (presentacion.precioPresentacion).
   const precio = Number(item?.precioUnitario);
   if (item?.precioUnitario === undefined || item?.precioUnitario === null || item?.precioUnitario === '' || Number.isNaN(precio)) {
     return `"${etiqueta}": el precio es obligatorio y debe ser un número.`;
   }
   if (precio <= 0) return `"${etiqueta}": el precio no puede ser 0 ni negativo.`;
-  if (precio > 999999999.9) return `"${etiqueta}": el precio no puede superar 999.999.999,9.`;
-  const decimalesPrecio = (String(item.precioUnitario).split('.')[1] || '').length;
-  if (decimalesPrecio > 1) return `"${etiqueta}": el precio admite máximo 1 decimal.`;
+  if (precio > 999999999) return `"${etiqueta}": el precio no puede superar 999.999.999.`;
 
   // "Por presentación" es solo informativa (auditoría/despliegue en el
   // detalle) — el frontend la manda anidada en item.presentacion, ya
   // convertida a cantidad/precioUnitario reales arriba.
   if (item?.presentacion) {
     const p = item.presentacion;
-    if (!PRESENTACIONES_VALIDAS.includes(p.tipo)) {
-      return `"${etiqueta}": tipo de presentación inválido.`;
+    // El precio que SÍ escribió el usuario (no el calculado por
+    // división de arriba) — este es el que debe ser un entero limpio de
+    // pesos, sin decimales (en Colombia el punto separa miles, no
+    // decimales).
+    const precioEscrito = Number(p.precioPresentacion);
+    if (p.precioPresentacion === undefined || p.precioPresentacion === null || p.precioPresentacion === '' || Number.isNaN(precioEscrito)) {
+      return `"${etiqueta}": el precio es obligatorio y debe ser un número.`;
+    }
+    if (precioEscrito <= 0) return `"${etiqueta}": el precio no puede ser 0 ni negativo.`;
+    if (precioEscrito > 999999999) return `"${etiqueta}": el precio no puede superar 999.999.999.`;
+    if (!Number.isInteger(precioEscrito)) return `"${etiqueta}": el precio debe ser un número entero de pesos, sin decimales (en Colombia el punto se usa para separar miles, no como decimal).`;
+    // El tipo ya no se compara contra una lista fija en el código —
+    // "Unitario" sigue siendo una excepción fija (no vive en la tabla,
+    // es una opción especial del sistema); cualquier otro tipo debe
+    // existir y estar activo en tipos_presentacion. Esto también evita
+    // que una compra guarde un tipo ya desactivado o inexistente, sin
+    // necesitar bloquear la desactivación en sí (que sigue sin
+    // restricciones, tal como se pidió).
+    if (p.tipo !== 'Unitario') {
+      const { rows } = await pool.query(
+        `SELECT id FROM tipos_presentacion WHERE lower(nombre)=lower($1) AND estado='Activo' LIMIT 1`,
+        [p.tipo]
+      );
+      if (!rows[0]) return `"${etiqueta}": tipo de presentación inválido o inactivo.`;
     }
     if (!Number.isInteger(p.cantidad) || p.cantidad <= 0) {
       return `"${etiqueta}": la cantidad de presentaciones debe ser un entero mayor a 0.`;
@@ -1875,7 +1972,7 @@ compRouter.post('/', auth, async (req, res) => {
   // valida ANTES de insertar nada: si un solo ítem viene mal, la compra
   // completa se rechaza en vez de quedar a medio guardar.
   for (let i = 0; i < (items || []).length; i++) {
-    const errorItem = validarItemCompra(items[i], i);
+    const errorItem = await validarItemCompra(items[i], i);
     if (errorItem) return res.status(400).json({ error: `Ítem inválido: ${errorItem}` });
   }
 
