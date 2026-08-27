@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS roles (
   nombre      VARCHAR(100) NOT NULL UNIQUE,
   descripcion TEXT,
   permisos    JSONB DEFAULT '[]',
+  color       VARCHAR(10),
   created_at  TIMESTAMP DEFAULT NOW()
 );
 

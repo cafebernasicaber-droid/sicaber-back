@@ -85,9 +85,13 @@ rolRouter.post('/', auth, async (req, res) => {
     if (await rolNombreDuplicado(nombre, null)) {
       return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
     }
+    // BUG CORREGIDO: "color" llegaba en req.body (RolFormPage.jsx sí lo
+    // manda) pero nunca se leía ni se incluía en el INSERT — se descartaba
+    // en silencio y todo rol nuevo quedaba con color=NULL, cayendo siempre
+    // al azul por defecto en el listado (RolesPage.jsx -> getColor()).
     const { rows } = await pool.query(
-      'INSERT INTO roles(nombre, descripcion, permisos) VALUES($1,$2,$3) RETURNING *',
-      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos)]
+      'INSERT INTO roles(nombre, descripcion, permisos, color) VALUES($1,$2,$3,$4) RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.body.color || null]
     );
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -103,9 +107,11 @@ rolRouter.put('/:id', auth, async (req, res) => {
     if (await rolNombreDuplicado(nombre, req.params.id)) {
       return res.status(400).json({ error: 'Ya existe un rol con ese nombre.' });
     }
+    // Mismo bug que en el POST de arriba: "color" faltaba en el UPDATE, así
+    // que editar el color de un rol existente tampoco se guardaba nunca.
     const { rows } = await pool.query(
-      'UPDATE roles SET nombre=$1, descripcion=$2, permisos=$3 WHERE id=$4 RETURNING *',
-      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.params.id]
+      'UPDATE roles SET nombre=$1, descripcion=$2, permisos=$3, color=$4 WHERE id=$5 RETURNING *',
+      [nombre, req.body.descripcion || null, JSON.stringify(req.body.permisos), req.body.color || null, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json(rows[0]);
@@ -653,6 +659,29 @@ const fechasDescuentoInvalidas = (inicio, fin) => {
   return new Date(inicio).getTime() > new Date(fin).getTime();
 };
 
+// Filtro de precio por "prefijo en miles": el cliente busca un número
+// (ej. "3", "10", "15") y el Backend arma el rango completo de precios
+// que empiezan así — "3" → 3000-3999, "10" → 10000-10999, "15" →
+// 15000-15999 — en vez de que el Frontend tenga que mandar precioMin y
+// precioMax ya calculados a mano. precio es NUMERIC(10,2) en la base de
+// datos (ver schema.sql), así que la comparación se hace numéricamente
+// (>=/<=), sin convertir nada a texto.
+//
+// Vacío/ausente ⇒ sin filtro (se devuelve null y la ruta no agrega
+// condición). Cualquier otra cosa que no sea un entero no negativo
+// (letras, negativos, decimales) ⇒ se devuelve el string 'invalido' para
+// que la ruta responda 400 en vez de dejar pasar un valor sin sentido.
+const RE_PRECIO_PREFIJO = /^\d+$/;
+const filtroPrecioDesdeQuery = (raw) => {
+  if (raw === undefined || raw === null) return null;
+  const texto = String(raw).trim();
+  if (texto === '') return null;
+  if (!RE_PRECIO_PREFIJO.test(texto)) return 'invalido';
+  const n = Number(texto);
+  if (!Number.isSafeInteger(n)) return 'invalido';
+  return { min: n * 1000, max: n * 1000 + 999 };
+};
+
 const prodRouter = require('express').Router();
 // Catálogo público (Landing). Además del estado del propio producto, se
 // respeta el estado de SU CATEGORÍA: si el administrador desactiva una
@@ -672,6 +701,16 @@ const prodRouter = require('express').Router();
 // esconden los que pertenecen a una categoría que existe Y está inactiva.
 prodRouter.get('/', async (req, res) => {
   try {
+  const filtroPrecio = filtroPrecioDesdeQuery(req.query.precio);
+  if (filtroPrecio === 'invalido') {
+    return res.status(400).json({ error: 'El precio de búsqueda debe ser un número entero (sin letras ni signos).' });
+  }
+  const params = [];
+  let condicionPrecio = '';
+  if (filtroPrecio) {
+    params.push(filtroPrecio.min, filtroPrecio.max);
+    condicionPrecio = 'AND p.precio >= $1 AND p.precio <= $2';
+  }
   const { rows } = await pool.query(
     `SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos p
       WHERE p.estado='Activo'
@@ -680,7 +719,9 @@ prodRouter.get('/', async (req, res) => {
            WHERE lower(btrim(c.nombre)) = lower(btrim(p.categoria))
              AND c.estado <> 'Activo'
         )
-      ORDER BY p.id`
+        ${condicionPrecio}
+      ORDER BY p.id`,
+    params
   );
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -851,9 +892,24 @@ r.use('/adiciones', crud('adiciones', ['nombre', 'precio', 'estado', 'insumo_id'
 // ── COMBOS ─────────────────────────────────────────────────
 const comboRouter = require('express').Router();
 comboRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
+// Público (Landing, sin auth): además de estado='Activo', un combo solo
+// se ofrece si la fecha actual está dentro de su ventana fecha_inicio /
+// fecha_fin — mismo criterio que ya usa DESCUENTO_VIGENTE_EXPR para
+// productos.fecha_inicio_desc/fecha_fin_desc (NULL = sin límite en ese
+// extremo), filtrando con CURRENT_DATE dentro de la propia consulta SQL
+// para que la regla la imponga el Backend y no dependa de que el
+// Frontend decida ocultarlo. GET /combos/todos (abajo, con auth) sigue
+// devolviendo TODOS los combos sin este filtro, para que el
+// Administrador pueda seguir viendo y gestionando combos futuros.
 comboRouter.get('/', async (req, res) => {
   try {
-  const { rows } = await pool.query(`SELECT * FROM combos WHERE estado='Activo' ORDER BY id`);
+  const { rows } = await pool.query(
+    `SELECT * FROM combos
+      WHERE estado='Activo'
+        AND (fecha_inicio IS NULL OR fecha_inicio <= CURRENT_DATE)
+        AND (fecha_fin    IS NULL OR fecha_fin    >= CURRENT_DATE)
+      ORDER BY id`
+  );
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -958,6 +1014,7 @@ const PROVEEDOR_FIELD_MAP = [
   ['direccion', 'direccion'], ['ciudad', 'ciudad'], ['observaciones', 'observaciones'], ['estado', 'estado'],
   ['tipo_persona', 'tipoPersona'], ['nombres', 'nombres'], ['apellidos', 'apellidos'],
   ['tipo_documento', 'tipoDocumento'], ['numero_documento', 'numeroDocumento'],
+  ['persona_contacto', 'personaContacto'],
 ];
 const PROVEEDOR_FIELDS = PROVEEDOR_FIELD_MAP.map(([col]) => col);
 
@@ -1010,7 +1067,8 @@ const buscarDuplicadosProveedor = async ({ nombre, nit, telefono, correo, tipoPe
 const PROVEEDOR_SELECT = `
   SELECT id, nombre, nit, telefono, correo, direccion, ciudad, observaciones, estado, created_at,
          tipo_persona AS "tipoPersona", nombres, apellidos,
-         tipo_documento AS "tipoDocumento", numero_documento AS "numeroDocumento"
+         tipo_documento AS "tipoDocumento", numero_documento AS "numeroDocumento",
+         persona_contacto AS "personaContacto"
   FROM proveedores`;
 
 const provRouter = require('express').Router();
@@ -1030,8 +1088,12 @@ provRouter.get('/:id', auth, async (req, res) => {
 provRouter.post('/', auth, async (req, res) => {
   try {
     // El nombre se guardaba tal cual llegaba, sin revisar que tuviera
-    // contenido real, y las observaciones no tenían ningún tope.
-    const errorNom = errorNombre(req.body.nombre, 'El nombre del proveedor', LIMITES.NOMBRE);
+    // contenido real, y las observaciones no tenían ningún tope. El
+    // límite depende del tipo de persona: Natural usa "Nombre completo"
+    // (100), Jurídica usa "Razón Social" (60) — mismo tope que ya aplica
+    // el frontend en cada caso.
+    const maxNombreProveedor = req.body.tipoPersona === 'Natural' ? 100 : 60;
+    const errorNom = errorNombre(req.body.nombre, req.body.tipoPersona === 'Natural' ? 'El nombre completo' : 'La razón social', maxNombreProveedor);
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
@@ -1055,7 +1117,8 @@ provRouter.post('/', auth, async (req, res) => {
 });
 provRouter.put('/:id', auth, async (req, res) => {
   try {
-    const errorNom = errorNombre(req.body.nombre, 'El nombre del proveedor', LIMITES.NOMBRE);
+    const maxNombreProveedor = req.body.tipoPersona === 'Natural' ? 100 : 60;
+    const errorNom = errorNombre(req.body.nombre, req.body.tipoPersona === 'Natural' ? 'El nombre completo' : 'La razón social', maxNombreProveedor);
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
@@ -1248,6 +1311,73 @@ catInsRouter.delete('/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/categorias-insumos', catInsRouter);
+
+// ── TIPOS DE PRESENTACIÓN (Compras) ───────────────────────────
+// Antes una lista fija en el código del formulario de compra (Caja,
+// Paquete, Bolsa) — ahora un catálogo gestionable, mismo patrón que
+// categorias_insumos de arriba. Deliberadamente más simple: a diferencia
+// de una categoría de insumo, un tipo de presentación no queda "pegado" a
+// una entidad persistente (solo se usa en el momento de definir una
+// compra puntual), así que no necesita ni bloqueo de eliminación por
+// tener registros asociados, ni un flujo de recategorización — una compra
+// ya registrada conserva el nombre del tipo que usó en su propio registro,
+// sin importar si ese tipo sigue existiendo o activo en este catálogo.
+const tiposPresentacionRouter = require('express').Router();
+tiposPresentacionRouter.param('id', validateId);
+tiposPresentacionRouter.get('/', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM tipos_presentacion ORDER BY id ASC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+tiposPresentacionRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del tipo de presentación', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'tipos_presentacion', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    }
+    if (nombre.toLowerCase() === 'unitario') {
+      return res.status(400).json({ error: '"Unitario" es una opción fija del sistema, no se puede crear como tipo gestionable.' });
+    }
+    const { rows } = await pool.query(`INSERT INTO tipos_presentacion(nombre) VALUES($1) RETURNING *`, [nombre]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+tiposPresentacionRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del tipo de presentación', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'tipos_presentacion', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    }
+    if (nombre.toLowerCase() === 'unitario') {
+      return res.status(400).json({ error: '"Unitario" es una opción fija del sistema, no se puede usar como nombre de un tipo gestionable.' });
+    }
+    const { rows } = await pool.query(`UPDATE tipos_presentacion SET nombre=$1 WHERE id=$2 RETURNING *`, [nombre, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un tipo de presentación con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+tiposPresentacionRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE tipos_presentacion SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/tipos-presentacion', tiposPresentacionRouter);
 
 // ── INSUMOS ────────────────────────────────────────────────
 // Alias camelCase → exactamente los nombres que ya usa el frontend
@@ -1465,13 +1595,11 @@ const ajustarStockInsumo = async (nombreInsumo, delta) => {
 //     caja). El stock del insumo NUNCA queda expresado en cajas/paquetes/
 //     bolsas/docenas: siempre se convierte a la unidad real antes de
 //     sumarlo o restarlo.
-const PRESENTACIONES_VALIDAS = ['Caja', 'Paquete', 'Bolsa', 'Docena'];
-
 // Valida la forma de un ítem de compra en modo "presentacion" antes de
 // guardarlo. Sin esto, un cantidad_presentaciones decimal/negativo o un
 // contenido_por_presentacion en 0 dejaría el stock sumado mal calculado
 // (o en 0) sin que nada lo impidiera.
-const validarItemCompra = (item, index) => {
+const validarItemCompra = async (item, index) => {
   const etiqueta = item?.insumo || `ítem #${index + 1}`;
 
   // Cantidad: obligatoria, positiva, sin letras/símbolos, tope 999.999,99,
@@ -1487,24 +1615,49 @@ const validarItemCompra = (item, index) => {
   const decimalesCantidad = (String(item.cantidad).split('.')[1] || '').length;
   if (decimalesCantidad > 2) return `"${etiqueta}": la cantidad admite máximo 2 decimales.`;
 
-  // Precio: obligatorio, positivo, sin letras/símbolos, tope
-  // 999.999.999,9, máximo 1 decimal.
+  // Precio por unidad real (kg/L/unidad/etc.): es un valor CALCULADO
+  // (precio total ÷ cantidad real), nunca lo que el usuario escribió
+  // directamente — legítimamente puede tener decimales infinitos (ej. 3 kg
+  // por $10.000 = $3.333,33... por kg) y eso no es un error. Por eso aquí
+  // solo se valida que sea positivo y esté dentro de un rango razonable;
+  // la exigencia de "entero, sin decimales" se aplica más abajo, al precio
+  // que el usuario SÍ escribió a mano (presentacion.precioPresentacion).
   const precio = Number(item?.precioUnitario);
   if (item?.precioUnitario === undefined || item?.precioUnitario === null || item?.precioUnitario === '' || Number.isNaN(precio)) {
     return `"${etiqueta}": el precio es obligatorio y debe ser un número.`;
   }
   if (precio <= 0) return `"${etiqueta}": el precio no puede ser 0 ni negativo.`;
-  if (precio > 999999999.9) return `"${etiqueta}": el precio no puede superar 999.999.999,9.`;
-  const decimalesPrecio = (String(item.precioUnitario).split('.')[1] || '').length;
-  if (decimalesPrecio > 1) return `"${etiqueta}": el precio admite máximo 1 decimal.`;
+  if (precio > 999999999) return `"${etiqueta}": el precio no puede superar 999.999.999.`;
 
   // "Por presentación" es solo informativa (auditoría/despliegue en el
   // detalle) — el frontend la manda anidada en item.presentacion, ya
   // convertida a cantidad/precioUnitario reales arriba.
   if (item?.presentacion) {
     const p = item.presentacion;
-    if (!PRESENTACIONES_VALIDAS.includes(p.tipo)) {
-      return `"${etiqueta}": tipo de presentación inválido.`;
+    // El precio que SÍ escribió el usuario (no el calculado por
+    // división de arriba) — este es el que debe ser un entero limpio de
+    // pesos, sin decimales (en Colombia el punto separa miles, no
+    // decimales).
+    const precioEscrito = Number(p.precioPresentacion);
+    if (p.precioPresentacion === undefined || p.precioPresentacion === null || p.precioPresentacion === '' || Number.isNaN(precioEscrito)) {
+      return `"${etiqueta}": el precio es obligatorio y debe ser un número.`;
+    }
+    if (precioEscrito <= 0) return `"${etiqueta}": el precio no puede ser 0 ni negativo.`;
+    if (precioEscrito > 999999999) return `"${etiqueta}": el precio no puede superar 999.999.999.`;
+    if (!Number.isInteger(precioEscrito)) return `"${etiqueta}": el precio debe ser un número entero de pesos, sin decimales (en Colombia el punto se usa para separar miles, no como decimal).`;
+    // El tipo ya no se compara contra una lista fija en el código —
+    // "Unitario" sigue siendo una excepción fija (no vive en la tabla,
+    // es una opción especial del sistema); cualquier otro tipo debe
+    // existir y estar activo en tipos_presentacion. Esto también evita
+    // que una compra guarde un tipo ya desactivado o inexistente, sin
+    // necesitar bloquear la desactivación en sí (que sigue sin
+    // restricciones, tal como se pidió).
+    if (p.tipo !== 'Unitario') {
+      const { rows } = await pool.query(
+        `SELECT id FROM tipos_presentacion WHERE lower(nombre)=lower($1) AND estado='Activo' LIMIT 1`,
+        [p.tipo]
+      );
+      if (!rows[0]) return `"${etiqueta}": tipo de presentación inválido o inactivo.`;
     }
     if (!Number.isInteger(p.cantidad) || p.cantidad <= 0) {
       return `"${etiqueta}": la cantidad de presentaciones debe ser un entero mayor a 0.`;
@@ -1819,7 +1972,7 @@ compRouter.post('/', auth, async (req, res) => {
   // valida ANTES de insertar nada: si un solo ítem viene mal, la compra
   // completa se rechaza en vez de quedar a medio guardar.
   for (let i = 0; i < (items || []).length; i++) {
-    const errorItem = validarItemCompra(items[i], i);
+    const errorItem = await validarItemCompra(items[i], i);
     if (errorItem) return res.status(400).json({ error: `Ítem inválido: ${errorItem}` });
   }
 
@@ -2575,25 +2728,11 @@ ventRouter.post('/desde-pedido', auth, async (req, res) => {
     const { rows: ped } = await pool.query('SELECT * FROM pedidos WHERE id=$1', [id_pedido]);
     if (!ped[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
 
-    // Crear la venta (registro contable/de inventario) es independiente
-    // del estado del PEDIDO — antes esta ruta forzaba estado='entregado'
-    // acá mismo, así que un pedido marcado "Listo" (que dispara la
-    // creación automática de su venta desde el frontend) saltaba directo
-    // a "Entregado" sin pasar por "Listo" de verdad, rompiendo el flujo de
-    // ESTADOS_PEDIDO_ORDEN. El pedido ahora se queda en el estado que el
-    // usuario eligió explícitamente, y solo llega a 'entregado' cuando
-    // alguien lo cambia desde PATCH /pedidos/:id/estado.
-    // Descontar del inventario los insumos + el vaso de la ficha técnica de
-    // cada producto vendido (ver descontarInventarioPorVenta arriba) sigue
-    // pasando igual, sin cambios.
+    
     await descontarInventarioPorVenta(ped[0].items);
 
     const { rows } = await pool.query(
-      // Antes no se pasaba `estado`, así que la venta quedaba con el
-      // default de la columna ('Activa'), un valor que ninguna pantalla
-      // del frontend reconoce (todas comparan contra 'vendido'/'devuelto').
-      // Eso hacía que la venta recién creada apareciera sin badge de estado
-      // y el botón "Registrar devolución" nunca se mostrara.
+      
       `INSERT INTO ventas(pedido_id, total, estado) VALUES($1,$2,'vendido') RETURNING *`,
       [id_pedido, ped[0].total]
     );
@@ -2610,12 +2749,9 @@ ventRouter.patch('/:id/estado', auth, async (req, res) => {
 });
 r.use('/ventas', ventRouter);
 
-// ── DEVOLUCIONES ───────────────────────────────────────────
+
 const devRouter = require('express').Router();
-// El listado de Devoluciones (admin) necesita el nombre del cliente y el
-// número de venta asociada, que solo se pueden sacar uniendo con pedidos/
-// ventas. Antes se hacía un SELECT * plano y el frontend nunca podía
-// mostrar el cliente ni cruzar la devolución con su venta.
+
 const DEV_SELECT = `
   SELECT
     d.id,
@@ -2645,24 +2781,144 @@ devRouter.get('/', auth, async (req, res) => {
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Tope de 20 palabras en el motivo de la devolución — igual que ya exige la
+// pantalla web, pero ahora también acá para que no se pueda saltar llamando
+// la API directo. Es UN solo motivo por devolución, compartido entre TODOS
+// los productos seleccionados en esa misma devolución (no hay tope "por
+// producto": pedir 3 productos en una sola devolución sigue exigiendo un
+// único motivo de máximo 20 palabras en total, no 20 por cada uno).
+const MOTIVO_DEVOLUCION_MAX_PALABRAS = 20;
+const contarPalabras = (texto) => textoLimpio(texto).split(/\s+/).filter(Boolean).length;
+
+// Identificador de una línea de "pedidos.items" tal como quedó guardada al
+// crear el pedido — mismo criterio de campos que idProductoDeItem (id /
+// id_producto / producto_id), pero SIN pasar por parseIdentificadorProducto:
+// acá interesa el identificador tal cual (incluido el "combo-5" sintético de
+// un combo), no separarlo en tipo/id, para poder comparar contra lo que
+// mande el cliente sin perder la posibilidad de devolver un combo completo.
+const identificadorLineaPedido = (it) => {
+  const raw = it?.id ?? it?.id_producto ?? it?.producto_id;
+  return (raw === undefined || raw === null || raw === '') ? null : String(raw);
+};
+
+// Acepta tanto el formato nuevo ("items": [{producto_id o item_index,
+// cantidad}, ...]) como el formato viejo (producto_id o item_index sueltos,
+// junto a "cantidad", directo en el body) — se normalizan a la misma forma
+// de lista para que el resto del handler no tenga que distinguir entre los
+// dos. Un "items" vacío no cae al formato viejo (evita que {items: []} se
+// confunda con "no mandaron items").
+const normalizarItemsSolicitados = (body) => {
+  if (Array.isArray(body.items) && body.items.length > 0) {
+    return body.items.map(it => ({
+      producto_id: it?.producto_id ?? it?.id ?? null,
+      item_index:  it?.item_index,
+      cantidad:    it?.cantidad,
+    }));
+  }
+  if (body.producto_id !== undefined || body.item_index !== undefined) {
+    return [{ producto_id: body.producto_id, item_index: body.item_index, cantidad: body.cantidad }];
+  }
+  return [];
+};
+
 devRouter.post('/', auth, async (req, res) => {
   try {
-  // Antes no se leía `tipo` (total/parcial) del body ni existía la columna
-  // en la tabla, así que toda devolución se mostraba como "Parcial" sin
-  // importar lo que el usuario hubiera elegido.
-  const { pedido_id, monto, items, tipo } = req.body;
+
+  const { pedido_id, monto, tipo } = req.body;
   if (!pedido_id) return res.status(400).json({ error: 'pedido_id es requerido' });
-  // El motivo solo se validaba en la pantalla (mínimo 10 caracteres), así
-  // que por API pasaba un motivo de puros espacios — o de 3.000 caracteres.
-  // Ahora se exige contenido real, el mismo mínimo de la pantalla, y un
-  // máximo que antes no existía en ninguna de las dos capas.
+
   const motivoLimpio = textoLimpio(req.body.motivo);
   if (!motivoLimpio) {
     return res.status(400).json({ error: 'El motivo de la devolución es obligatorio y no puede contener solo espacios en blanco.' });
   }
   const errorMotivo = errorLongitud(motivoLimpio, 'El motivo de la devolución', LIMITES.MOTIVO, LIMITES.MOTIVO_MINIMO);
   if (errorMotivo) return res.status(400).json({ error: errorMotivo });
+  if (contarPalabras(motivoLimpio) > MOTIVO_DEVOLUCION_MAX_PALABRAS) {
+    return res.status(400).json({ error: `El motivo de la devolución no puede superar las ${MOTIVO_DEVOLUCION_MAX_PALABRAS} palabras.` });
+  }
   const motivo = motivoLimpio;
+
+  const solicitados = normalizarItemsSolicitados(req.body);
+  if (solicitados.length === 0) {
+    return res.status(400).json({ error: 'Debes indicar al menos un producto a devolver ("items", o "producto_id"/"item_index" sueltos).' });
+  }
+
+  // Los productos/cantidades a devolver NUNCA se toman de lo que mande el
+  // cliente: se resuelven contra "pedidos.items" ya guardado en el backend
+  // (ver comentario de enriquecerItemsPedido más arriba — ese mismo array es
+  // la fuente de verdad de qué y cuánto se compró en este pedido), así un
+  // cliente no puede inventar un producto que no estaba en el pedido ni
+  // pedir devolver más unidades de las que realmente compró.
+  const { rows: pedidoRows } = await pool.query('SELECT id, items FROM pedidos WHERE id=$1', [pedido_id]);
+  if (!pedidoRows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+  const pedidoItems = Array.isArray(pedidoRows[0].items) ? pedidoRows[0].items : [];
+
+  const itemsResueltos = [];
+  const acumuladoPorId = new Map(); // suma lo pedido en ESTA devolución por identificador, para el tope de "no exceder lo comprado" cuando el mismo producto aparece más de una vez en la solicitud
+  for (let i = 0; i < solicitados.length; i++) {
+    const solicitado = solicitados[i];
+    const numeroItem = i + 1;
+
+    let idx = null;
+    if (solicitado.item_index !== undefined && solicitado.item_index !== null && solicitado.item_index !== '') {
+      const n = Number(solicitado.item_index);
+      if (!Number.isInteger(n) || n < 0 || n >= pedidoItems.length) {
+        return res.status(400).json({ error: `item_index inválido en el ítem ${numeroItem}: no existe esa línea en el pedido ${pedido_id}.` });
+      }
+      idx = n;
+    }
+
+    const idPorIndex = idx !== null ? identificadorLineaPedido(pedidoItems[idx]) : null;
+    const idPedido = idx !== null
+      ? idPorIndex
+      : (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
+          ? String(solicitado.producto_id) : null);
+    if (!idPedido) {
+      return res.status(400).json({ error: `Cada ítem debe indicar "producto_id" o "item_index" (ítem ${numeroItem}).` });
+    }
+
+    if (idx === null) {
+      idx = pedidoItems.findIndex(it => identificadorLineaPedido(it) === idPedido);
+      if (idx === -1) {
+        return res.status(400).json({ error: `El producto (${idPedido}) no pertenece al pedido ${pedido_id}.` });
+      }
+    } else if (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
+               && String(solicitado.producto_id) !== idPorIndex) {
+      return res.status(400).json({ error: `"producto_id" no coincide con "item_index" en el ítem ${numeroItem}.` });
+    }
+
+    const cantidad = Number(solicitado.cantidad);
+    if (!Number.isInteger(cantidad) || cantidad <= 0) {
+      return res.status(400).json({ error: `La cantidad a devolver del ítem ${numeroItem} debe ser un número entero mayor que cero.` });
+    }
+
+    // Cantidad comprada de este producto en TODO el pedido — sumada entre
+    // todas las líneas que compartan el mismo identificador (ej. el mismo
+    // producto pedido dos veces con toppings distintos), no solo la línea
+    // puntual que resolvió este ítem.
+    const totalComprado = pedidoItems.reduce(
+      (suma, it) => identificadorLineaPedido(it) === idPedido ? suma + (Number(it.cantidad) || 1) : suma,
+      0
+    );
+    const previoEnEstaSolicitud = acumuladoPorId.get(idPedido) || 0;
+    if (previoEnEstaSolicitud + cantidad > totalComprado) {
+      const linea = pedidoItems[idx];
+      return res.status(400).json({
+        error: `La cantidad a devolver de "${linea?.nombre ?? idPedido}" (${previoEnEstaSolicitud + cantidad}) excede lo comprado en el pedido (${totalComprado}).`,
+      });
+    }
+    acumuladoPorId.set(idPedido, previoEnEstaSolicitud + cantidad);
+
+    const linea = pedidoItems[idx];
+    itemsResueltos.push({
+      producto_id: idPedido,
+      item_index: idx,
+      nombre: linea?.nombre ?? null,
+      precio: linea?.precio ?? null,
+      cantidad,
+    });
+  }
+
   const { rows } = await pool.query(
     // El default de la columna quedó en 'Pendiente' (con mayúscula) pero
     // todo el frontend compara contra 'pendiente' en minúscula; sin este
@@ -2670,7 +2926,7 @@ devRouter.post('/', auth, async (req, res) => {
     // ningún filtro ni mostraba los botones de aprobar/rechazar.
     `INSERT INTO devoluciones(pedido_id,motivo,monto,items,tipo,estado)
      VALUES($1,$2,$3,$4,$5,'pendiente') RETURNING id`,
-    [pedido_id, motivo, monto || 0, JSON.stringify(items || []), tipo || 'total']
+    [pedido_id, motivo, monto || 0, JSON.stringify(itemsResueltos), tipo || (itemsResueltos.length > 1 ? 'parcial' : 'total')]
   );
   const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [rows[0].id]);
   res.status(201).json(full[0]);
@@ -2685,11 +2941,7 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
   const { rows } = await pool.query('UPDATE devoluciones SET estado=$1 WHERE id=$2 RETURNING *', [estado, req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Devolución no encontrada' });
 
-  // La UI le informa al usuario que aprobar/rechazar una devolución
-  // actualiza automáticamente el estado de la venta. Antes esto nunca
-  // pasaba: solo se tocaba la fila de `devoluciones`, así que la venta
-  // se quedaba "vendida" para siempre aunque la devolución estuviera
-  // aprobada.
+ 
   if (rows[0].pedido_id) {
     const nuevoEstadoVenta = estado === 'aprobada' ? 'devuelto' : 'vendido';
     await pool.query('UPDATE ventas SET estado=$1 WHERE pedido_id=$2', [nuevoEstadoVenta, rows[0].pedido_id]);
@@ -2701,19 +2953,7 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
 });
 r.use('/devoluciones', devRouter);
 
-// ── FICHAS TÉCNICAS ────────────────────────────────────────
-// ── FICHAS TÉCNICAS ─────────────────────────────────────────
-// El formulario (ModalFichaForm en FichasTecnicasPage) maneja bastante más
-// que producto/ingredientes: categoría de preparación, porciones, tiempo,
-// costo estimado, estado activo/inactivo, notas, resumen, preparación paso
-// a paso, el vaso usado, y la lista de insumos con cantidad/unidad. Los
-// alias de abajo devuelven exactamente esos nombres (id_producto, insumos,
-// fecha_registro, etc.) para que coincidan con lo que ya lee React.
-// f.toppings_ficha AS toppings: [{ topping_id, cantidad }] — cuánto de cada
-// topping asociado a este producto se usa específicamente en él (puede ser
-// distinto al "cantidad" por defecto del topping). Ver
-// descontarInventarioPorVenta más abajo, que la usa para saber cuánto
-// descontar del insumo del topping al confirmarse un pedido.
+
 const FICHA_COLS = `
   SELECT f.id, f.producto_id AS id_producto, p.nombre AS producto_nombre,
     f.categoria_prep, f.porciones, f.tiempo_prep, f.costo_estimado, f.estado,
@@ -2722,11 +2962,7 @@ const FICHA_COLS = `
   FROM fichas_tecnicas f LEFT JOIN productos p ON f.producto_id = p.id
 `;
 
-// El costo estimado de producción nunca puede superar el precio de venta
-// del producto. Antes esto solo se validaba en el formulario (React) — una
-// petición directa a la API (o un cliente desactualizado) podía guardar
-// una ficha inconsistente sin que nada del lado del servidor lo impidiera.
-// Se usa desde POST y PUT para no duplicar la consulta/comparación.
+
 const costoEstimadoSuperaPrecio = async (idProducto, costoEstimado) => {
   if (!idProducto || costoEstimado === undefined || costoEstimado === null) return false;
   const { rows } = await pool.query('SELECT precio FROM productos WHERE id=$1', [idProducto]);
@@ -2734,12 +2970,7 @@ const costoEstimadoSuperaPrecio = async (idProducto, costoEstimado) => {
   return Number(costoEstimado) > Number(rows[0].precio);
 };
 
-// Ya existe una ficha técnica activa para ese producto (ver el índice único
-// parcial fichas_tecnicas_producto_activo_uidx en config/db.js/schema.sql).
-// Se valida aparte, antes del INSERT, para poder devolver un 400 con un
-// mensaje claro en vez de que el usuario se encuentre con un 500 genérico
-// de violación de restricción única. excluirId se usa desde el PUT: al
-// editar una ficha no debe chocar contra sí misma.
+
 const existeFichaActivaParaProducto = async (idProducto, excluirId) => {
   if (!idProducto) return false;
   const { rows } = await pool.query(
@@ -2769,9 +3000,7 @@ fichaRouter.post('/', auth, async (req, res) => {
     id_producto, categoria_prep, porciones, tiempo_prep, costo_estimado,
     estado, notas, resumen_prep, preparacion, vaso_id, insumos, toppings,
   } = req.body;
-  // Ninguno de los tres campos de texto libre de la ficha tenía tope: se
-  // podía pegar un documento entero en "Preparación". Son opcionales (por
-  // eso solo se valida el máximo, no que vengan llenos).
+ 
   const errorTextoFicha =
     errorLongitud(notas,        'Las notas',                 LIMITES.NOTAS_FICHA) ||
     errorLongitud(resumen_prep, 'El resumen de preparación', LIMITES.NOTAS_FICHA) ||
@@ -2798,12 +3027,7 @@ fichaRouter.post('/', auth, async (req, res) => {
   const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [rows[0].id]);
   res.status(201).json(full[0]);
   } catch (e) {
-    // Red de seguridad ante una condición de carrera (dos peticiones POST
-    // casi simultáneas pasan la verificación de arriba antes de que
-    // cualquiera de las dos inserte): el índice único parcial de la base
-    // de datos (fichas_tecnicas_producto_activo_uidx) es la última línea
-    // de defensa, y su violación se traduce en el mismo 400 claro en vez
-    // de un 500 genérico.
+   
     if (e.code === '23505') {
       return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
     }
@@ -2816,9 +3040,7 @@ fichaRouter.put('/:id', auth, async (req, res) => {
     id_producto, categoria_prep, porciones, tiempo_prep, costo_estimado,
     estado, notas, resumen_prep, preparacion, vaso_id, insumos, toppings,
   } = req.body;
-  // Ninguno de los tres campos de texto libre de la ficha tenía tope: se
-  // podía pegar un documento entero en "Preparación". Son opcionales (por
-  // eso solo se valida el máximo, no que vengan llenos).
+  
   const errorTextoFicha =
     errorLongitud(notas,        'Las notas',                 LIMITES.NOTAS_FICHA) ||
     errorLongitud(resumen_prep, 'El resumen de preparación', LIMITES.NOTAS_FICHA) ||
@@ -2854,13 +3076,10 @@ fichaRouter.put('/:id', auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-// El botón de "Activar/Inactivar" del listado llama a esta ruta — antes no
-// existía y cada clic fallaba con 404.
+
 fichaRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
-  // Reactivar una ficha inactiva puede chocar con la que ya esté activa
-  // para el mismo producto (mismo índice único parcial que POST/PUT) — se
-  // valida antes del UPDATE para devolver el mismo 400 claro.
+  
   const { rows: actual } = await pool.query(
     'SELECT producto_id, estado FROM fichas_tecnicas WHERE id=$1', [req.params.id]
   );
@@ -2904,28 +3123,14 @@ fichaRouter.delete('/:id', auth, async (req, res) => {
 });
 r.use('/fichas-tecnicas', fichaRouter);
 
-// ── DISPONIBILIDAD (pública) ─────────────────────────────────
-// El Landing (tienda de cara al cliente) necesita saber cuántas unidades de
-// cada producto se pueden vender según el inventario real — pero /insumos y
-// /fichas-tecnicas viven detrás de `auth` porque exponen costos, proveedores
-// y recetas completas, datos que un visitante sin sesión no debe ver. Esta
-// ruta es la única forma pública de consultar disponibilidad: hace el mismo
-// cálculo que ya hacía el frontend (maxDisponible en Landing.jsx) pero del
-// lado del servidor, y solo devuelve { id_producto, stock_disponible }.
-//
-// Un producto SIN ficha técnica activa, o con una ficha sin insumos
-// registrados, no tiene límite conocido — se omite del arreglo (en vez de
-// mandar null/Infinity) para que el contrato de la respuesta sea siempre
-// un número real. El frontend debe interpretar "producto ausente de esta
-// lista" como "sin límite de stock".
+
 const dispRouter = require('express').Router();
 dispRouter.get('/', async (req, res) => {
   try {
     const { rows: fichas } = await pool.query(
       `SELECT producto_id, ingredientes FROM fichas_tecnicas WHERE estado = true`
     );
-    // Solo id + stock: nunca precio_unitario, proveedor_id ni nada más de
-    // la tabla insumos llega a esta respuesta.
+   
     const { rows: insumos } = await pool.query(`SELECT id, stock FROM insumos`);
     const stockPorInsumo = new Map(insumos.map(i => [String(i.id), Number(i.stock) || 0]));
 

@@ -42,6 +42,17 @@ pool.on('error', (err) => {
 
 const migrar = async () => {
   const alters = [
+    // roles: color identificador elegido en el formulario de Roles
+    // (RolFormPage.jsx) para la franja de la tarjeta en el listado
+    // (RolesPage.jsx). BUG CORREGIDO: la columna nunca existió — schema.sql
+    // solo definía id/nombre/descripcion/permisos/created_at, y las rutas
+    // POST/PUT /roles tampoco lo leían de req.body ni lo incluían en el
+    // INSERT/UPDATE, así que el color elegido se descartaba en silencio
+    // (nunca llegaba ni a intentar guardarse) y todo rol quedaba con
+    // rol.color=undefined, cayendo siempre al azul por defecto
+    // (rolesService.getColor -> COLORES[5]) sin importar qué color se
+    // hubiera elegido al crearlo.
+    `ALTER TABLE roles ADD COLUMN IF NOT EXISTS color VARCHAR(10)`,
     // usuarios (login con correo o usuario)
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS correo VARCHAR(150)`,
     // usuarios: marca del Superadministrador único e inmodificable
@@ -191,6 +202,21 @@ const migrar = async () => {
     // ejecutó en instalaciones existentes — el patrón de este archivo es
     // siempre sumar un paso nuevo, nunca editar uno anterior.
     `INSERT INTO categorias_insumos (nombre) VALUES ('Empaques') ON CONFLICT (nombre) DO NOTHING`,
+    // Tipos de Presentación (Compras): antes era una lista fija en el
+    // código del formulario (Caja, Paquete, Bolsa) — se convierte en un
+    // catálogo gestionable, mismo patrón que categorias_insumos. "Unitario"
+    // NO se siembra acá: no es un tipo gestionable, sigue siendo una
+    // opción fija y especial manejada aparte por el propio formulario de
+    // compra (Cantidad de presentaciones fija en 1, sin checkbox de nivel
+    // 3) — nunca debe poder editarse, desactivarse ni aparecer en este
+    // catálogo.
+    `CREATE TABLE IF NOT EXISTS tipos_presentacion (
+       id         SERIAL PRIMARY KEY,
+       nombre     VARCHAR(100) NOT NULL UNIQUE,
+       estado     VARCHAR(20)  NOT NULL DEFAULT 'Activo',
+       created_at TIMESTAMP DEFAULT NOW()
+     )`,
+    `INSERT INTO tipos_presentacion (nombre) VALUES ('Caja'), ('Paquete'), ('Bolsa') ON CONFLICT (nombre) DO NOTHING`,
     // Compras: el formulario siempre mandó observaciones y los datos del
     // comprobante (url, si quedó verificado, el total leído por OCR), pero
     // esas columnas nunca existieron, así que se perdían silenciosamente
@@ -286,6 +312,11 @@ const migrar = async () => {
     `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS apellidos VARCHAR(150)`,
     `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS tipo_documento VARCHAR(20)`,
     `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS numero_documento VARCHAR(20)`,
+    // Persona de contacto (Persona Jurídica): nombre de la persona con la
+    // que se trata dentro de la empresa proveedora. Campo nuevo, sin
+    // equivalente previo — antes de esta columna, el dato se habría
+    // perdido silenciosamente al guardar.
+    `ALTER TABLE proveedores ADD COLUMN IF NOT EXISTS persona_contacto VARCHAR(100)`,
     // Locales físicos para "recoger en el local" (tipo de entrega 'local').
     // NO es lo mismo que "sede" en pedidos/usuarios/empleados ('Local 1'/
     // 'Local 2'/'Ambos', la asignación operativa interna de qué cajero/
