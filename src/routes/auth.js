@@ -8,7 +8,7 @@ const { auth } = require('../middleware/auth');
 // el mismo perfil completo que ya muestra la web, con los mismos nombres
 // de campo, en vez de un subconjunto recortado.
 const { CLIENTE_COLS } = require('../config/clienteCols');
-const { passwordValida, PASSWORD_ERROR } = require('../config/passwordPolicy');
+const { passwordValida, PASSWORD_ERROR, errorPassword } = require('../config/passwordPolicy');
 // Validaciones compartidas de texto (ver config/validaciones.js): nombre no
 // vacío / no solo espacios y tope de longitud en el registro de clientes.
 const { textoLimpio, nombreNormalizado, errorNombre, LIMITES } = require('../config/validaciones');
@@ -65,7 +65,7 @@ router.post('/cliente/registro', async (req, res) => {
     // intenta saltarse la validación manualmente.
     if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
 
-    if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+    if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
 
     // Verificar duplicados. El correo se valida aparte porque es el caso
     // más común y necesita un mensaje claro y específico.
@@ -171,7 +171,7 @@ router.post('/cliente/recuperar', async (req, res) => {
 router.post('/cliente/reset-password', async (req, res) => {
   const { correo, token, nuevaPassword } = req.body;
   try {
-    if (!passwordValida(nuevaPassword)) return res.status(400).json({ error: PASSWORD_ERROR });
+    if (!passwordValida(nuevaPassword)) return res.status(400).json({ error: errorPassword(nuevaPassword) });
 
     const { rows } = await pool.query(
       `SELECT * FROM tokens_verificacion

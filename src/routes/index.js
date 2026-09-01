@@ -5,7 +5,7 @@ const { auth, permitirRoles } = require('../middleware/auth');
 const bcrypt  = require('bcryptjs');
 const crud    = require('./crud');
 const validateId = require('../middleware/validateId');
-const { passwordValida, PASSWORD_ERROR } = require('../config/passwordPolicy');
+const { passwordValida, PASSWORD_ERROR, errorPassword } = require('../config/passwordPolicy');
 // Validaciones compartidas de texto: nombres vacíos / solo espacios,
 // duplicados sin distinguir mayúsculas ni espacios de más, y topes de
 // longitud. Ver config/validaciones.js.
@@ -13,6 +13,9 @@ const {
   textoLimpio, nombreNormalizado, LIMITES,
   errorNombre, errorLongitud, nombreDuplicado,
 } = require('../config/validaciones');
+// Vocabulario y derivación del "tipo de preparación" de una ficha técnica a
+// partir de la categoría del producto. Ver config/tiposPreparacion.js.
+const { resolverTipoPreparacion } = require('../config/tiposPreparacion');
 
 const r = express.Router();
 
@@ -166,7 +169,7 @@ usrRouter.post('/', auth, async (req, res) => {
   const nombre   = nombreNormalizado(req.body.nombre);
   const username = nombreNormalizado(req.body.username);
 
-  if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+  if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
   try {
     // Duplicado de username ignorando mayúsculas/espacios (el UNIQUE de la
     // columna sí distingue mayúsculas, así que "Ana" y "ANA" pasaban).
@@ -220,7 +223,7 @@ usrRouter.put('/:id', auth, async (req, res) => {
 
     let q, vals;
     if (password) {
-      if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+      if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
       const hash = await bcrypt.hash(password, 10);
       q = 'UPDATE usuarios SET nombre=$1,username=$2,correo=$3,password=$4,rol=$5,sede=$6 WHERE id=$7 RETURNING id,nombre,username,correo,rol,sede,es_superadmin';
       vals = [nombre, username, correo || null, hash, rolFinal, sedeFinal, req.params.id];
@@ -330,14 +333,28 @@ cliRouter.put('/mi-perfil', auth, actualizarMiPerfil);
 // nunca se toca aquí a propósito.
 cliRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { nombre, telefono, tipoDoc, numeroDoc, departamento, municipio, direccion } = req.body;
+  // `comuna` se leía en el PUT del propio cliente (/me) pero NO aquí, así
+  // que al editar un cliente desde el panel de administración el campo se
+  // descartaba en silencio: la pantalla lo mostraba y lo enviaba, y el
+  // cliente se quedaba con la comuna que puso al registrarse.
+  //
+  // El CASE de abajo distingue dos situaciones que NO son lo mismo:
+  //   • el cliente HTTP no mandó "comuna"  → se conserva la que ya tenía
+  //     (así un consumidor antiguo de esta API no borra el dato sin querer);
+  //   • la mandó vacía                     → se limpia a propósito (es lo
+  //     que pasa cuando el cliente deja de vivir en Medellín, donde el
+  //     selector de comuna ni siquiera se muestra).
+  const { nombre, telefono, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion } = req.body;
   if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es obligatorio.' });
   if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
+  const mandoComuna = comuna !== undefined;
   const { rows } = await pool.query(
     `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4,
-       departamento=$5, municipio=$6, direccion=$7
-     WHERE id=$8 RETURNING ${CLIENTE_COLS}`,
-    [nombre, telefono || null, tipoDoc || null, numeroDoc || null, departamento || null, municipio || null, direccion || null, req.params.id]
+       departamento=$5, municipio=$6, direccion=$7,
+       comuna = CASE WHEN $8::boolean THEN $9 ELSE comuna END
+     WHERE id=$10 RETURNING ${CLIENTE_COLS}`,
+    [nombre, telefono || null, tipoDoc || null, numeroDoc || null, departamento || null, municipio || null, direccion || null,
+     mandoComuna, mandoComuna ? (textoLimpio(comuna) || null) : null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Cliente no encontrado' });
   res.json(rows[0]);
@@ -409,6 +426,14 @@ empRouter.post('/', auth, async (req, res) => {
   const nombre   = nombreNormalizado(req.body.nombre);
   const telefono = textoLimpio(req.body.telefono) || null;
   const correo   = textoLimpio(req.body.correo)   || null;
+  // Documento, dirección y local: el formulario siempre los envió, pero
+  // antes se descartaban en silencio (ni el INSERT ni las columnas
+  // existían). Ver la migración de empleados en config/db.js.
+  const tipoDoc   = textoLimpio(req.body.tipoDoc   ?? req.body.tipo_doc)   || null;
+  const numeroDoc = textoLimpio(req.body.numeroDoc ?? req.body.numero_doc) || null;
+  const direccion = textoLimpio(req.body.direccion) || null;
+  const localId   = Number.isInteger(Number(req.body.local_id)) && Number(req.body.local_id) > 0
+    ? Number(req.body.local_id) : null;
   const username = req.body.username !== undefined && req.body.username !== null
     ? nombreNormalizado(req.body.username)
     : req.body.username;
@@ -432,7 +457,7 @@ empRouter.post('/', auth, async (req, res) => {
       if (!username || !password) {
         return res.status(400).json({ error: 'Usuario y contraseña son obligatorios para el cargo ' + cargo + '.' });
       }
-      if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+      if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
       const hash = await bcrypt.hash(password, 10);
       const { rows: nuevoUsuario } = await pool.query(
         'INSERT INTO usuarios(nombre,username,correo,password,rol,sede) VALUES($1,$2,$3,$4,$5,$6) RETURNING id',
@@ -441,9 +466,10 @@ empRouter.post('/', auth, async (req, res) => {
       usuarioId = nuevoUsuario[0].id;
     }
     const { rows } = await pool.query(
-      `INSERT INTO empleados(nombre,cargo,telefono,correo,estado,sede,usuario_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [nombre, cargo || null, telefono || null, correo || null, estado || 'Activo', sedeFinal, usuarioId]
+      `INSERT INTO empleados(nombre,cargo,telefono,correo,estado,sede,usuario_id,tipo_doc,numero_doc,direccion,local_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+      [nombre, cargo || null, telefono || null, correo || null, estado || 'Activo', sedeFinal, usuarioId,
+       tipoDoc, numeroDoc, direccion, localId]
     );
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -458,6 +484,12 @@ empRouter.put('/:id', auth, async (req, res) => {
   const nombre   = nombreNormalizado(req.body.nombre);
   const telefono = textoLimpio(req.body.telefono) || null;
   const correo   = textoLimpio(req.body.correo)   || null;
+  // Mismos campos que en el POST (ver ahí el motivo).
+  const tipoDoc   = textoLimpio(req.body.tipoDoc   ?? req.body.tipo_doc)   || null;
+  const numeroDoc = textoLimpio(req.body.numeroDoc ?? req.body.numero_doc) || null;
+  const direccion = textoLimpio(req.body.direccion) || null;
+  const localId   = Number.isInteger(Number(req.body.local_id)) && Number(req.body.local_id) > 0
+    ? Number(req.body.local_id) : null;
   // Ojo: aquí username puede llegar ausente a propósito (el UPDATE de abajo
   // usa COALESCE para conservar el que ya tenía), así que solo se normaliza
   // si realmente vino algo — nunca se convierte un undefined en ''.
@@ -486,7 +518,7 @@ empRouter.put('/:id', auth, async (req, res) => {
       if (usuarioId) {
         // Ya tenía cuenta: se actualiza (y la contraseña solo si mandaron una nueva).
         if (password) {
-          if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+          if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
           const hash = await bcrypt.hash(password, 10);
           await pool.query(
             'UPDATE usuarios SET nombre=$1,username=COALESCE($2,username),correo=$3,password=$4,rol=$5,sede=$6 WHERE id=$7',
@@ -500,7 +532,7 @@ empRouter.put('/:id', auth, async (req, res) => {
         }
       } else if (username && password) {
         // Antes no tenía cuenta (ej. cambió de "Barista" a "Cajero"): se crea ahora.
-        if (!passwordValida(password)) return res.status(400).json({ error: PASSWORD_ERROR });
+        if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
         const hash = await bcrypt.hash(password, 10);
         const { rows: nuevoUsuario } = await pool.query(
           'INSERT INTO usuarios(nombre,username,correo,password,rol,sede) VALUES($1,$2,$3,$4,$5,$6) RETURNING id',
@@ -513,9 +545,11 @@ empRouter.put('/:id', auth, async (req, res) => {
     }
 
     const { rows } = await pool.query(
-      `UPDATE empleados SET nombre=$1,cargo=$2,telefono=$3,correo=$4,estado=$5,sede=$6,usuario_id=$7
-       WHERE id=$8 RETURNING *`,
-      [nombre, cargo || null, telefono || null, correo || null, estado || 'Activo', sedeFinal, usuarioId, req.params.id]
+      `UPDATE empleados SET nombre=$1,cargo=$2,telefono=$3,correo=$4,estado=$5,sede=$6,usuario_id=$7,
+         tipo_doc=$8,numero_doc=$9,direccion=$10,local_id=$11
+       WHERE id=$12 RETURNING *`,
+      [nombre, cargo || null, telefono || null, correo || null, estado || 'Activo', sedeFinal, usuarioId,
+       tipoDoc, numeroDoc, direccion, localId, req.params.id]
     );
     res.json(rows[0]);
   } catch (e) {
@@ -2963,24 +2997,207 @@ const FICHA_COLS = `
 `;
 
 
-const costoEstimadoSuperaPrecio = async (idProducto, costoEstimado) => {
-  if (!idProducto || costoEstimado === undefined || costoEstimado === null) return false;
-  const { rows } = await pool.query('SELECT precio FROM productos WHERE id=$1', [idProducto]);
-  if (!rows[0]) return false;
-  return Number(costoEstimado) > Number(rows[0].precio);
+// ── Validación de una ficha técnica ─────────────────────────────────────────
+// Antes, la API aceptaba prácticamente cualquier cosa en este módulo: una
+// ficha sin producto, sin insumos, sin vaso y sin preparación; cantidades en
+// 0 o negativas; insumos que no existen; notas de puros espacios; y un
+// "tipo de preparación" cualquiera. Todas esas reglas vivían solo en el
+// formulario de React, así que llamando la API directamente (Postman/curl,
+// o la app móvil) se saltaban por completo. Estas funciones las replican en
+// el servidor, que es el único lugar donde no se pueden evadir.
+
+// Devuelve el producto (id, nombre, categoria, precio) o null si no existe.
+const obtenerProductoDeFicha = async (idProducto) => {
+  const { rows } = await pool.query(
+    'SELECT id, nombre, categoria, precio FROM productos WHERE id=$1', [idProducto]
+  );
+  return rows[0] || null;
 };
 
-
-const existeFichaActivaParaProducto = async (idProducto, excluirId) => {
+// Un producto solo puede tener UNA ficha técnica, activa o inactiva. Antes
+// esto solo se revisaba entre fichas ACTIVAS, así que se podían acumular
+// fichas inactivas repetidas del mismo producto (duplicados reales, que
+// además reaparecían al reactivarlas). `excluirId` es el id de la propia
+// ficha al editar, para que no se detecte a sí misma.
+const existeFichaParaProducto = async (idProducto, excluirId) => {
   if (!idProducto) return false;
   const { rows } = await pool.query(
-    `SELECT id FROM fichas_tecnicas WHERE producto_id=$1 AND estado=true AND id <> COALESCE($2, -1)`,
+    `SELECT id, estado FROM fichas_tecnicas
+      WHERE producto_id=$1 AND id <> COALESCE($2, -1) LIMIT 1`,
     [idProducto, excluirId || null]
   );
-  return rows.length > 0;
+  return rows[0] || false;
 };
 
+const ERROR_FICHA_DUPLICADA =
+  'Este producto ya tiene una ficha técnica registrada. Edítala en vez de crear una nueva.';
+
+// Número entero dentro de un rango. Rechaza texto, decimales, NaN, Infinity
+// y valores fuera de rango — antes `porciones: "abc"` llegaba a Postgres y
+// reventaba con un error 500 crudo de tipos.
+const errorEntero = (valor, etiqueta, min, max) => {
+  const n = Number(valor);
+  if (valor === undefined || valor === null || String(valor).trim() === '' || !Number.isFinite(n)) {
+    return `${etiqueta} es obligatorio y debe ser un número.`;
+  }
+  if (!Number.isInteger(n)) return `${etiqueta} debe ser un número entero.`;
+  if (n < min || n > max) return `${etiqueta} debe estar entre ${min} y ${max}.`;
+  return null;
+};
+
+// Valida una lista de insumos/toppings de la ficha: [{ id_insumo, cantidad,
+// unidad }]. Revisa que cada fila esté completa, con cantidad > 0, que el
+// insumo exista de verdad en la tabla `insumos`, y que no se repita el mismo
+// insumo dos veces en la misma lista. Devuelve { error } o { filas } ya
+// normalizadas (números, no texto) listas para guardar.
+// `contexto` es cómo se llama la sección en la pantalla ("los insumos
+// requeridos" / "los toppings"), para que el mensaje se lea natural y el
+// usuario sepa exactamente en qué parte del formulario está el problema.
+const validarLineasInsumo = async (lista, contexto, { obligatoria }) => {
+  const errorVacio = 'Debes registrar al menos un insumo en la ficha técnica.';
+  if (lista === undefined || lista === null) {
+    return obligatoria ? { error: errorVacio } : { filas: [] };
+  }
+  if (!Array.isArray(lista)) return { error: `El formato de ${contexto} no es válido.` };
+  const filas = [];
+  const vistos = new Set();
+  for (const item of lista) {
+    if (!item || typeof item !== 'object') return { error: `El formato de ${contexto} no es válido.` };
+    const idInsumo = Number(item.id_insumo);
+    const cantidad = Number(item.cantidad);
+    if (!Number.isInteger(idInsumo) || idInsumo <= 0) {
+      return { error: `Hay una fila en ${contexto} sin insumo seleccionado.` };
+    }
+    if (!Number.isFinite(cantidad) || cantidad <= 0) {
+      return { error: `Las cantidades de ${contexto} deben ser números mayores a 0.` };
+    }
+    if (vistos.has(idInsumo)) {
+      return { error: `No puedes repetir el mismo insumo dos veces en ${contexto}.` };
+    }
+    vistos.add(idInsumo);
+    filas.push({ id_insumo: idInsumo, cantidad, unidad: textoLimpio(item.unidad) || null });
+  }
+  if (obligatoria && filas.length === 0) return { error: errorVacio };
+  if (filas.length > 0) {
+    // Un solo SELECT para todos los ids: comprueba de una vez que todos
+    // existan, y de paso trae la unidad real registrada para cada insumo
+    // (la ficha nunca debe guardar una unidad distinta a la del insumo).
+    const ids = filas.map(f => f.id_insumo);
+    const { rows } = await pool.query('SELECT id, unidad FROM insumos WHERE id = ANY($1::int[])', [ids]);
+    const unidadPorId = new Map(rows.map(r => [r.id, r.unidad]));
+    const faltantes = ids.filter(id => !unidadPorId.has(id));
+    if (faltantes.length) {
+      return { error: `En ${contexto} hay insumos que ya no existen en el inventario (id: ${faltantes.join(', ')}).` };
+    }
+    for (const f of filas) f.unidad = unidadPorId.get(f.id_insumo) || f.unidad;
+  }
+  return { filas };
+};
+
+// Validación completa del cuerpo de una ficha técnica, compartida por POST y
+// PUT. Devuelve { error } con el primer problema encontrado, o { datos } con
+// todos los valores ya limpios y normalizados, listos para el INSERT/UPDATE.
+const validarFichaTecnica = async (body, excluirId) => {
+  // 1. Producto: obligatorio y tiene que existir. Antes se guardaba como
+  //    NULL sin quejarse, dejando fichas "huérfanas" imposibles de asociar
+  //    a nada y que además burlaban el control de duplicados.
+  const idProducto = Number(body.id_producto);
+  if (!Number.isInteger(idProducto) || idProducto <= 0) {
+    return { error: 'Debes seleccionar el producto al que pertenece esta ficha técnica.' };
+  }
+  const producto = await obtenerProductoDeFicha(idProducto);
+  if (!producto) return { error: 'El producto seleccionado no existe.' };
+
+  // 2. Un producto = una ficha (activa o inactiva).
+  if (await existeFichaParaProducto(idProducto, excluirId)) {
+    return { error: ERROR_FICHA_DUPLICADA };
+  }
+
+  // 3. Parámetros de producción.
+  const errorPorciones = errorEntero(body.porciones, 'La unidad (porciones)', 1, 1000);
+  if (errorPorciones) return { error: errorPorciones };
+  const errorTiempo = errorEntero(body.tiempo_prep, 'El tiempo de preparación', 1, 1440);
+  if (errorTiempo) return { error: errorTiempo };
+
+  const costo = Number(body.costo_estimado);
+  if (body.costo_estimado === undefined || body.costo_estimado === null ||
+      String(body.costo_estimado).trim() === '' || !Number.isFinite(costo) || costo < 0) {
+    return { error: 'El costo estimado es obligatorio y debe ser un número mayor o igual a 0.' };
+  }
+  // Mismo criterio que el formulario: igualar el precio de venta ya
+  // significa vender sin ganancia, así que también se bloquea (antes el
+  // servidor solo rechazaba costo > precio, y la pantalla costo >= precio).
+  if (Number(producto.precio) > 0 && costo >= Number(producto.precio)) {
+    return { error: 'El costo estimado supera o iguala el precio de venta del producto. Revisa la ficha técnica para evitar pérdidas.' };
+  }
+
+  // 4. Textos: obligatorios los que de verdad lo son, y nunca "solo espacios".
+  const preparacion = textoLimpio(body.preparacion);
+  if (!preparacion) {
+    return { error: 'El proceso de preparación es obligatorio y no puede contener solo espacios en blanco.' };
+  }
+  const errorTextoFicha =
+    errorLongitud(body.notas,        'Las notas',                 LIMITES.NOTAS_FICHA) ||
+    errorLongitud(body.resumen_prep, 'El resumen de preparación', LIMITES.NOTAS_FICHA) ||
+    errorLongitud(preparacion,       'La preparación',            LIMITES.PREPARACION);
+  if (errorTextoFicha) return { error: errorTextoFicha };
+
+  // 5. Insumos (obligatorios) y toppings propios de la ficha (opcionales).
+  //    El frontend manda los toppings en `toppings_ficha`; se acepta también
+  //    `toppings` por compatibilidad con cualquier cliente anterior.
+  const resInsumos = await validarLineasInsumo(body.insumos, 'los insumos requeridos', { obligatoria: true });
+  if (resInsumos.error) return { error: resInsumos.error };
+  const listaToppings = body.toppings_ficha !== undefined ? body.toppings_ficha : body.toppings;
+  const resToppings = await validarLineasInsumo(listaToppings, 'los toppings', { obligatoria: false });
+  if (resToppings.error) return { error: resToppings.error };
+
+  // 6. Vaso: obligatorio y tiene que ser un insumo real. El formulario ya lo
+  //    exigía; el servidor lo aceptaba vacío, y sin vaso el descuento de
+  //    inventario por venta se queda corto (ver descontarInventarioPorVenta).
+  const vasoId = Number(body.vaso_id);
+  if (!Number.isInteger(vasoId) || vasoId <= 0) {
+    return { error: 'Debes seleccionar el vaso utilizado para este producto.' };
+  }
+  const { rows: vaso } = await pool.query('SELECT id FROM insumos WHERE id=$1', [vasoId]);
+  if (!vaso[0]) return { error: 'El vaso seleccionado no existe en el inventario de insumos.' };
+
+  // 7. Tipo de preparación: se deduce de la categoría del producto siempre
+  //    que se pueda (es lo mismo que muestra el formulario, bloqueado), y
+  //    solo si no se puede deducir se respeta lo que haya elegido el
+  //    usuario. Ver config/tiposPreparacion.js.
+  const categoriaPrep = resolverTipoPreparacion(producto.categoria, body.categoria_prep);
+
+  // 8. Estado: solo booleano real (antes un "false" en texto se guardaba
+  //    como true, porque Postgres lo interpreta como cadena no vacía).
+  const estado = body.estado === undefined || body.estado === null
+    ? true
+    : (body.estado === true || body.estado === 'true' || body.estado === 1 || body.estado === '1');
+
+  return {
+    datos: {
+      producto_id: idProducto,
+      categoria_prep: categoriaPrep,
+      porciones: Number(body.porciones),
+      tiempo_prep: Number(body.tiempo_prep),
+      costo_estimado: costo,
+      estado,
+      notas: textoLimpio(body.notas) || null,
+      resumen_prep: textoLimpio(body.resumen_prep) || null,
+      preparacion,
+      vaso_id: vasoId,
+      insumos: resInsumos.filas,
+      toppings: resToppings.filas,
+    },
+  };
+};
+
+
 const fichaRouter = require('express').Router();
+// Valida :id (numérico) antes de que llegue a cualquier consulta, igual que
+// el resto de routers. Sin esto, un id no numérico llegaba tal cual a
+// Postgres y devolvía un 500 críptico ("la sintaxis de entrada no es válida
+// para tipo integer") en vez de un 400 claro.
+fichaRouter.param('id', validateId);
 fichaRouter.get('/', auth, async (req, res) => {
   try {
   const { rows } = await pool.query(`${FICHA_COLS} ORDER BY f.id DESC`);
@@ -2996,97 +3213,83 @@ fichaRouter.get('/:id', auth, async (req, res) => {
 });
 fichaRouter.post('/', auth, async (req, res) => {
   try {
-  const {
-    id_producto, categoria_prep, porciones, tiempo_prep, costo_estimado,
-    estado, notas, resumen_prep, preparacion, vaso_id, insumos, toppings,
-  } = req.body;
- 
-  const errorTextoFicha =
-    errorLongitud(notas,        'Las notas',                 LIMITES.NOTAS_FICHA) ||
-    errorLongitud(resumen_prep, 'El resumen de preparación', LIMITES.NOTAS_FICHA) ||
-    errorLongitud(preparacion,  'La preparación',            LIMITES.PREPARACION);
-  if (errorTextoFicha) return res.status(400).json({ error: errorTextoFicha });
-  if (await costoEstimadoSuperaPrecio(id_producto, costo_estimado)) {
-    return res.status(400).json({ error: 'El costo estimado supera el valor de venta del producto.' });
-  }
-  const estadoNuevo = estado !== undefined ? estado : true;
-  if (estadoNuevo && await existeFichaActivaParaProducto(id_producto)) {
-    return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
-  }
-  const { rows } = await pool.query(
-    `INSERT INTO fichas_tecnicas
-       (producto_id,categoria_prep,porciones,tiempo_prep,costo_estimado,estado,notas,resumen_prep,preparacion,vaso_id,ingredientes,toppings_ficha)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-    [
-      id_producto || null, categoria_prep || 'Caliente', porciones || 1, tiempo_prep || 5,
-      costo_estimado || 0, estadoNuevo, notas || null,
-      resumen_prep || null, preparacion || null, vaso_id || null, JSON.stringify(insumos || []),
-      JSON.stringify(toppings || []),
-    ]
-  );
-  const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [rows[0].id]);
-  res.status(201).json(full[0]);
+    // Toda la validación vive en validarFichaTecnica (arriba): producto
+    // obligatorio y existente, sin fichas repetidas, parámetros numéricos
+    // dentro de rango, costo por debajo del precio de venta, preparación
+    // obligatoria, insumos y vaso reales, y tipo de preparación derivado de
+    // la categoría del producto.
+    const { error, datos } = await validarFichaTecnica(req.body, null);
+    if (error) return res.status(400).json({ error });
+
+    const { rows } = await pool.query(
+      `INSERT INTO fichas_tecnicas
+         (producto_id,categoria_prep,porciones,tiempo_prep,costo_estimado,estado,notas,resumen_prep,preparacion,vaso_id,ingredientes,toppings_ficha)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+      [
+        datos.producto_id, datos.categoria_prep, datos.porciones, datos.tiempo_prep,
+        datos.costo_estimado, datos.estado, datos.notas,
+        datos.resumen_prep, datos.preparacion, datos.vaso_id,
+        JSON.stringify(datos.insumos), JSON.stringify(datos.toppings),
+      ]
+    );
+    const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
   } catch (e) {
-   
-    if (e.code === '23505') {
-      return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
-    }
+    // Red de seguridad ante dos peticiones simultáneas para el mismo
+    // producto: el índice único parcial de Postgres las frena aunque la
+    // consulta de duplicados de arriba no alcance a verlas.
+    if (e.code === '23505') return res.status(400).json({ error: ERROR_FICHA_DUPLICADA });
     res.status(500).json({ error: e.message });
   }
 });
 fichaRouter.put('/:id', auth, async (req, res) => {
   try {
-  const {
-    id_producto, categoria_prep, porciones, tiempo_prep, costo_estimado,
-    estado, notas, resumen_prep, preparacion, vaso_id, insumos, toppings,
-  } = req.body;
-  
-  const errorTextoFicha =
-    errorLongitud(notas,        'Las notas',                 LIMITES.NOTAS_FICHA) ||
-    errorLongitud(resumen_prep, 'El resumen de preparación', LIMITES.NOTAS_FICHA) ||
-    errorLongitud(preparacion,  'La preparación',            LIMITES.PREPARACION);
-  if (errorTextoFicha) return res.status(400).json({ error: errorTextoFicha });
-  if (await costoEstimadoSuperaPrecio(id_producto, costo_estimado)) {
-    return res.status(400).json({ error: 'El costo estimado supera el valor de venta del producto.' });
-  }
-  const estadoNuevo = estado !== undefined ? estado : true;
-  if (estadoNuevo && await existeFichaActivaParaProducto(id_producto, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
-  }
-  const { rows } = await pool.query(
-    `UPDATE fichas_tecnicas SET
-       producto_id=$1, categoria_prep=$2, porciones=$3, tiempo_prep=$4, costo_estimado=$5,
-       estado=$6, notas=$7, resumen_prep=$8, preparacion=$9, vaso_id=$10, ingredientes=$11, toppings_ficha=$12
-     WHERE id=$13 RETURNING id`,
-    [
-      id_producto || null, categoria_prep || 'Caliente', porciones || 1, tiempo_prep || 5,
-      costo_estimado || 0, estadoNuevo, notas || null,
-      resumen_prep || null, preparacion || null, vaso_id || null, JSON.stringify(insumos || []),
-      JSON.stringify(toppings || []),
-      req.params.id,
-    ]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Ficha técnica no encontrada' });
-  const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [req.params.id]);
-  res.json(full[0]);
+    const { rows: actual } = await pool.query('SELECT id FROM fichas_tecnicas WHERE id=$1', [req.params.id]);
+    if (!actual[0]) return res.status(404).json({ error: 'Ficha técnica no encontrada' });
+
+    const { error, datos } = await validarFichaTecnica(req.body, req.params.id);
+    if (error) return res.status(400).json({ error });
+
+    const { rows } = await pool.query(
+      `UPDATE fichas_tecnicas SET
+         producto_id=$1, categoria_prep=$2, porciones=$3, tiempo_prep=$4, costo_estimado=$5,
+         estado=$6, notas=$7, resumen_prep=$8, preparacion=$9, vaso_id=$10, ingredientes=$11, toppings_ficha=$12
+       WHERE id=$13 RETURNING id`,
+      [
+        datos.producto_id, datos.categoria_prep, datos.porciones, datos.tiempo_prep,
+        datos.costo_estimado, datos.estado, datos.notas,
+        datos.resumen_prep, datos.preparacion, datos.vaso_id,
+        JSON.stringify(datos.insumos), JSON.stringify(datos.toppings),
+        req.params.id,
+      ]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Ficha técnica no encontrada' });
+    const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [req.params.id]);
+    res.json(full[0]);
   } catch (e) {
-    if (e.code === '23505') {
-      return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
-    }
+    if (e.code === '23505') return res.status(400).json({ error: ERROR_FICHA_DUPLICADA });
     res.status(500).json({ error: e.message });
   }
 });
 
 fichaRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
-  
   const { rows: actual } = await pool.query(
     'SELECT producto_id, estado FROM fichas_tecnicas WHERE id=$1', [req.params.id]
   );
   if (!actual[0]) return res.status(404).json({ error: 'Ficha técnica no encontrada' });
+  // Con la regla de "un producto = una ficha" ya no puede haber otra ficha
+  // del mismo producto compitiendo, pero el chequeo se mantiene como red de
+  // seguridad para bases de datos que traigan duplicados de antes de esta
+  // corrección: en ese caso reactivar una avisa en vez de fallar con un
+  // error 500 crudo del índice único.
   const vaAQuedarActiva = !actual[0].estado;
-  if (vaAQuedarActiva && await existeFichaActivaParaProducto(actual[0].producto_id, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
+  if (vaAQuedarActiva && actual[0].producto_id) {
+    const { rows: otraActiva } = await pool.query(
+      `SELECT id FROM fichas_tecnicas WHERE producto_id=$1 AND estado=true AND id <> $2 LIMIT 1`,
+      [actual[0].producto_id, req.params.id]
+    );
+    if (otraActiva[0]) return res.status(400).json({ error: ERROR_FICHA_DUPLICADA });
   }
   const { rows } = await pool.query(
     `UPDATE fichas_tecnicas SET estado = NOT estado WHERE id=$1 RETURNING id, producto_id, estado`,
@@ -3109,15 +3312,18 @@ fichaRouter.patch('/:id/estado', auth, async (req, res) => {
   const { rows: full } = await pool.query(`${FICHA_COLS} WHERE f.id=$1`, [req.params.id]);
   res.json(full[0]);
   } catch (e) {
-    if (e.code === '23505') {
-      return res.status(400).json({ error: 'Ya existe una ficha técnica activa para este producto. Edítala en vez de crear una nueva.' });
-    }
+    if (e.code === '23505') return res.status(400).json({ error: ERROR_FICHA_DUPLICADA });
     res.status(500).json({ error: e.message });
   }
 });
+
 fichaRouter.delete('/:id', auth, async (req, res) => {
   try {
-  await pool.query('DELETE FROM fichas_tecnicas WHERE id=$1', [req.params.id]);
+  // RETURNING id: antes esto respondía { ok: true } aunque no se hubiera
+  // borrado nada (id inexistente o ya eliminado por otra pestaña), y la
+  // pantalla mostraba "Ficha técnica anulada" sin que pasara nada.
+  const { rows } = await pool.query('DELETE FROM fichas_tecnicas WHERE id=$1 RETURNING id', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Ficha técnica no encontrada' });
   res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

@@ -118,6 +118,21 @@ const migrar = async () => {
     // cuenta de acceso real en "usuarios" (login, rol, contraseña).
     `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS sede VARCHAR(20) NOT NULL DEFAULT 'Local 1'`,
     `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL`,
+    // Tipo/número de documento, dirección de residencia y local real del
+    // empleado: el formulario de "Nuevo empleado" SIEMPRE pidió estos
+    // cuatro datos y el frontend siempre los envió, pero las columnas no
+    // existían en este archivo y el INSERT/UPDATE tampoco los guardaba —
+    // se perdían en silencio, sin ningún error visible, y el modal "Ver
+    // detalle" mostraba siempre "—" en esos campos.
+    `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS tipo_doc   VARCHAR(50)`,
+    `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS numero_doc VARCHAR(30)`,
+    `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS direccion  TEXT`,
+    // local_id sin REFERENCES en línea, igual que pedidos.local_id: la
+    // tabla "locales" se crea más abajo en este mismo arreglo, así que la
+    // FK no se puede declarar aquí. Se deja como INTEGER simple porque el
+    // dato operativo real sigue siendo "sede" (nombre en texto); local_id
+    // es la referencia moderna que ya envía el formulario.
+    `ALTER TABLE empleados ADD COLUMN IF NOT EXISTS local_id   INTEGER`,
     // devoluciones: faltaba la columna `tipo` (total/parcial) que el
     // frontend siempre intentó leer.
     `ALTER TABLE devoluciones ADD COLUMN IF NOT EXISTS tipo VARCHAR(20) DEFAULT 'total'`,

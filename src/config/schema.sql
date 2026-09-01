@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS empleados (
 -- con su cuenta de acceso real en "usuarios" (username/password/rol).
 ALTER TABLE empleados ADD COLUMN IF NOT EXISTS sede VARCHAR(20) NOT NULL DEFAULT 'Local 1';
 ALTER TABLE empleados ADD COLUMN IF NOT EXISTS usuario_id INTEGER REFERENCES usuarios(id) ON DELETE SET NULL;
+-- Migración: datos de identificación y residencia del empleado. El
+-- formulario siempre los pidió y el frontend siempre los envió, pero estas
+-- columnas no existían, así que se descartaban en silencio al guardar.
+ALTER TABLE empleados ADD COLUMN IF NOT EXISTS tipo_doc   VARCHAR(50);
+ALTER TABLE empleados ADD COLUMN IF NOT EXISTS numero_doc VARCHAR(30);
+ALTER TABLE empleados ADD COLUMN IF NOT EXISTS direccion  TEXT;
+ALTER TABLE empleados ADD COLUMN IF NOT EXISTS local_id   INTEGER;
 
 CREATE TABLE IF NOT EXISTS categorias (
   id          SERIAL PRIMARY KEY,
