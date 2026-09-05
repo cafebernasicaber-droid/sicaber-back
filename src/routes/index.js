@@ -1251,7 +1251,6 @@ provRouter.put('/:id', auth, async (req, res) => {
     }
     const { rows: actual } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
     if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
-    const seDesactiva = actual[0].estado === 'Activo' && body.estado === 'Inactivo';
 
     const vals = [...PROVEEDOR_FIELD_MAP.map(([, key]) => body[key] ?? null), req.params.id];
     const { rows } = await pool.query(
@@ -1260,19 +1259,8 @@ provRouter.put('/:id', auth, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
 
-    // Al desactivar un proveedor desde el formulario de edición, sus
-    // insumos activos también quedan inactivos — igual que ya pasaba con
-    // el interruptor rápido, pero acá nunca se aplicaba.
-    let insumosDesactivados = [];
-    if (seDesactiva) {
-      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
-      if (afectados.length) {
-        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
-        insumosDesactivados = afectados;
-      }
-    }
     const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
-    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
+    res.json(full[0]);
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese dato.' });
     res.status(500).json({ error: e.message });
@@ -1280,39 +1268,27 @@ provRouter.put('/:id', auth, async (req, res) => {
 });
 provRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
-    const { rows: antes } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
-    if (!antes[0]) return res.status(404).json({ error: 'No encontrado' });
     const { rows } = await pool.query(
       `UPDATE proveedores SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING estado`,
       [req.params.id]
     );
-    let insumosDesactivados = [];
-    if (antes[0].estado === 'Activo' && rows[0].estado === 'Inactivo') {
-      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
-      if (afectados.length) {
-        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
-        insumosDesactivados = afectados;
-      }
-    }
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
-    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
+    res.json(full[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // No se puede eliminar un proveedor con compras (activas o anuladas) — solo
-// desactivarlo. Sin compras, se elimina junto con sus insumos asociados
-// (nunca deben quedar insumos huérfanos apuntando a un proveedor borrado).
+// desactivarlo. Proveedor e insumo son independientes: eliminar un
+// proveedor nunca toca ningún insumo.
 provRouter.delete('/:id', auth, async (req, res) => {
   try {
     const { rows: conCompras } = await pool.query(`SELECT id FROM compras WHERE proveedor_id=$1 LIMIT 1`, [req.params.id]);
     if (conCompras[0]) {
       return res.status(400).json({ error: 'No se puede eliminar: este proveedor tiene compras registradas (activas o anuladas). Solo puedes desactivarlo.' });
     }
-    const { rows: insumosAsociados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1`, [req.params.id]);
-    if (insumosAsociados.length) {
-      await pool.query(`DELETE FROM insumos WHERE proveedor_id=$1`, [req.params.id]);
-    }
-    await pool.query('DELETE FROM proveedores WHERE id=$1', [req.params.id]);
-    res.json({ ok: true, insumosEliminados: insumosAsociados.length, nombresInsumos: insumosAsociados.map(i => i.nombre) });
+    const { rowCount } = await pool.query('DELETE FROM proveedores WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'No encontrado' });
+    res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/proveedores', provRouter);
@@ -1384,53 +1360,14 @@ catInsRouter.patch('/:id/estado', auth, async (req, res) => {
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Mueve todos los insumos de una categoría a otra (existente o recién
-// creada) y elimina la categoría de origen — así nunca queda un insumo sin
-// categoría. Se usa desde ModalRecategorizar antes de poder eliminar una
-// categoría que sí tiene insumos.
-catInsRouter.post('/:id/recategorizar', auth, async (req, res) => {
-  try {
-    const { nuevaCategoriaId, nuevaCategoriaNombre } = req.body;
-    let destinoId = nuevaCategoriaId || null;
-    if (!destinoId && nuevaCategoriaNombre) {
-      // Misma validación que el POST de arriba: crear la categoría destino
-      // por esta vía no puede saltarse las reglas de nombre.
-      const errorNom = errorNombre(nuevaCategoriaNombre, 'El nombre de la nueva categoría', LIMITES.NOMBRE_CORTO);
-      if (errorNom) return res.status(400).json({ error: errorNom });
-      const nombreNuevo = nombreNormalizado(nuevaCategoriaNombre);
-      if (await nombreDuplicado(pool, 'categorias_insumos', nombreNuevo, null)) {
-        return res.status(400).json({ error: 'Ya existe una categoría con ese nombre' });
-      }
-      const { rows } = await pool.query(`INSERT INTO categorias_insumos(nombre) VALUES($1) RETURNING id`, [nombreNuevo]);
-      destinoId = rows[0].id;
-    }
-    if (!destinoId) return res.status(400).json({ error: 'Selecciona una categoría existente o escribe el nombre de una nueva.' });
-    if (String(destinoId) === String(req.params.id)) {
-      return res.status(400).json({ error: 'La nueva categoría no puede ser la misma que se va a eliminar.' });
-    }
-    await pool.query(`UPDATE insumos SET categoria_id=$1 WHERE categoria_id=$2`, [destinoId, req.params.id]);
-    await pool.query(`DELETE FROM categorias_insumos WHERE id=$1`, [req.params.id]);
-    const { rows: nueva } = await pool.query(`SELECT * FROM categorias_insumos WHERE id=$1`, [destinoId]);
-    res.json({ ok: true, categoria: nueva[0] });
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una categoría con ese nombre' });
-    res.status(500).json({ error: e.message });
-  }
-});
-catInsRouter.delete('/:id', auth, async (req, res) => {
-  try {
-    const { rows: insumosAsociados } = await pool.query(`SELECT id, nombre FROM insumos WHERE categoria_id=$1`, [req.params.id]);
-    if (insumosAsociados.length) {
-      return res.status(409).json({
-        error: 'La categoría contiene insumos asociados.',
-        insumos: insumosAsociados.map(i => i.nombre),
-        insumosAsociados: insumosAsociados.length,
-      });
-    }
-    await pool.query(`DELETE FROM categorias_insumos WHERE id=$1`, [req.params.id]);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
+// Sin DELETE ni /recategorizar: una categoría de insumo es solo una
+// etiqueta para organizar/filtrar (insumos.categoria_id tiene ON DELETE
+// SET NULL), no una entidad que un insumo necesite "proteger" al
+// eliminarse — mismo patrón simple que Ciudades y Tipos de Presentación.
+// Se simplifica intencionalmente: agregar, editar, desactivar; nunca
+// eliminar. Un insumo ya creado con una categoría desactivada conserva
+// esa categoría sin cambios; desactivar solo la saca de las opciones
+// para insumos nuevos.
 r.use('/categorias-insumos', catInsRouter);
 
 // ── TIPOS DE PRESENTACIÓN (Compras) ───────────────────────────
@@ -1500,18 +1437,76 @@ tiposPresentacionRouter.patch('/:id/estado', auth, async (req, res) => {
 });
 r.use('/tipos-presentacion', tiposPresentacionRouter);
 
+// ── CIUDADES (Proveedores) ────────────────────────────────────
+// El campo "Ciudad" de Proveedores estaba fijo en "Medellín" — se pidió
+// volverlo dinámico: un catálogo real con las 16 ciudades principales ya
+// sembradas (ver migración en config/db.js), más la posibilidad de
+// agregar ciudades nuevas a futuro sin tocar código. Mismo patrón exacto
+// que tipos_presentacion arriba, pero SIN ninguna excepción fija tipo
+// "Unitario" — ninguna ciudad (ni Medellín) tiene trato especial, todas
+// se pueden editar/desactivar por igual.
+const ciudadesRouter = require('express').Router();
+ciudadesRouter.param('id', validateId);
+ciudadesRouter.get('/', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM ciudades ORDER BY id ASC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+ciudadesRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'ciudades', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    }
+    const { rows } = await pool.query(`INSERT INTO ciudades(nombre) VALUES($1) RETURNING *`, [nombre]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+ciudadesRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'ciudades', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    }
+    const { rows } = await pool.query(`UPDATE ciudades SET nombre=$1 WHERE id=$2 RETURNING *`, [nombre, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+ciudadesRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE ciudades SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/ciudades', ciudadesRouter);
+
 // ── INSUMOS ────────────────────────────────────────────────
 // Alias camelCase → exactamente los nombres que ya usa el frontend
 // (InsumoForm, InsumosPage, VerInsumoPage): antes el backend devolvía
-// columnas snake_case (stock, stock_minimo, unidad, proveedor_id) que no
-// coincidían con nada de lo que leía React (stockActual, stockMinimo,
-// unidadMedida, proveedor), así que categoría/unidad/proveedor se veían
-// vacíos y el stock daba NaN (Number(undefined)).
+// columnas snake_case (stock, stock_minimo, unidad) que no coincidían con
+// nada de lo que leía React (stockActual, stockMinimo, unidadMedida), así
+// que categoría/unidad se veían vacíos y el stock daba NaN
+// (Number(undefined)).
 const INSUMO_COLS = `
   i.id, i.nombre, i.descripcion, i.estado,
   i.stock AS "stockActual", i.stock_minimo AS "stockMinimo",
   i.unidad AS "unidadMedida", i.precio_unitario AS "precioUnitario",
-  i.proveedor_id AS "proveedorId", p.nombre AS proveedor,
   i.categoria_id AS "categoriaId", ci.nombre AS categoria,
   i.es_topping AS "esTopping",
   i.local_id AS "localId", lo.nombre AS "localNombre",
@@ -1519,7 +1514,6 @@ const INSUMO_COLS = `
 `;
 const INSUMO_JOINS = `
   FROM insumos i
-  LEFT JOIN proveedores p ON i.proveedor_id = p.id
   LEFT JOIN categorias_insumos ci ON i.categoria_id = ci.id
   LEFT JOIN locales lo ON i.local_id = lo.id
 `;
@@ -1682,7 +1676,7 @@ const resolverLocalDeTrabajo = async (req) => {
 
 insRouter.post('/', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, descripcion, estado, esTopping } = req.body;
   // Antes el nombre se insertaba directo: si era solo espacios, ni siquiera
   // llegaba a insumoNombreDuplicado (que sale temprano con !nombre... pero
   // "   " es truthy, así que comparaba espacios contra espacios y guardaba).
@@ -1712,9 +1706,9 @@ insRouter.post('/', auth, async (req, res) => {
     return res.status(400).json({ error: 'Ya existe un insumo con ese nombre en este local.' });
   }
   const { rows } = await pool.query(
-    `INSERT INTO insumos(nombre,categoria_id,unidad,stock,stock_minimo,precio_unitario,proveedor_id,descripcion,estado,es_topping,local_id)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
-    [nombre, categoriaId || null, unidadMedida || null, stockActual || 0, stockMinimo || 0, precioUnitario || 0, proveedorId || null, descripcion || null, estado || 'Activo', !!esTopping, localId]
+    `INSERT INTO insumos(nombre,categoria_id,unidad,stock,stock_minimo,precio_unitario,descripcion,estado,es_topping,local_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+    [nombre, categoriaId || null, unidadMedida || null, stockActual || 0, stockMinimo || 0, precioUnitario || 0, descripcion || null, estado || 'Activo', !!esTopping, localId]
   );
   const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [rows[0].id]);
   res.status(201).json(full[0]);
@@ -1725,7 +1719,7 @@ insRouter.post('/', auth, async (req, res) => {
 });
 insRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, descripcion, estado, esTopping } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del insumo', LIMITES.NOMBRE);
   if (errorNom) return res.status(400).json({ error: errorNom });
   const errorDesc = errorLongitud(descripcion, 'La descripción del insumo', LIMITES.DESCRIPCION);
@@ -1758,9 +1752,9 @@ insRouter.put('/:id', auth, async (req, res) => {
     return res.status(400).json({ error: 'Ya existe un insumo con ese nombre en este local.' });
   }
   const { rows } = await pool.query(
-    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock_minimo=$4,precio_unitario=$5,proveedor_id=$6,descripcion=$7,estado=$8,es_topping=$9
-     WHERE id=$10 RETURNING id`,
-    [nombre, categoriaId || null, unidadEnviada, stockMinimo, precioUnitario, proveedorId || null, descripcion || null, estado, !!esTopping, req.params.id]
+    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock_minimo=$4,precio_unitario=$5,descripcion=$6,estado=$7,es_topping=$8
+     WHERE id=$9 RETURNING id`,
+    [nombre, categoriaId || null, unidadEnviada, stockMinimo, precioUnitario, descripcion || null, estado, !!esTopping, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [req.params.id]);
@@ -2298,11 +2292,14 @@ compRouter.get('/', auth, async (req, res) => {
 // visible en el historial.
 compRouter.get('/historial', auth, async (req, res) => {
   try {
-  const diasParam = Number(req.query.dias);
-  const dias = Number.isFinite(diasParam) && diasParam > 0 ? diasParam : 30;
-  // Filtro opcional por local (?local_id=), igual que en GET /compras.
+  // Historial exclusivo de compras ANULADAS — antes también incluía
+  // compras activas con más de "dias" de antigüedad (regla de 30 días),
+  // pero eso ya no aplica: la tabla principal (GET /compras) ahora
+  // muestra TODAS las compras activas sin límite de tiempo, con su propia
+  // paginación en el frontend. El historial queda reservado únicamente
+  // para lo que salió de circulación por haberse anulado.
   const { local_id } = req.query;
-  const params = [dias];
+  const params = [];
   let filtroLocal = '';
   if (local_id !== undefined && local_id !== '') {
     params.push(Number(local_id));
@@ -2310,7 +2307,7 @@ compRouter.get('/historial', auth, async (req, res) => {
   }
   const { rows } = await pool.query(
     `SELECT ${COMPRA_COLS} ${COMPRA_JOINS}
-     WHERE (c.fecha < (CURRENT_DATE - $1::int) OR c.estado = 'anulada')${filtroLocal}
+     WHERE c.estado = 'anulada'${filtroLocal}
      ORDER BY c.id DESC`,
     params
   );

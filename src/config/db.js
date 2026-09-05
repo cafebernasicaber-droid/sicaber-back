@@ -236,6 +236,12 @@ const migrar = async () => {
     // único viejo (nombre + proveedor_id); el nuevo (nombre + local_id) se
     // crea aparte más abajo, guardado por su propio try/catch.
     `DROP INDEX IF EXISTS insumos_nombre_proveedor_unico`,
+    // Proveedor e insumo pasan a ser independientes: solo se relacionan al
+    // momento de registrar una compra puntual (compras.proveedor_id sigue
+    // existiendo, esa relación no cambia). Se quita la columna real de la
+    // tabla — schema.sql ya no la define, pero CREATE TABLE IF NOT EXISTS
+    // no la elimina de una base de datos que ya la tenía creada.
+    `ALTER TABLE insumos DROP COLUMN IF EXISTS proveedor_id`,
     // Mismas categorías que antes venían fijas en el código del frontend
     // (incluyendo "Vasos de plástico"/"Vasos de cartón", de las que
     // depende el selector de tamaño de vaso) — se insertan una sola vez.
@@ -497,6 +503,37 @@ const migrar = async () => {
         SET permisos = permisos || '["ver_ventas"]'::jsonb
       WHERE lower(btrim(nombre)) = 'cajero'
         AND NOT (permisos @> '["ver_ventas"]'::jsonb)`,
+    // ── CIUDADES (Proveedores) ────────────────────────────────
+    // Antes "Ciudad" en el formulario de Proveedores quedó fija en
+    // "Medellín" (el cliente solo maneja proveedores de ahí en ese
+    // momento) — se pidió volverla dinámica: un catálogo real con las 16
+    // ciudades principales ya sembradas, más la posibilidad de agregar
+    // ciudades nuevas a futuro sin tocar código, para garantizar
+    // escalabilidad. Mismo patrón exacto que categorias_insumos y
+    // tipos_presentacion (arriba): tabla propia con nombre único y estado
+    // Activo/Inactivo. A diferencia de tipos_presentacion (que sí tiene
+    // una excepción fija, "Unitario"), acá NINGUNA ciudad tiene trato
+    // especial — Medellín es solo la primera de la siembra, pero se puede
+    // editar/desactivar como cualquier otra.
+    //
+    // ⚠️ La lista de las "16 ciudades principales" no me la compartieron
+    // explícitamente en esta ronda — se sembró con las 16 ciudades más
+    // pobladas de Colombia (Medellín primero, según se pidió). Si el
+    // cliente ya tenía una lista distinta en mente (ej. la que ya usa el
+    // módulo de Clientes), agrégalas o ajústalas desde el propio "Añadir
+    // ciudad" del formulario — no hace falta otra migración para eso.
+    `CREATE TABLE IF NOT EXISTS ciudades (
+       id         SERIAL PRIMARY KEY,
+       nombre     VARCHAR(100) NOT NULL UNIQUE,
+       estado     VARCHAR(20)  NOT NULL DEFAULT 'Activo',
+       created_at TIMESTAMP DEFAULT NOW()
+     )`,
+    `INSERT INTO ciudades (nombre) VALUES
+       ('Medellín'), ('Bogotá'), ('Cali'), ('Barranquilla'), ('Cartagena'),
+       ('Cúcuta'), ('Bucaramanga'), ('Pereira'), ('Santa Marta'), ('Ibagué'),
+       ('Pasto'), ('Manizales'), ('Neiva'), ('Villavicencio'), ('Armenia'),
+       ('Valledupar')
+     ON CONFLICT (nombre) DO NOTHING`,
   ];
   for (const sql of alters) {
     try { await pool.query(sql); }
@@ -776,6 +813,7 @@ const TABLAS_CON_ID = [
   'toppings', 'adiciones', 'combos', 'proveedores', 'categorias_insumos',
   'insumos', 'compras', 'pedidos', 'ventas', 'devoluciones',
   'fichas_tecnicas', 'resenas', 'tokens_verificacion', 'locales',
+  'tipos_presentacion', 'ciudades',
 ];
 
 const asegurarSecuenciaId = async (tabla) => {

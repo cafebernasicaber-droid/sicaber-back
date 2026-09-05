@@ -172,7 +172,6 @@ CREATE TABLE IF NOT EXISTS insumos (
   stock           NUMERIC(10,2) DEFAULT 0,
   stock_minimo    NUMERIC(10,2) DEFAULT 0,
   precio_unitario NUMERIC(10,2) DEFAULT 0,
-  proveedor_id    INTEGER REFERENCES proveedores(id) ON DELETE SET NULL,
   estado          VARCHAR(20) NOT NULL DEFAULT 'Activo',
   -- Puramente informativo/de filtro: NO condiciona nada del backend (un
   -- insumo con es_topping=false igual se puede asociar a un topping vía
