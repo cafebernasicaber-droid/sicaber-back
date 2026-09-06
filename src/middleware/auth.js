@@ -12,25 +12,6 @@ const auth = (req, res, next) => {
   }
 };
 
-// Variante de `auth` para rutas que sirven TANTO a un cliente/visitante sin
-// sesión (ej. el checkout de la landing) COMO a un usuario interno
-// autenticado (Cajero/Administrador) — el mismo endpoint necesita saber
-// QUIÉN llama, si alguien llama, sin poder exigir un token (ver POST
-// /pedidos: requisito de unificar la creación de pedido para Admin y
-// Cajero sin dejar de aceptar pedidos de cliente). Si viene un Authorization
-// válido, decodifica igual que `auth` (req.user queda disponible); si no
-// viene, o el token es inválido/expiró, NO rechaza la petición — sigue
-// como pedido público, con req.user sin definir.
-const authOpcional = (req, res, next) => {
-  const header = req.headers['authorization'];
-  if (header) {
-    const token = header.split(' ')[1];
-    try { req.user = jwt.verify(token, process.env.JWT_SECRET); }
-    catch { /* token ausente/ inválido: se sigue como público, no como error */ }
-  }
-  next();
-};
-
 const soloAdmin = (req, res, next) => {
   if (req.user?.rol !== 'Administrador') return res.status(403).json({ error: 'Solo administradores' });
   next();
@@ -47,4 +28,4 @@ const permitirRoles = (...roles) => (req, res, next) => {
   next();
 };
 
-module.exports = { auth, authOpcional, soloAdmin, permitirRoles };
+module.exports = { auth, soloAdmin, permitirRoles };

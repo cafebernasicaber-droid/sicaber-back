@@ -8,31 +8,15 @@ const { auth } = require('../middleware/auth');
 // el mismo perfil completo que ya muestra la web, con los mismos nombres
 // de campo, en vez de un subconjunto recortado.
 const { CLIENTE_COLS } = require('../config/clienteCols');
-// Permisos vigentes del rol del usuario. Ver middleware/permisos.js: sin
-// esto, /login y /me devolvían el usuario SIN su lista de permisos, así que
-// el frontend (sidebar dinámico, PrivateRoute, HomeRedirect) se quedaba a
-// ciegas y todo rol distinto de Administrador veía el panel vacío.
-const { permisosDeRol } = require('../middleware/permisos');
 const { passwordValida, PASSWORD_ERROR, errorPassword } = require('../config/passwordPolicy');
 // Validaciones compartidas de texto (ver config/validaciones.js): nombre no
 // vacío / no solo espacios y tope de longitud en el registro de clientes.
-const { textoLimpio, nombreNormalizado, errorNombre, errorDocumento, LIMITES } = require('../config/validaciones');
+const { textoLimpio, nombreNormalizado, errorNombre, LIMITES } = require('../config/validaciones');
 const { enviarTokenRegistro, enviarTokenRecuperacion } = require('../services/mailer');
 
 const sign = (payload) => jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
 
 const genToken = () => String(Math.floor(100000 + Math.random() * 900000)); // 6 dígitos
-
-// Mensaje ÚNICO para cualquier fallo de login (usuario/correo inexistente,
-// contraseña incorrecta, o ambos): nunca se revela cuál de los dos falló —
-// si dijéramos "ese correo no existe" un atacante podría enumerar cuentas.
-const ERROR_CREDENCIALES = 'El correo o la contraseña son incorrectos.';
-// Hash "señuelo" (de una contraseña aleatoria descartada) para gastar el
-// mismo tiempo de bcrypt cuando el usuario NO existe. Sin esto, "usuario
-// inexistente" respondería al instante y "contraseña incorrecta" tardaría
-// ~100ms (bcrypt.compare), y esa diferencia de latencia delataría igual qué
-// correos están registrados.
-const HASH_SENUELO = '$2a$10$ntHThjxQboTY7/XSp7IQUewDjoS1i2qiCY3KxwVIfPNapdO.M1DkC';
 
 // ── ADMIN/EMPLEADO LOGIN (usuario, correo, o nombre) ────────────────────────
 router.post('/login', async (req, res) => {
@@ -42,26 +26,15 @@ router.post('/login', async (req, res) => {
       'SELECT * FROM usuarios WHERE lower(username)=lower($1) OR lower(correo)=lower($1) OR nombre ILIKE $1',
       [username]
     );
+    if (!rows[0]) return res.status(401).json({ error: 'Credenciales inválidas' });
+    const ok = await bcrypt.compare(password, rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Credenciales inválidas' });
     const u = rows[0];
-    // Siempre se ejecuta bcrypt.compare (contra el hash real o el señuelo),
-    // para que la respuesta tarde lo mismo exista o no la cuenta.
-    const ok = await bcrypt.compare(String(password || ''), u ? u.password : HASH_SENUELO);
-    if (!u || !ok) return res.status(401).json({ error: ERROR_CREDENCIALES });
     // "sede" viaja en el JWT para que el middleware `auth` la exponga en
     // req.user y las rutas puedan filtrar pedidos por local sin tener que
-    // volver a consultar la tabla usuarios en cada petición. "local_id" (la
-    // referencia real a locales.id) viaja por el mismo motivo: POST /insumos
-    // lo usa para asignar automáticamente el local del insumo. "es_superadmin"
-    // viaja también: el Superadministrador NO tiene un local fijo, así que al
-    // crear un insumo/compra debe ELEGIR el local a mano (el frontend usa
-    // este flag para mostrar el selector en vez de asumir un local).
-    const token = sign({ id: u.id, username: u.username, rol: u.rol, sede: u.sede, local_id: u.local_id, es_superadmin: u.es_superadmin });
-    // Los permisos se leen de la tabla `roles` en cada login y NO viajan
-    // dentro del JWT: si viajaran en el token, un cambio de permisos hecho
-    // desde el panel de Roles no tendría efecto hasta que el token expirara
-    // (8 h) o el usuario cerrara sesión a mano.
-    const permisos = await permisosDeRol(u.rol);
-    res.json({ token, usuario: { id: u.id, nombre: u.nombre, username: u.username, rol: u.rol, sede: u.sede, local_id: u.local_id, es_superadmin: u.es_superadmin, permisos } });
+    // volver a consultar la tabla usuarios en cada petición.
+    const token = sign({ id: u.id, username: u.username, rol: u.rol, sede: u.sede });
+    res.json({ token, usuario: { id: u.id, nombre: u.nombre, username: u.username, rol: u.rol, sede: u.sede } });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -91,10 +64,6 @@ router.post('/cliente/registro', async (req, res) => {
     // valor literal "Otros" es que el frontend no lo resolvió o alguien
     // intenta saltarse la validación manualmente.
     if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
-
-    // Número de documento: opcional, pero si viene → solo dígitos, máx 10.
-    const errorDoc = errorDocumento(numeroDoc);
-    if (errorDoc) return res.status(400).json({ error: errorDoc });
 
     if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
 
@@ -165,9 +134,10 @@ router.post('/cliente/login', async (req, res) => {
       'SELECT * FROM clientes WHERE lower(correo)=lower($1) OR lower(username)=lower($1) OR nombre ILIKE $1',
       [correo]
     );
+    if (!rows[0]) return res.status(401).json({ error: 'Credenciales inválidas' });
+    const ok = await bcrypt.compare(password, rows[0].password);
+    if (!ok) return res.status(401).json({ error: 'Credenciales inválidas' });
     const c = rows[0];
-    const ok = await bcrypt.compare(String(password || ''), c ? c.password : HASH_SENUELO);
-    if (!c || !ok) return res.status(401).json({ error: ERROR_CREDENCIALES });
     const token = sign({ id: c.id, correo: c.correo, rol: 'Cliente' });
     // Perfil completo (mismas columnas/alias que GET /clientes/mi-perfil),
     // + username, que ya se usaba para iniciar sesión pero no forma parte
@@ -181,27 +151,19 @@ router.post('/cliente/login', async (req, res) => {
 });
 
 // ── SOLICITAR RECUPERACIÓN ─────────────────────────────────────────────────
-// Respuesta SIEMPRE genérica (mismo texto, mismo 200) exista o no una cuenta
-// con ese correo: si dijéramos "no existe una cuenta con ese correo", un
-// atacante podría enumerar qué correos están registrados. El código solo se
-// genera y envía cuando la cuenta existe de verdad, pero eso no se revela.
 router.post('/cliente/recuperar', async (req, res) => {
   const { correo } = req.body;
-  const RESPUESTA_GENERICA = { mensaje: 'Si existe una cuenta con ese correo, te enviamos un código para restablecer la contraseña.' };
   try {
-    const correoLimpio = textoLimpio(correo).toLowerCase();
-    if (!correoLimpio) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
+    const { rows } = await pool.query('SELECT id,nombre FROM clientes WHERE lower(correo)=lower($1)', [correo]);
+    if (!rows[0]) return res.status(404).json({ error: 'No existe una cuenta con ese correo.' });
 
-    const { rows } = await pool.query('SELECT id,nombre FROM clientes WHERE lower(correo)=lower($1)', [correoLimpio]);
-    if (rows[0]) {
-      const token = genToken();
-      await pool.query(
-        'INSERT INTO tokens_verificacion(correo,token,tipo) VALUES($1,$2,$3)',
-        [correoLimpio, token, 'recuperacion']
-      );
-      await enviarTokenRecuperacion(correoLimpio, rows[0].nombre, token);
-    }
-    res.json(RESPUESTA_GENERICA);
+    const token = genToken();
+    await pool.query(
+      'INSERT INTO tokens_verificacion(correo,token,tipo) VALUES($1,$2,$3)',
+      [correo, token, 'recuperacion']
+    );
+    await enviarTokenRecuperacion(correo, rows[0].nombre, token);
+    res.json({ mensaje: 'Código enviado. Revisa tu correo.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -233,14 +195,8 @@ router.get('/me', auth, async (req, res) => {
       const { rows } = await pool.query(`SELECT ${CLIENTE_COLS}, username FROM clientes WHERE id=$1`, [req.user.id]);
       return res.json(rows[0]);
     }
-    const { rows } = await pool.query('SELECT id,nombre,username,rol,sede,local_id,es_superadmin FROM usuarios WHERE id=$1', [req.user.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Usuario no encontrado' });
-    // Siempre los permisos ACTUALES del rol, nunca los del momento del
-    // login: AuthContext llama a /auth/me cada vez que carga la app y
-    // refresca con esto el usuario en memoria y en localStorage. Es lo que
-    // hace que editar un rol se refleje sin volver a iniciar sesión.
-    const permisos = await permisosDeRol(rows[0].rol);
-    res.json({ ...rows[0], permisos });
+    const { rows } = await pool.query('SELECT id,nombre,username,rol,sede FROM usuarios WHERE id=$1', [req.user.id]);
+    res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

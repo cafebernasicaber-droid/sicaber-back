@@ -1,7 +1,7 @@
 const express = require('express');
 const crypto  = require('crypto');
 const pool    = require('../config/db');
-const { auth, authOpcional, permitirRoles } = require('../middleware/auth');
+const { auth, permitirRoles } = require('../middleware/auth');
 const bcrypt  = require('bcryptjs');
 const crud    = require('./crud');
 const validateId = require('../middleware/validateId');
@@ -11,63 +11,13 @@ const { passwordValida, PASSWORD_ERROR, errorPassword } = require('../config/pas
 // longitud. Ver config/validaciones.js.
 const {
   textoLimpio, nombreNormalizado, LIMITES,
-  errorNombre, errorLongitud, errorDocumento, errorTelefono, nombreDuplicado,
+  errorNombre, errorLongitud, nombreDuplicado,
 } = require('../config/validaciones');
 // Vocabulario y derivación del "tipo de preparación" de una ficha técnica a
 // partir de la categoría del producto. Ver config/tiposPreparacion.js.
 const { resolverTipoPreparacion } = require('../config/tiposPreparacion');
 
 const r = express.Router();
-
-// Traduce el "local" que manda el formulario de usuarios/empleados a un
-// locales.id real, para guardar usuarios.local_id (lo que POST /insumos
-// necesita después): usa el local_id explícito si vino y existe; si no, el
-// local cuyo nombre coincide con "sede" (los registros nuevos ya guardan
-// ahí el nombre real del local); si nada coincide (ej. Administrador con
-// sede 'Ambos', o 'Local 1'/'Local 2' heredados), devuelve null.
-const resolverLocalIdUsuario = async (localIdBody, sede) => {
-  const explicito = Number(localIdBody);
-  if (Number.isInteger(explicito) && explicito > 0) {
-    const { rows } = await pool.query('SELECT id FROM locales WHERE id=$1', [explicito]);
-    if (rows[0]) return explicito;
-  }
-  if (sede) {
-    const { rows } = await pool.query(
-      `SELECT id FROM locales WHERE lower(btrim(nombre)) = lower(btrim($1)) LIMIT 1`, [sede]
-    );
-    if (rows[0]) return rows[0].id;
-  }
-  return null;
-};
-
-// El formulario de usuarios (UsuarioFormPage.jsx) manda `rolId` — el id de
-// la fila en `roles` — pero POST y PUT /usuarios solo leían `rol`, que es
-// el NOMBRE. Ese campo nunca llegaba, así que el INSERT recibía `undefined`
-// → NULL, y como usuarios.rol es NOT NULL la creación fallaba (o, en las
-// rutas que sí pasaban, dejaba el usuario con un rol que no existe en la
-// tabla `roles` — y entonces permisosDeRol() no encuentra nada y ese
-// usuario se queda con el panel vacío para siempre).
-// Ahora se acepta cualquiera de los dos y se traduce el id a nombre, que
-// es lo que guarda la columna (usuarios.rol NO es una FK, ver la nota de
-// contarUsuariosConRol).
-const resolverNombreRol = async (rolBody, rolIdBody) => {
-  const nombreDirecto = String(rolBody ?? '').trim();
-  if (nombreDirecto) {
-    // Se devuelve el nombre tal como está guardado en `roles` (respetando
-    // sus mayúsculas), no como lo escribió quien llamó la API: así
-    // usuarios.rol siempre coincide exactamente con roles.nombre.
-    const { rows } = await pool.query(
-      'SELECT nombre FROM roles WHERE lower(btrim(nombre)) = lower(btrim($1)) LIMIT 1', [nombreDirecto]
-    );
-    return rows[0] ? rows[0].nombre : nombreDirecto;
-  }
-  const id = Number(rolIdBody);
-  if (Number.isInteger(id) && id > 0) {
-    const { rows } = await pool.query('SELECT nombre FROM roles WHERE id=$1', [id]);
-    if (rows[0]) return rows[0].nombre;
-  }
-  return null;
-};
 
 // ── ROLES ──────────────────────────────────────────────────
 // Antes esto era un CRUD genérico (crud('roles', [...])), que no validaba
@@ -196,21 +146,13 @@ usrRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 
 usrRouter.get('/', auth, async (req, res) => {
   try {
-  // Filtro opcional por local (?local_id=), igual que en /empleados.
-  const { local_id } = req.query;
-  const params = [];
-  let where = '';
-  if (local_id !== undefined && local_id !== '') {
-    params.push(Number(local_id));
-    where = 'WHERE local_id = $1';
-  }
-  const { rows } = await pool.query(`SELECT id,nombre,username,correo,rol,sede,local_id,estado,es_superadmin,created_at FROM usuarios ${where} ORDER BY id DESC`, params);
+  const { rows } = await pool.query('SELECT id,nombre,username,correo,rol,sede,estado,es_superadmin,created_at FROM usuarios ORDER BY id DESC');
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 usrRouter.get('/:id', auth, async (req, res) => {
   try {
-  const { rows } = await pool.query('SELECT id,nombre,username,correo,rol,sede,local_id,estado,es_superadmin FROM usuarios WHERE id=$1', [req.params.id]);
+  const { rows } = await pool.query('SELECT id,nombre,username,correo,rol,sede,estado,es_superadmin FROM usuarios WHERE id=$1', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
   res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -229,9 +171,6 @@ usrRouter.post('/', auth, async (req, res) => {
 
   if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
   try {
-    // Ver resolverNombreRol: el formulario manda rolId, no rol.
-    const rolNombre = await resolverNombreRol(rol, req.body.rolId);
-    if (!rolNombre) return res.status(400).json({ error: 'Selecciona un rol válido.' });
     // Duplicado de username ignorando mayúsculas/espacios (el UNIQUE de la
     // columna sí distingue mayúsculas, así que "Ana" y "ANA" pasaban).
     if (await nombreDuplicado(pool, 'usuarios', username, null, 'username')) {
@@ -242,16 +181,14 @@ usrRouter.post('/', auth, async (req, res) => {
     // locales); Cajero/Bartender deben elegir 'Local 1' o 'Local 2' desde
     // el formulario. Si por algún motivo no llega sede, se cae a 'Local 1'
     // para no dejar la columna vacía (es NOT NULL).
-    const sedeFinal = rolNombre === 'Administrador' ? 'Ambos' : (sede || 'Local 1');
-    // local_id: referencia real a locales.id (lo que POST /insumos usa para
-    // el local de trabajo). Se deriva del local elegido en el formulario;
-    // queda NULL para el Administrador o si "sede" no es un local del
-    // catálogo. es_superadmin nunca se recibe del cliente: todo usuario
-    // nuevo se crea con es_superadmin=false por el DEFAULT de la columna.
-    const localIdUsuario = await resolverLocalIdUsuario(req.body.local_id, sedeFinal);
+    const sedeFinal = rol === 'Administrador' ? 'Ambos' : (sede || 'Local 1');
+    // es_superadmin nunca se recibe del cliente: todo usuario nuevo se
+    // crea con es_superadmin=false por el DEFAULT de la columna, así el
+    // Superadministrador sigue siendo único y no se puede crear otro
+    // desde este formulario.
     const { rows } = await pool.query(
-      'INSERT INTO usuarios(nombre,username,correo,password,rol,sede,local_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,nombre,username,correo,rol,sede,local_id,es_superadmin',
-      [nombre, username, correo || null, hash, rolNombre, sedeFinal, localIdUsuario]
+      'INSERT INTO usuarios(nombre,username,correo,password,rol,sede) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,nombre,username,correo,rol,sede,es_superadmin',
+      [nombre, username, correo || null, hash, rol, sedeFinal]
     );
     res.status(201).json(rows[0]);
   } catch (e) {
@@ -280,23 +217,19 @@ usrRouter.put('/:id', auth, async (req, res) => {
     // El rol del Superadministrador es inmodificable: sin importar lo que
     // llegue en el body, conservamos su rol actual. El resto de sus datos
     // (nombre, usuario, correo, contraseña) sí se pueden actualizar.
-    // Mismo caso que en el POST: el formulario manda rolId, no rol.
-    const rolPedido = await resolverNombreRol(rol, req.body.rolId);
-    const rolFinal = actual[0].es_superadmin ? actual[0].rol : (rolPedido || actual[0].rol);
+    const rolFinal = actual[0].es_superadmin ? actual[0].rol : rol;
     // Igual que en la creación: Administrador siempre queda en 'Ambos'.
     const sedeFinal = rolFinal === 'Administrador' ? 'Ambos' : (sede || 'Local 1');
-    // Se mantiene usuarios.local_id en sync con el local elegido (ver POST).
-    const localIdUsuario = await resolverLocalIdUsuario(req.body.local_id, sedeFinal);
 
     let q, vals;
     if (password) {
       if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
       const hash = await bcrypt.hash(password, 10);
-      q = 'UPDATE usuarios SET nombre=$1,username=$2,correo=$3,password=$4,rol=$5,sede=$6,local_id=$7 WHERE id=$8 RETURNING id,nombre,username,correo,rol,sede,local_id,es_superadmin';
-      vals = [nombre, username, correo || null, hash, rolFinal, sedeFinal, localIdUsuario, req.params.id];
+      q = 'UPDATE usuarios SET nombre=$1,username=$2,correo=$3,password=$4,rol=$5,sede=$6 WHERE id=$7 RETURNING id,nombre,username,correo,rol,sede,es_superadmin';
+      vals = [nombre, username, correo || null, hash, rolFinal, sedeFinal, req.params.id];
     } else {
-      q = 'UPDATE usuarios SET nombre=$1,username=$2,correo=$3,rol=$4,sede=$5,local_id=$6 WHERE id=$7 RETURNING id,nombre,username,correo,rol,sede,local_id,es_superadmin';
-      vals = [nombre, username, correo || null, rolFinal, sedeFinal, localIdUsuario, req.params.id];
+      q = 'UPDATE usuarios SET nombre=$1,username=$2,correo=$3,rol=$4,sede=$5 WHERE id=$6 RETURNING id,nombre,username,correo,rol,sede,es_superadmin';
+      vals = [nombre, username, correo || null, rolFinal, sedeFinal, req.params.id];
     }
     const { rows } = await pool.query(q, vals);
     res.json(rows[0]);
@@ -381,8 +314,6 @@ const actualizarMiPerfil = async (req, res) => {
   const { nombre, telefono, direccion, comuna, tipoDoc, numeroDoc, departamento, municipio } = req.body;
   if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es obligatorio.' });
   if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
-  const errorDoc = errorDocumento(numeroDoc);
-  if (errorDoc) return res.status(400).json({ error: errorDoc });
   const { rows } = await pool.query(
     `UPDATE clientes SET nombre=$1, telefono=$2, direccion=$3, comuna=$4,
        tipo_doc=$5, numero_doc=$6, departamento=$7, municipio=$8
@@ -416,8 +347,6 @@ cliRouter.put('/:id', auth, async (req, res) => {
   const { nombre, telefono, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion } = req.body;
   if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es obligatorio.' });
   if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
-  const errorDoc = errorDocumento(numeroDoc);
-  if (errorDoc) return res.status(400).json({ error: errorDoc });
   const mandoComuna = comuna !== undefined;
   const { rows } = await pool.query(
     `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4,
@@ -478,18 +407,7 @@ const ETIQUETA_CAMPO_EMPLEADO = { correo: 'correo', telefono: 'teléfono' };
 
 empRouter.get('/', async (req, res) => {
   try {
-    // Filtro opcional por local (?local_id=): así el listado de Empleados
-    // puede mostrarse "por local". Sin el parámetro, devuelve todos (igual
-    // que antes). local_id se guarda por el formulario de empleados y se
-    // propaga a usuarios.local_id (JWT) para Cajero/Bartender.
-    const { local_id } = req.query;
-    const params = [];
-    let where = '';
-    if (local_id !== undefined && local_id !== '') {
-      params.push(Number(local_id));
-      where = `WHERE local_id = $1`;
-    }
-    const { rows } = await pool.query(`SELECT * FROM empleados ${where} ORDER BY id DESC`, params);
+    const { rows } = await pool.query('SELECT * FROM empleados ORDER BY id DESC');
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -541,12 +459,9 @@ empRouter.post('/', auth, async (req, res) => {
       }
       if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
       const hash = await bcrypt.hash(password, 10);
-      // usuarios.local_id en sync con el local del empleado (lo que POST
-      // /insumos usa como "local de trabajo" del cajero/bartender).
-      const localIdUsuario = await resolverLocalIdUsuario(localId, sedeFinal);
       const { rows: nuevoUsuario } = await pool.query(
-        'INSERT INTO usuarios(nombre,username,correo,password,rol,sede,local_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id',
-        [nombre, username, correo || null, hash, cargo, sedeFinal, localIdUsuario]
+        'INSERT INTO usuarios(nombre,username,correo,password,rol,sede) VALUES($1,$2,$3,$4,$5,$6) RETURNING id',
+        [nombre, username, correo || null, hash, cargo, sedeFinal]
       );
       usuarioId = nuevoUsuario[0].id;
     }
@@ -587,8 +502,6 @@ empRouter.put('/:id', auth, async (req, res) => {
   try {
     const { rows: actual } = await pool.query('SELECT usuario_id FROM empleados WHERE id=$1', [req.params.id]);
     if (!actual[0]) return res.status(404).json({ error: 'Empleado no encontrado' });
-    // usuarios.local_id en sync con el local del empleado (ver POST).
-    const localIdUsuario = await resolverLocalIdUsuario(localId, sedeFinal);
 
     const dup = await buscarDuplicadosEmpleado({ correo, telefono }, req.params.id);
     if (dup.length) {
@@ -608,13 +521,13 @@ empRouter.put('/:id', auth, async (req, res) => {
           if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
           const hash = await bcrypt.hash(password, 10);
           await pool.query(
-            'UPDATE usuarios SET nombre=$1,username=COALESCE($2,username),correo=$3,password=$4,rol=$5,sede=$6,local_id=$7 WHERE id=$8',
-            [nombre, username || null, correo || null, hash, cargo, sedeFinal, localIdUsuario, usuarioId]
+            'UPDATE usuarios SET nombre=$1,username=COALESCE($2,username),correo=$3,password=$4,rol=$5,sede=$6 WHERE id=$7',
+            [nombre, username || null, correo || null, hash, cargo, sedeFinal, usuarioId]
           );
         } else {
           await pool.query(
-            'UPDATE usuarios SET nombre=$1,username=COALESCE($2,username),correo=$3,rol=$4,sede=$5,local_id=$6 WHERE id=$7',
-            [nombre, username || null, correo || null, cargo, sedeFinal, localIdUsuario, usuarioId]
+            'UPDATE usuarios SET nombre=$1,username=COALESCE($2,username),correo=$3,rol=$4,sede=$5 WHERE id=$6',
+            [nombre, username || null, correo || null, cargo, sedeFinal, usuarioId]
           );
         }
       } else if (username && password) {
@@ -622,8 +535,8 @@ empRouter.put('/:id', auth, async (req, res) => {
         if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
         const hash = await bcrypt.hash(password, 10);
         const { rows: nuevoUsuario } = await pool.query(
-          'INSERT INTO usuarios(nombre,username,correo,password,rol,sede,local_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id',
-          [nombre, username, correo || null, hash, cargo, sedeFinal, localIdUsuario]
+          'INSERT INTO usuarios(nombre,username,correo,password,rol,sede) VALUES($1,$2,$3,$4,$5,$6) RETURNING id',
+          [nombre, username, correo || null, hash, cargo, sedeFinal]
         );
         usuarioId = nuevoUsuario[0].id;
       } else {
@@ -1251,6 +1164,7 @@ provRouter.put('/:id', auth, async (req, res) => {
     }
     const { rows: actual } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
     if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
+    const seDesactiva = actual[0].estado === 'Activo' && body.estado === 'Inactivo';
 
     const vals = [...PROVEEDOR_FIELD_MAP.map(([, key]) => body[key] ?? null), req.params.id];
     const { rows } = await pool.query(
@@ -1259,8 +1173,19 @@ provRouter.put('/:id', auth, async (req, res) => {
     );
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
 
+    // Al desactivar un proveedor desde el formulario de edición, sus
+    // insumos activos también quedan inactivos — igual que ya pasaba con
+    // el interruptor rápido, pero acá nunca se aplicaba.
+    let insumosDesactivados = [];
+    if (seDesactiva) {
+      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+      if (afectados.length) {
+        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+        insumosDesactivados = afectados;
+      }
+    }
     const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
-    res.json(full[0]);
+    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
   } catch (e) {
     if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un registro con ese dato.' });
     res.status(500).json({ error: e.message });
@@ -1268,27 +1193,39 @@ provRouter.put('/:id', auth, async (req, res) => {
 });
 provRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
+    const { rows: antes } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
+    if (!antes[0]) return res.status(404).json({ error: 'No encontrado' });
     const { rows } = await pool.query(
       `UPDATE proveedores SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING estado`,
       [req.params.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    let insumosDesactivados = [];
+    if (antes[0].estado === 'Activo' && rows[0].estado === 'Inactivo') {
+      const { rows: afectados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+      if (afectados.length) {
+        await pool.query(`UPDATE insumos SET estado='Inactivo' WHERE proveedor_id=$1 AND estado='Activo'`, [req.params.id]);
+        insumosDesactivados = afectados;
+      }
+    }
     const { rows: full } = await pool.query(`${PROVEEDOR_SELECT} WHERE id=$1`, [req.params.id]);
-    res.json(full[0]);
+    res.json({ ...full[0], insumosDesactivados: insumosDesactivados.length, nombresInsumosDesactivados: insumosDesactivados.map(i => i.nombre) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // No se puede eliminar un proveedor con compras (activas o anuladas) — solo
-// desactivarlo. Proveedor e insumo son independientes: eliminar un
-// proveedor nunca toca ningún insumo.
+// desactivarlo. Sin compras, se elimina junto con sus insumos asociados
+// (nunca deben quedar insumos huérfanos apuntando a un proveedor borrado).
 provRouter.delete('/:id', auth, async (req, res) => {
   try {
     const { rows: conCompras } = await pool.query(`SELECT id FROM compras WHERE proveedor_id=$1 LIMIT 1`, [req.params.id]);
     if (conCompras[0]) {
       return res.status(400).json({ error: 'No se puede eliminar: este proveedor tiene compras registradas (activas o anuladas). Solo puedes desactivarlo.' });
     }
-    const { rowCount } = await pool.query('DELETE FROM proveedores WHERE id=$1', [req.params.id]);
-    if (!rowCount) return res.status(404).json({ error: 'No encontrado' });
-    res.json({ ok: true });
+    const { rows: insumosAsociados } = await pool.query(`SELECT id, nombre FROM insumos WHERE proveedor_id=$1`, [req.params.id]);
+    if (insumosAsociados.length) {
+      await pool.query(`DELETE FROM insumos WHERE proveedor_id=$1`, [req.params.id]);
+    }
+    await pool.query('DELETE FROM proveedores WHERE id=$1', [req.params.id]);
+    res.json({ ok: true, insumosEliminados: insumosAsociados.length, nombresInsumos: insumosAsociados.map(i => i.nombre) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/proveedores', provRouter);
@@ -1360,14 +1297,53 @@ catInsRouter.patch('/:id/estado', auth, async (req, res) => {
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Sin DELETE ni /recategorizar: una categoría de insumo es solo una
-// etiqueta para organizar/filtrar (insumos.categoria_id tiene ON DELETE
-// SET NULL), no una entidad que un insumo necesite "proteger" al
-// eliminarse — mismo patrón simple que Ciudades y Tipos de Presentación.
-// Se simplifica intencionalmente: agregar, editar, desactivar; nunca
-// eliminar. Un insumo ya creado con una categoría desactivada conserva
-// esa categoría sin cambios; desactivar solo la saca de las opciones
-// para insumos nuevos.
+// Mueve todos los insumos de una categoría a otra (existente o recién
+// creada) y elimina la categoría de origen — así nunca queda un insumo sin
+// categoría. Se usa desde ModalRecategorizar antes de poder eliminar una
+// categoría que sí tiene insumos.
+catInsRouter.post('/:id/recategorizar', auth, async (req, res) => {
+  try {
+    const { nuevaCategoriaId, nuevaCategoriaNombre } = req.body;
+    let destinoId = nuevaCategoriaId || null;
+    if (!destinoId && nuevaCategoriaNombre) {
+      // Misma validación que el POST de arriba: crear la categoría destino
+      // por esta vía no puede saltarse las reglas de nombre.
+      const errorNom = errorNombre(nuevaCategoriaNombre, 'El nombre de la nueva categoría', LIMITES.NOMBRE_CORTO);
+      if (errorNom) return res.status(400).json({ error: errorNom });
+      const nombreNuevo = nombreNormalizado(nuevaCategoriaNombre);
+      if (await nombreDuplicado(pool, 'categorias_insumos', nombreNuevo, null)) {
+        return res.status(400).json({ error: 'Ya existe una categoría con ese nombre' });
+      }
+      const { rows } = await pool.query(`INSERT INTO categorias_insumos(nombre) VALUES($1) RETURNING id`, [nombreNuevo]);
+      destinoId = rows[0].id;
+    }
+    if (!destinoId) return res.status(400).json({ error: 'Selecciona una categoría existente o escribe el nombre de una nueva.' });
+    if (String(destinoId) === String(req.params.id)) {
+      return res.status(400).json({ error: 'La nueva categoría no puede ser la misma que se va a eliminar.' });
+    }
+    await pool.query(`UPDATE insumos SET categoria_id=$1 WHERE categoria_id=$2`, [destinoId, req.params.id]);
+    await pool.query(`DELETE FROM categorias_insumos WHERE id=$1`, [req.params.id]);
+    const { rows: nueva } = await pool.query(`SELECT * FROM categorias_insumos WHERE id=$1`, [destinoId]);
+    res.json({ ok: true, categoria: nueva[0] });
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una categoría con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+catInsRouter.delete('/:id', auth, async (req, res) => {
+  try {
+    const { rows: insumosAsociados } = await pool.query(`SELECT id, nombre FROM insumos WHERE categoria_id=$1`, [req.params.id]);
+    if (insumosAsociados.length) {
+      return res.status(409).json({
+        error: 'La categoría contiene insumos asociados.',
+        insumos: insumosAsociados.map(i => i.nombre),
+        insumosAsociados: insumosAsociados.length,
+      });
+    }
+    await pool.query(`DELETE FROM categorias_insumos WHERE id=$1`, [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 r.use('/categorias-insumos', catInsRouter);
 
 // ── TIPOS DE PRESENTACIÓN (Compras) ───────────────────────────
@@ -1437,87 +1413,25 @@ tiposPresentacionRouter.patch('/:id/estado', auth, async (req, res) => {
 });
 r.use('/tipos-presentacion', tiposPresentacionRouter);
 
-// ── CIUDADES (Proveedores) ────────────────────────────────────
-// El campo "Ciudad" de Proveedores estaba fijo en "Medellín" — se pidió
-// volverlo dinámico: un catálogo real con las 16 ciudades principales ya
-// sembradas (ver migración en config/db.js), más la posibilidad de
-// agregar ciudades nuevas a futuro sin tocar código. Mismo patrón exacto
-// que tipos_presentacion arriba, pero SIN ninguna excepción fija tipo
-// "Unitario" — ninguna ciudad (ni Medellín) tiene trato especial, todas
-// se pueden editar/desactivar por igual.
-const ciudadesRouter = require('express').Router();
-ciudadesRouter.param('id', validateId);
-ciudadesRouter.get('/', auth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`SELECT * FROM ciudades ORDER BY id ASC`);
-    res.json(rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-ciudadesRouter.post('/', auth, async (req, res) => {
-  try {
-    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
-    if (errorNom) return res.status(400).json({ error: errorNom });
-    const nombre = nombreNormalizado(req.body.nombre);
-    if (await nombreDuplicado(pool, 'ciudades', nombre, null)) {
-      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
-    }
-    const { rows } = await pool.query(`INSERT INTO ciudades(nombre) VALUES($1) RETURNING *`, [nombre]);
-    res.status(201).json(rows[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
-    res.status(500).json({ error: e.message });
-  }
-});
-ciudadesRouter.put('/:id', auth, async (req, res) => {
-  try {
-    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
-    if (errorNom) return res.status(400).json({ error: errorNom });
-    const nombre = nombreNormalizado(req.body.nombre);
-    if (await nombreDuplicado(pool, 'ciudades', nombre, req.params.id)) {
-      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
-    }
-    const { rows } = await pool.query(`UPDATE ciudades SET nombre=$1 WHERE id=$2 RETURNING *`, [nombre, req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
-    res.json(rows[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
-    res.status(500).json({ error: e.message });
-  }
-});
-ciudadesRouter.patch('/:id/estado', auth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `UPDATE ciudades SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
-      [req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'No encontrada' });
-    res.json(rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-r.use('/ciudades', ciudadesRouter);
-
 // ── INSUMOS ────────────────────────────────────────────────
 // Alias camelCase → exactamente los nombres que ya usa el frontend
 // (InsumoForm, InsumosPage, VerInsumoPage): antes el backend devolvía
-// columnas snake_case (stock, stock_minimo, unidad) que no coincidían con
-// nada de lo que leía React (stockActual, stockMinimo, unidadMedida), así
-// que categoría/unidad se veían vacíos y el stock daba NaN
-// (Number(undefined)).
-// Insumo: catálogo GLOBAL (un solo registro, sin importar en cuántos
-// locales tenga stock — ver insumo_local más abajo). Ya NO trae
-// stock/stock_minimo/local propios: esos viven en insumo_local, una fila
-// por insumo+local. GET /insumos añade esos campos según ?local_id= (ver
-// más abajo) — nunca vienen de esta constante.
+// columnas snake_case (stock, stock_minimo, unidad, proveedor_id) que no
+// coincidían con nada de lo que leía React (stockActual, stockMinimo,
+// unidadMedida, proveedor), así que categoría/unidad/proveedor se veían
+// vacíos y el stock daba NaN (Number(undefined)).
 const INSUMO_COLS = `
   i.id, i.nombre, i.descripcion, i.estado,
+  i.stock AS "stockActual", i.stock_minimo AS "stockMinimo",
   i.unidad AS "unidadMedida", i.precio_unitario AS "precioUnitario",
+  i.proveedor_id AS "proveedorId", p.nombre AS proveedor,
   i.categoria_id AS "categoriaId", ci.nombre AS categoria,
-  i.es_insumo AS "esInsumo", i.es_adicion AS "esAdicion",
   i.es_topping AS "esTopping",
   i.created_at AS "fechaCreacion"
 `;
 const INSUMO_JOINS = `
   FROM insumos i
+  LEFT JOIN proveedores p ON i.proveedor_id = p.id
   LEFT JOIN categorias_insumos ci ON i.categoria_id = ci.id
 `;
 // Unidad de medida REAL del insumo — nunca una presentación de compra
@@ -1525,64 +1439,6 @@ const INSUMO_JOINS = `
 // compra (ver PRESENTACIONES_VALIDAS / POST /compras más abajo), no como
 // unidad del insumo. Coincide con el CHECK de la columna en schema.sql/db.js.
 const UNIDADES_VALIDAS = ['kg', 'g', 'lb', 'oz', 'L', 'mL', 'unidad'];
-
-// ── Estado de stock calculado por local (para que el frontend solo lo pinte) ──
-// Cuatro estados, de más a menos urgente (el primero que aplica gana —
-// las condiciones tal cual las pidieron se superponen: todo lo que es
-// "bajo_minimo" (stock < mínimo) también cumpliría "agotandose" si UMBRAL
-// >= 1, así que "bajo_minimo" se evalúa primero, por ser el más severo):
-//   • agotado      → stock_actual = 0
-//   • bajo_minimo  → stock_actual > 0 y < stock_minimo (YA cruzó el mínimo)
-//   • agotandose   → stock_actual > 0 y <= stock_minimo × UMBRAL (todavía
-//     por ENCIMA del mínimo, pero acercándose — solo distingue de "ok" si
-//     UMBRAL > 1; con UMBRAL=1.2 avisa 20% antes de tocar el mínimo)
-//   • ok           → el resto
-// UMBRAL como constante nombrada: ajustar el margen de la alerta temprana
-// es cambiar un solo número, no reescribir la fórmula.
-const UMBRAL_STOCK_BAJO = 1.2;
-const calcularEstadoStock = (stock, stockMinimo) => {
-  const s = Number(stock) || 0;
-  const min = Number(stockMinimo) || 0;
-  if (s <= 0) return 'agotado';
-  if (min > 0 && s < min) return 'bajo_minimo';
-  if (min > 0 && s <= min * UMBRAL_STOCK_BAJO) return 'agotandose';
-  return 'ok';
-};
-// true para cualquier estado que no sea 'ok' — lo usan los filtros
-// ?stockBajo=true (GET /insumos, GET /empaques).
-const esEstadoStockBajo = (estado) => estado !== 'ok';
-
-// Cantidad válida para stock_actual/stock_minimo de un insumo/empaque
-// según su UNIDAD real: si la unidad es "unidad" (conteo), el valor debe
-// ser un entero — no existen "3.5 pitillos"; para el resto (kg/g/lb/oz/L/
-// mL) se aceptan decimales (mismo criterio que ya exige el frontend al
-// registrar una compra). `obligatorio=false` permite que el valor venga
-// vacío/undefined sin error (para stock inicial, opcional).
-const errorCantidadPorUnidad = (valor, etiqueta, unidad, obligatorio = true) => {
-  const vacio = valor === undefined || valor === null || valor === '';
-  if (vacio) return obligatorio ? `${etiqueta} es obligatorio y debe ser un número.` : null;
-  const n = Number(valor);
-  if (!Number.isFinite(n)) return `${etiqueta} debe ser un número.`;
-  if (n < 0) return `${etiqueta} no puede ser negativo.`;
-  if (unidad === 'unidad' && !Number.isInteger(n)) {
-    return `${etiqueta} debe ser un número entero cuando la unidad es "unidad" (no se pueden tener fracciones de una unidad).`;
-  }
-  return null;
-};
-
-// ¿Esta categoría de insumo es "Empaques"? Los empaques (vasos, pitillos,
-// desechables) viven en su propia entidad (ver "empaques"/"empaque_local"
-// más abajo) — un insumo NUNCA puede crearse ni editarse con esta
-// categoría (ver bloqueo en POST/PUT /insumos).
-const idCategoriaEmpaquesCache = { id: undefined };
-const idCategoriaEmpaques = async () => {
-  if (idCategoriaEmpaquesCache.id !== undefined) return idCategoriaEmpaquesCache.id;
-  const { rows } = await pool.query(`SELECT id FROM categorias_insumos WHERE lower(btrim(nombre))='empaques' LIMIT 1`);
-  idCategoriaEmpaquesCache.id = rows[0]?.id ?? null;
-  return idCategoriaEmpaquesCache.id;
-};
-const ERROR_CATEGORIA_EMPAQUES =
-  'La categoría "Empaques" ya no aplica a insumos: vasos, pitillos y desechables se gestionan en su propio recurso — usa POST/GET /empaques (y /empaques/:id/locales para su stock por local) en vez de /insumos.';
 
 const insRouter = require('express').Router();
 insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
@@ -1597,269 +1453,40 @@ insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 // lo usa el buscador con lupa del formulario de Ficha Técnica para no
 // tener que traer/filtrar en el navegador la lista completa de insumos
 // cada vez. ?esTopping=true/false filtra por el flag informativo de la
-// columna (se mantiene por compatibilidad); ?tipo=topping|adicion|insumo
-// hace lo mismo, con el nombre que usa Ficha Técnica para poblar sus
-// selectores por tipo de uso. "topping" = adición GRATUITA y opcional
-// dentro de la ficha técnica; "adicion" = extra que el cliente agrega y
-// que SÍ tiene costo (ver corrección de nombres/valores en config/db.js —
-// antes esta columna se llamaba "es_adicion_sin_costo", una contradicción
-// con la definición real de "adición").
-//
-// ?local_id= decide la FORMA de la respuesta:
-//   • sin local_id, o local_id=all → CONSOLIDADO: un registro por insumo,
-//     con stockActual/stockMinimo SUMADOS (para el total de la empresa) MÁS
-//     "porLocal" con el desglose de cada uno (stock, mínimo y su ESTADO
-//     calculado individualmente). El estado NUNCA se calcula sobre la suma
-//     (requisito 4) — por eso el nivel superior no trae "estadoStock": el
-//     front lee el estado de cada entrada de "porLocal", nunca uno global.
-//   • local_id=<id> → SOLO el stock de ESE local (join con insumo_local);
-//     un insumo que no tenga fila en ese local no aparece. Funciona igual
-//     si ese local está Inactivo (su stock/historial se conservan en solo
-//     lectura — requisito 1): pedirlo por id explícito siempre lo trae.
-// ?incluirInactivos=true — solo afecta al modo CONSOLIDADO y a la ausencia
-// de local_id: por defecto, los locales Inactivos se excluyen de "porLocal"
-// y del total sumado (así la pestaña de un local desactivado queda oculta
-// en Insumos); con este flag se incluyen también.
-// ?stockBajo=true → solo insumos con estadoStock distinto de 'ok' (en el
-// ámbito que corresponda: el local pedido, o CUALQUIERA de sus locales
-// visibles si no se pidió uno). Combinable con el resto de filtros.
-// ── Diagnóstico del "buscador solo trae 2 resultados" (requisitos 1 y 2,
-// esta ronda) ────────────────────────────────────────────────────────────
-// Revisé esta ruta a fondo y la probé en vivo contra la base real con
-// varias combinaciones (estado=Activo, tipo=insumo, tipo=topping,
-// local_id=cada local activo, q= con término amplio): en NINGÚN caso
-// encontré un límite fijo, paginación implícita, filtro de local heredado,
-// filtro de categoría, ni un WHERE residual — la consulta base no tiene
-// LIMIT, y ni la rama "local_id puntual" ni la "consolidado" recortan el
-// arreglo salvo por los filtros que el propio caller pidió. Con la base
-// actual (41 insumos activos, 3 marcados topping) el endpoint devuelve el
-// conjunto completo en todos los casos. Mi conclusión: el límite de "2
-// resultados" no está en ESTA ruta tal como existe hoy — o venía de una
-// versión anterior del endpoint (antes de la reescritura de la Ronda 6,
-// que quitó justamente ese tipo de límite implícito) o es un límite del
-// lado del FRONTEND (tamaño de página de un selector, .slice, caché de un
-// fetch viejo) que no se puede confirmar ni corregir desde este repo — solo
-// backend. Lo que sí agrego, para que un límite nunca vuelva a ser
-// silencioso: paginación real y EXPLÍCITA (`?limit=&offset=`), opcional —
-// sin ella, el comportamiento es exactamente "devolver todo lo que
-// coincide", como hasta ahora.
+// columna. Combinables entre sí y con ?estado=, igual que antes.
 insRouter.get('/', auth, async (req, res) => {
   try {
-  const { estado, q, esTopping, tipo, local_id, stockBajo, incluirInactivos, limit, offset, unidad } = req.query;
+  const { estado, q, esTopping } = req.query;
   const condiciones = [];
   const params = [];
-  if (estado) { params.push(estado); condiciones.push(`i.estado = $${params.length}`); }
-  if (q)      { params.push(`%${q}%`); condiciones.push(`i.nombre ILIKE $${params.length}`); }
+  if (estado)    { params.push(estado); condiciones.push(`i.estado = $${params.length}`); }
+  if (q)         { params.push(`%${q}%`); condiciones.push(`i.nombre ILIKE $${params.length}`); }
   if (esTopping !== undefined) { params.push(esTopping === 'true'); condiciones.push(`i.es_topping = $${params.length}`); }
-  if (tipo === 'topping')       condiciones.push(`i.es_topping = true`);
-  else if (tipo === 'adicion')  condiciones.push(`i.es_adicion = true`);
-  else if (tipo === 'insumo')   condiciones.push(`i.es_insumo = true`);
-  // ?unidad= alimenta los selectores dedicados de Vaso/Pitillo en Ficha
-  // Técnica (requisito 3): NO es un tipo de insumo nuevo, es un filtro por
-  // la unidad de medida real del insumo. "onzas" es el alias amigable de
-  // la unidad real 'oz' (ver UNIDADES_VALIDAS) — se acepta cualquiera de
-  // los dos. Ídem "unidades"/"unidad" para pitillos.
-  if (unidad) {
-    const ALIAS_UNIDAD = { onzas: 'oz', onza: 'oz', unidades: 'unidad' };
-    params.push(ALIAS_UNIDAD[unidad] || unidad);
-    condiciones.push(`i.unidad = $${params.length}`);
-  }
-
   const where = condiciones.length ? `WHERE ${condiciones.join(' AND ')}` : '';
-  const { rows: base } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} ${where} ORDER BY i.id DESC`, params);
-  if (!base.length) return res.json([]);
-
-  const ids = base.map(b => b.id);
-  const { rows: locs } = await pool.query(
-    `SELECT il.insumo_id AS "insumoId", il.local_id AS "localId", lo.nombre AS "localNombre",
-            lo.estado AS "localEstado", il.stock, il.stock_minimo AS "stockMinimo", il.activo
-       FROM insumo_local il JOIN locales lo ON lo.id = il.local_id
-      WHERE il.insumo_id = ANY($1::int[])
-      ORDER BY lo.id`,
-    [ids]
-  );
-  const porInsumo = new Map();
-  for (const l of locs) {
-    if (!porInsumo.has(l.insumoId)) porInsumo.set(l.insumoId, []);
-    porInsumo.get(l.insumoId).push({
-      localId: l.localId, localNombre: l.localNombre, localEstado: l.localEstado,
-      stock: l.stock, stockMinimo: l.stockMinimo, activo: l.activo,
-      estadoStock: calcularEstadoStock(l.stock, l.stockMinimo),
-    });
-  }
-
-  let resultado;
-  if (local_id !== undefined && local_id !== '' && local_id !== 'all') {
-    // Un local puntual: siempre visible aunque esté Inactivo (lectura de
-    // su historial conservado — requisito 1). El "ocultar" es solo del
-    // listado general/consolidado, no de un id explícito.
-    const idLocal = Number(local_id);
-    resultado = base
-      .map(b => {
-        const fila = (porInsumo.get(b.id) || []).find(l => l.localId === idLocal);
-        if (!fila) return null; // sin fila en ese local: no aparece
-        return { ...b, stockActual: fila.stock, stockMinimo: fila.stockMinimo, activoEnLocal: fila.activo, estadoStock: fila.estadoStock, localId: fila.localId, localNombre: fila.localNombre, localEstado: fila.localEstado };
-      })
-      .filter(Boolean);
-  } else {
-    // Consolidado (local_id=all u omitido): oculta locales Inactivos salvo
-    // ?incluirInactivos=true.
-    const incluirTodos = incluirInactivos === 'true';
-    resultado = base.map(b => {
-      const filas = (porInsumo.get(b.id) || []).filter(f => incluirTodos || f.localEstado === 'Activo');
-      const stockActual = filas.reduce((a, f) => a + Number(f.stock || 0), 0);
-      const stockMinimo = filas.reduce((a, f) => a + Number(f.stockMinimo || 0), 0);
-      // Sin "estadoStock" a este nivel a propósito (requisito 4: el estado
-      // nunca se calcula sumando locales) — cada entrada de "porLocal" ya
-      // trae el suyo, calculado individualmente.
-      return { ...b, stockActual, stockMinimo, porLocal: filas };
-    });
-  }
-
-  if (stockBajo === 'true') {
-    resultado = resultado.filter(r => esEstadoStockBajo(r.estadoStock)
-      || (r.porLocal && r.porLocal.some(f => esEstadoStockBajo(f.estadoStock))));
-  }
-
-  // Paginación EXPLÍCITA y opcional (?limit=&offset=): sin `limit`, se
-  // devuelve el arreglo completo tal cual siempre se hizo (compatibilidad
-  // total con quien ya consume esta ruta). Con `limit`, la respuesta pasa a
-  // ser un sobre { total, items, limit, offset } — nunca se recorta nada
-  // en silencio: el `total` real siempre viaja, así el front sabe cuánto
-  // le falta por pedir.
-  if (limit !== undefined && limit !== '') {
-    const limitNum = Math.max(1, Number(limit) || 0);
-    const offsetNum = Math.max(0, Number(offset) || 0);
-    return res.json({
-      total: resultado.length,
-      limit: limitNum,
-      offset: offsetNum,
-      items: resultado.slice(offsetNum, offsetNum + limitNum),
-    });
-  }
-  res.json(resultado);
+  const { rows } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} ${where} ORDER BY i.id DESC`, params);
+  res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// GET /insumos/alertas-stock — RETIRADO (requisito 8, esta ronda): era la
-// tarjeta "Insumos — stock bajo" del Dashboard, que el frontend deja de
-// mostrar. Nada más en este backend la consumía, así que se deja de
-// calcular (dejaba de pagarse esa consulta en cada carga del Dashboard,
-// aunque nadie la mostrara). El resto de "stock bajo" sigue disponible
-// donde de verdad hace falta: GET /insumos?stockBajo=true (por insumo,
-// con su estado calculado por local) y GET /insumos/:id (detalle).
-//
-// Trae un insumo completo (catálogo + su stock en cada local donde tiene
-// fila en insumo_local, con el estado calculado). La usan GET /:id y las
-// respuestas de POST/PUT (para no duplicar el mismo armado tres veces).
-// Detalle de un insumo con el DESGLOSE de stock por local (nunca un total
-// único — requisito 8) — incluye TODOS los locales con fila, activos e
-// inactivos (el histórico de un local desactivado se conserva y sigue
-// siendo consultable acá; "localEstado" deja que el frontend lo marque
-// como solo-lectura). El estado de stock se calcula por cada fila, nunca
-// sobre una suma (requisito 4).
-const obtenerInsumoCompleto = async (id) => {
-  const { rows } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [id]);
-  if (!rows[0]) return null;
-  const { rows: locs } = await pool.query(
-    `SELECT il.local_id AS "localId", lo.nombre AS "localNombre", lo.estado AS "localEstado",
-            il.stock, il.stock_minimo AS "stockMinimo", il.activo
-       FROM insumo_local il JOIN locales lo ON lo.id = il.local_id WHERE il.insumo_id=$1 ORDER BY lo.id`,
-    [id]
-  );
-  rows[0].porLocal = locs.map(l => ({ ...l, estadoStock: calcularEstadoStock(l.stock, l.stockMinimo) }));
-  return rows[0];
-};
 insRouter.get('/:id', auth, async (req, res) => {
   try {
-  const insumo = await obtenerInsumoCompleto(req.params.id);
-  if (!insumo) return res.status(404).json({ error: 'Insumo no encontrado' });
-  res.json(insumo);
+  const { rows } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
+  res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// El nombre de un insumo es único GLOBALMENTE (un solo registro de
-// catálogo, sin importar en cuántos locales tenga stock — ver
-// insumo_local). Antes la unicidad era "por local" (cuando cada local
-// duplicaba la fila completa); ahora que el insumo es un único registro,
-// dos insumos con el mismo nombre ya no tienen sentido en ningún caso.
-const insumoNombreDuplicado = async (nombre, excluirId) => {
-  if (!nombre) return false;
-  const params = excluirId ? [nombre, excluirId] : [nombre];
-  const cond = excluirId ? 'lower(nombre)=lower($1) AND id<>$2' : 'lower(nombre)=lower($1)';
+// El nombre de un insumo debe ser único dentro de un mismo proveedor (dos
+// proveedores distintos sí pueden vender un insumo con el mismo nombre).
+const insumoNombreDuplicado = async (nombre, proveedorId, excluirId) => {
+  if (!nombre || !proveedorId) return false;
+  const params = excluirId ? [nombre, proveedorId, excluirId] : [nombre, proveedorId];
+  const cond = excluirId ? 'lower(nombre)=lower($1) AND proveedor_id=$2 AND id<>$3' : 'lower(nombre)=lower($1) AND proveedor_id=$2';
   const { rows } = await pool.query(`SELECT id FROM insumos WHERE ${cond} LIMIT 1`, params);
   return !!rows[0];
 };
 
-// ¿La categoría elegida es "Empaques"? Se usa para bloquear (422) la
-// creación/edición de un insumo con esa categoría — vasos, pitillos y
-// desechables se gestionan en /empaques, no en /insumos (ver requisito 4).
-const categoriaEsEmpaques = async (categoriaId) => {
-  if (!categoriaId) return false;
-  const idEmp = await idCategoriaEmpaques();
-  return idEmp != null && Number(categoriaId) === idEmp;
-};
-
-// Tipo de uso del insumo: al menos uno de los tres debe quedar en true.
-// `actual` (solo en PUT) trae los valores YA guardados, para que no mandar
-// un campo en el body signifique "dejalo como está" (no "ponlo en false").
-// Definiciones correctas (ver auditoría en CAMBIOS.md antes de corregir el
-// nombre de esta columna): "topping" = adición GRATUITA y opcional dentro
-// de la ficha técnica; "adición" = extra que el cliente agrega y que SÍ
-// tiene costo. esAdicion (antes "esAdicionSinCosto") marca insumos
-// candidatos para construir una Adición con costo (tabla "adiciones").
-const ERROR_TIPO_USO_INSUMO =
-  'El insumo debe marcarse como al menos uno de: ingrediente normal (esInsumo), adición con costo (esAdicion) o topping gratuito (esTopping).';
-const resolverFlagsTipoUso = (body, actual = {}) => {
-  const esInsumo = body.esInsumo !== undefined ? !!body.esInsumo : (actual.esInsumo ?? true);
-  const esAdicion = body.esAdicion !== undefined ? !!body.esAdicion : (actual.esAdicion ?? false);
-  const esTopping = body.esTopping !== undefined ? !!body.esTopping : (actual.esTopping ?? false);
-  if (!esInsumo && !esAdicion && !esTopping) return { error: ERROR_TIPO_USO_INSUMO };
-  return { esInsumo, esAdicion, esTopping };
-};
-
-// ¿El usuario autenticado es el Superadministrador? (usuarios.es_superadmin —
-// hoy: solo 'Admin_Sicaber', el usuario raíz sembrado en schema.sql). Se lee
-// del JWT si viene (tokens nuevos) y, si no, de la BD — así funciona también
-// con sesiones abiertas antes de este cambio.
-const esSuperadmin = async (reqUser) => {
-  if (reqUser && typeof reqUser.es_superadmin === 'boolean') return reqUser.es_superadmin;
-  if (!reqUser?.id) return false;
-  const { rows } = await pool.query('SELECT es_superadmin FROM usuarios WHERE id=$1', [reqUser.id]);
-  return !!rows[0]?.es_superadmin;
-};
-
-// Local al que pertenece un insumo que se está registrando:
-//   • Superadministrador (o cualquier usuario SIN local_id fijo): NO se le
-//     asume ningún local — DEBE elegirlo explícitamente en el body
-//     (`local_id`). Es el comportamiento previo a "local automático".
-//   • Cajero/Bartender/Admin CON local_id: se usa el suyo, automático e
-//     inmutable — cualquier `local_id` distinto en el body se ignora.
-// Devuelve { localId } o { error, requiereSeleccionLocal } (para que el
-// frontend sepa que tiene que mostrar el selector de local).
-const resolverLocalDeTrabajo = async (req) => {
-  const superadmin = await esSuperadmin(req.user);
-  // El superadmin nunca "tiene" un local operativo aunque su fila lo tuviera.
-  const asignado = superadmin ? null : (Number(req.user?.local_id) || null);
-  let localId = asignado;
-  if (!localId) {
-    const explicito = Number(req.body?.local_id);
-    if (!Number.isInteger(explicito) || explicito <= 0) {
-      return {
-        error: superadmin
-          ? 'Como Superadministrador no tenés un local fijo: elegí a qué local pertenece este insumo (campo "local_id").'
-          : 'Tu usuario no tiene un local de trabajo asignado: elegí el local ("local_id") o pedí a un administrador que te asigne uno.',
-        requiereSeleccionLocal: true,
-      };
-    }
-    localId = explicito;
-  }
-  const { rows } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
-  if (!rows[0]) return { error: 'El local indicado no existe o no está activo.', requiereSeleccionLocal: !asignado };
-  return { localId };
-};
-
 insRouter.post('/', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, descripcion, estado } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
   // Antes el nombre se insertaba directo: si era solo espacios, ni siquiera
   // llegaba a insumoNombreDuplicado (que sale temprano con !nombre... pero
   // "   " es truthy, así que comparaba espacios contra espacios y guardaba).
@@ -1875,100 +1502,27 @@ insRouter.post('/', auth, async (req, res) => {
   if (unidadMedida && !UNIDADES_VALIDAS.includes(unidadMedida)) {
     return res.status(400).json({ error: `Unidad de medida inválida. Debe ser una de: ${UNIDADES_VALIDAS.join(', ')}.` });
   }
-  // Los empaques (vasos, pitillos, desechables) ya no se crean como
-  // insumos — ver requisito 4: usa /empaques.
-  if (await categoriaEsEmpaques(categoriaId)) {
-    return res.status(422).json({ error: ERROR_CATEGORIA_EMPAQUES });
-  }
-  const flags = resolverFlagsTipoUso(req.body);
-  if (flags.error) return res.status(400).json({ error: flags.error });
-
-  // stock_minimo es OBLIGATORIO al crear (ya no default 0 en silencio: un
-  // insumo sin mínimo definido nunca dispara la alerta de stock bajo). El
-  // stock inicial sigue siendo OPCIONAL (default 0) — mismo criterio que ya
-  // existía. Ambos, si vienen, respetan la unidad real del insumo: enteros
-  // cuando la unidad es "unidad" (no hay "3.5 pitillos"), decimales para
-  // el resto (kg/g/lb/oz/L/mL).
-  const errorMin = errorCantidadPorUnidad(stockMinimo, 'El stock mínimo', unidadMedida);
-  if (errorMin) return res.status(400).json({ error: errorMin });
-  const stockActualProvisto = stockActual !== undefined && stockActual !== null && stockActual !== '';
-  if (stockActualProvisto) {
-    const errorStock = errorCantidadPorUnidad(stockActual, 'El stock inicial', unidadMedida);
-    if (errorStock) return res.status(400).json({ error: errorStock });
-  }
-
-  // El local ahora es OBLIGATORIO al crear un insumo (requisito 3): un
-  // insumo sin ningún local asignado no puede tener stock/mínimo en
-  // ninguna parte, así que ya no se permite crearlo "flotando" — se
-  // resuelve ANTES de insertar nada (automático para quien tiene local
-  // fijo; el Superadministrador debe elegirlo explícito en el body).
-  const { localId, error: errorLocal, requiereSeleccionLocal } = await resolverLocalDeTrabajo(req);
-  if (errorLocal) return res.status(400).json({ error: errorLocal, requiereSeleccionLocal: !!requiereSeleccionLocal });
-
   // Espejo de la validación del frontend: no se puede crear un insumo si
   // no hay ningún proveedor Activo (ni registrado, ni todos inactivos).
   const { rows: activos } = await pool.query(`SELECT id FROM proveedores WHERE estado='Activo' LIMIT 1`);
   if (activos.length === 0) {
     return res.status(400).json({ error: 'No hay proveedores disponibles. Registra o activa un proveedor antes de crear un insumo.' });
   }
-  if (await insumoNombreDuplicado(nombre, null)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+  if (await insumoNombreDuplicado(nombre, proveedorId, null)) {
+    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor.' });
   }
   const { rows } = await pool.query(
-    `INSERT INTO insumos(nombre,categoria_id,unidad,precio_unitario,descripcion,estado,es_topping,es_insumo,es_adicion)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-    [nombre, categoriaId || null, unidadMedida || null, precioUnitario || 0, descripcion || null, estado || 'Activo', flags.esTopping, flags.esInsumo, flags.esAdicion]
+    `INSERT INTO insumos(nombre,categoria_id,unidad,stock,stock_minimo,precio_unitario,proveedor_id,descripcion,estado,es_topping)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+    [nombre, categoriaId || null, unidadMedida || null, stockActual || 0, stockMinimo || 0, precioUnitario || 0, proveedorId || null, descripcion || null, estado || 'Activo', !!esTopping]
   );
-  const insumoId = rows[0].id;
-
-  // Al crear un insumo se genera una fila de insumo_local por CADA local
-  // activo — no solo el elegido/resuelto — para que el insumo nunca
-  // aparezca "ausente" ni dé error en un local donde todavía no se ha
-  // comprado (las filas existen igual, en 0). El local elegido recibe el
-  // stock inicial real (si vino) y el stock_minimo tal cual lo pidió quien
-  // creó el insumo; el resto arranca en stock_actual=0 con el MISMO
-  // stock_minimo como valor por defecto heredado — se puede ajustar
-  // después, por local, con PUT /insumos/:id/locales/:localId.
-  //
-  // Requisito 6 (esta ronda) — "Todos los locales": lo que varía con este
-  // flag es SOLO el "activo" de cada fila, nunca cuáles existen (todas
-  // existen siempre, ver arriba) — así ningún local muestra un error, solo
-  // 0 en vez de "insumo no disponible aquí".
-  //   • todosLosLocales=true → activo=true en TODAS (el "local_id" que se
-  //     resolvió arriba sigue siendo, únicamente, el que recibe el stock
-  //     inicial indicado — no cambia por este flag).
-  //   • sin el flag (un local puntual, el de siempre) → activo=true SOLO
-  //     en el local elegido; el resto queda activo=false (existen, pero no
-  //     se ofrecen ahí hasta que alguien las active a mano).
-  // TODO local, activo o inactivo (mismo criterio que
-  // asegurarInsumoLocalEnTodosLosLocales en config/db.js): un local
-  // desactivado igual conserva su fila en solo lectura, para no dejarle
-  // huecos que la migración tenga que ir rellenando después.
-  const todosLosLocales = req.body.todosLosLocales === true || req.body.todosLosLocales === 'true';
-  const { rows: locales } = await pool.query(`SELECT id FROM locales`);
-  const stockMinimoNum = Number(stockMinimo);
-  const stockActualNum = Number(stockActual) || 0;
-  for (const l of locales) {
-    const esElElegido = l.id === localId;
-    const activoAqui = esElElegido || todosLosLocales;
-    await pool.query(
-      `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,$3,$4,$5)
-         ON CONFLICT (insumo_id, local_id) DO NOTHING`,
-      [insumoId, l.id, esElElegido ? stockActualNum : 0, stockMinimoNum, activoAqui]
-    );
-  }
-  // La respuesta ya trae "porLocal" con el "activo" de cada fila (ver
-  // obtenerInsumoCompleto) — así el front sabe exactamente en qué locales
-  // quedó disponible este insumo, para mostrarlo al editar.
-  res.status(201).json(await obtenerInsumoCompleto(insumoId));
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
-    res.status(500).json({ error: e.message });
-  }
+  const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [rows[0].id]);
+  res.status(201).json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 insRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, precioUnitario, descripcion, estado } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del insumo', LIMITES.NOMBRE);
   if (errorNom) return res.status(400).json({ error: errorNom });
   const errorDesc = errorLongitud(descripcion, 'La descripción del insumo', LIMITES.DESCRIPCION);
@@ -1980,37 +1534,25 @@ insRouter.put('/:id', auth, async (req, res) => {
   // unidad distinta a la actual, sin ninguna conversión. Se rechaza
   // cualquier intento de mandar un valor distinto al que ya tiene guardado
   // (incluso si el nuevo valor es, por sí solo, una unidad válida).
-  const { rows: actual } = await pool.query(
-    'SELECT unidad, categoria_id, es_insumo, es_adicion, es_topping FROM insumos WHERE id=$1', [req.params.id]
-  );
+  const { rows: actual } = await pool.query('SELECT unidad FROM insumos WHERE id=$1', [req.params.id]);
   if (!actual[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const unidadEnviada = unidadMedida || null;
   if (unidadEnviada !== actual[0].unidad) {
     return res.status(400).json({ error: 'La unidad de medida no se puede modificar después de creado el insumo.' });
   }
-  if (await categoriaEsEmpaques(categoriaId)) {
-    return res.status(422).json({ error: ERROR_CATEGORIA_EMPAQUES });
-  }
-  const flags = resolverFlagsTipoUso(req.body, {
-    esInsumo: actual[0].es_insumo, esAdicion: actual[0].es_adicion, esTopping: actual[0].es_topping,
-  });
-  if (flags.error) return res.status(400).json({ error: flags.error });
 
-  // La unicidad de nombre ahora es GLOBAL (ver insumoNombreDuplicado).
-  if (await insumoNombreDuplicado(nombre, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+  if (await insumoNombreDuplicado(nombre, proveedorId, req.params.id)) {
+    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor.' });
   }
   const { rows } = await pool.query(
-    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,precio_unitario=$4,descripcion=$5,estado=$6,es_topping=$7,es_insumo=$8,es_adicion=$9
+    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock_minimo=$4,precio_unitario=$5,proveedor_id=$6,descripcion=$7,estado=$8,es_topping=$9
      WHERE id=$10 RETURNING id`,
-    [nombre, categoriaId || null, unidadEnviada, precioUnitario, descripcion || null, estado, flags.esTopping, flags.esInsumo, flags.esAdicion, req.params.id]
+    [nombre, categoriaId || null, unidadEnviada, stockMinimo, precioUnitario, proveedorId || null, descripcion || null, estado, !!esTopping, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
-  res.json(await obtenerInsumoCompleto(req.params.id));
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
-    res.status(500).json({ error: e.message });
-  }
+  const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [req.params.id]);
+  res.json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 insRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
@@ -2019,7 +1561,8 @@ insRouter.patch('/:id/estado', auth, async (req, res) => {
     [req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
-  res.json(await obtenerInsumoCompleto(req.params.id));
+  const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [req.params.id]);
+  res.json(full[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 insRouter.delete('/:id', auth, async (req, res) => {
@@ -2035,432 +1578,11 @@ insRouter.delete('/:id', auth, async (req, res) => {
   if (conCompras[0]) {
     return res.status(400).json({ error: 'No se puede eliminar: este insumo tiene compras registradas. Desactívalo en su lugar.' });
   }
-  // ON DELETE CASCADE en insumo_local: borrar el insumo se lleva su stock
-  // por local también (ya no tiene sentido dejarlo huérfano).
   await pool.query('DELETE FROM insumos WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// ── INSUMO_LOCAL: stock/mínimo por local (CRUD) ─────────────────────────
-// Ajustar el stock/mínimo de UN insumo en UN local puntual (alta de un
-// local nuevo para un insumo que ya existe, corrección manual de stock,
-// desactivar el insumo solo en ese local, etc.) — el alta/edición del
-// insumo en sí (catálogo) sigue siendo las rutas de arriba.
-insRouter.param('localId', validateId);
-insRouter.get('/:id/locales', auth, async (req, res) => {
-  try {
-  const { rows: existe } = await pool.query('SELECT id FROM insumos WHERE id=$1', [req.params.id]);
-  if (!existe[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
-  const { rows } = await pool.query(
-    `SELECT il.id, il.local_id AS "localId", lo.nombre AS "localNombre", il.stock, il.stock_minimo AS "stockMinimo", il.activo
-       FROM insumo_local il JOIN locales lo ON lo.id = il.local_id WHERE il.insumo_id=$1 ORDER BY lo.id`,
-    [req.params.id]
-  );
-  res.json(rows.map(r => ({ ...r, estadoStock: calcularEstadoStock(r.stock, r.stockMinimo) })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-insRouter.post('/:id/locales', auth, async (req, res) => {
-  try {
-  const { rows: existe } = await pool.query('SELECT id, unidad FROM insumos WHERE id=$1', [req.params.id]);
-  if (!existe[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
-  const localId = Number(req.body.local_id);
-  if (!Number.isInteger(localId) || localId <= 0) {
-    return res.status(400).json({ error: 'Debes indicar el local ("local_id").' });
-  }
-  const { rows: localOk } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
-  if (!localOk[0]) return res.status(400).json({ error: 'El local indicado no existe o no está activo.' });
-  // Mismo criterio que al crear el insumo: enteros si la unidad es
-  // "unidad", decimales para el resto. stock_minimo obligatorio; stock
-  // inicial opcional (default 0).
-  const errorMin = errorCantidadPorUnidad(req.body.stockMinimo, 'El stock mínimo', existe[0].unidad);
-  if (errorMin) return res.status(400).json({ error: errorMin });
-  const errorStock = errorCantidadPorUnidad(req.body.stockActual, 'El stock', existe[0].unidad, false);
-  if (errorStock) return res.status(400).json({ error: errorStock });
-  const stockActual = Number(req.body.stockActual) || 0;
-  const stockMinimo = Number(req.body.stockMinimo);
-  const { rows } = await pool.query(
-    `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo)
-       VALUES($1,$2,$3,$4,$5) RETURNING id, local_id AS "localId", stock, stock_minimo AS "stockMinimo", activo`,
-    [req.params.id, localId, stockActual, stockMinimo, req.body.activo !== false]
-  );
-  res.status(201).json({ ...rows[0], estadoStock: calcularEstadoStock(rows[0].stock, rows[0].stockMinimo) });
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Este insumo ya tiene una fila de stock para ese local — usa PUT para editarla.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-insRouter.put('/:id/locales/:localId', auth, async (req, res) => {
-  try {
-  const { rows: insumo } = await pool.query('SELECT unidad FROM insumos WHERE id=$1', [req.params.id]);
-  if (!insumo[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
-  const { stockActual, stockMinimo, activo } = req.body;
-  const errorStock = errorCantidadPorUnidad(stockActual, 'El stock', insumo[0].unidad, false);
-  if (errorStock) return res.status(400).json({ error: errorStock });
-  const errorMin = errorCantidadPorUnidad(stockMinimo, 'El stock mínimo', insumo[0].unidad, false);
-  if (errorMin) return res.status(400).json({ error: errorMin });
-  const { rows } = await pool.query(
-    `UPDATE insumo_local SET
-       stock = COALESCE($1, stock), stock_minimo = COALESCE($2, stock_minimo), activo = COALESCE($3, activo)
-     WHERE insumo_id=$4 AND local_id=$5
-     RETURNING id, local_id AS "localId", stock, stock_minimo AS "stockMinimo", activo`,
-    [stockActual ?? null, stockMinimo ?? null, activo ?? null, req.params.id, req.params.localId]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Este insumo no tiene stock registrado en ese local.' });
-  res.json({ ...rows[0], estadoStock: calcularEstadoStock(rows[0].stock, rows[0].stockMinimo) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-insRouter.delete('/:id/locales/:localId', auth, async (req, res) => {
-  try {
-  const { rows } = await pool.query(
-    `DELETE FROM insumo_local WHERE insumo_id=$1 AND local_id=$2 RETURNING id`,
-    [req.params.id, req.params.localId]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Este insumo no tiene stock registrado en ese local.' });
-  res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
 r.use('/insumos', insRouter);
-
-// ── EMPAQUES (vasos, pitillos, desechables) ─────────────────────────────
-// Separados de "insumos" (requisito 4): no son perecederos, no llevan
-// receta y se descuentan por PRODUCTO/TAMAÑO (ver producto_empaque más
-// abajo), no por ficha técnica. Mismo patrón exacto que insumos/
-// insumo_local: catálogo global (esta tabla) + stock por local
-// (empaque_local).
-const EMPAQUE_COLS = `
-  e.id, e.nombre, e.descripcion, e.unidad AS "unidadMedida",
-  e.precio_unitario AS "precioUnitario", e.estado, e.created_at AS "fechaCreacion"
-`;
-const empRouterEmpaques = require('express').Router(); // nombre distinto: "empRouter" ya lo usa el módulo de Empleados
-empRouterEmpaques.param('id', validateId);
-empRouterEmpaques.param('localId', validateId);
-
-const obtenerEmpaqueCompleto = async (id) => {
-  const { rows } = await pool.query(`SELECT ${EMPAQUE_COLS} FROM empaques e WHERE e.id=$1`, [id]);
-  if (!rows[0]) return null;
-  const { rows: locs } = await pool.query(
-    `SELECT el.local_id AS "localId", lo.nombre AS "localNombre", el.stock, el.stock_minimo AS "stockMinimo", el.activo
-       FROM empaque_local el JOIN locales lo ON lo.id = el.local_id WHERE el.empaque_id=$1 ORDER BY lo.id`,
-    [id]
-  );
-  rows[0].porLocal = locs.map(l => ({ ...l, estadoStock: calcularEstadoStock(l.stock, l.stockMinimo) }));
-  return rows[0];
-};
-const empaqueNombreDuplicado = async (nombre, excluirId) => {
-  if (!nombre) return false;
-  const params = excluirId ? [nombre, excluirId] : [nombre];
-  const cond = excluirId ? 'lower(nombre)=lower($1) AND id<>$2' : 'lower(nombre)=lower($1)';
-  const { rows } = await pool.query(`SELECT id FROM empaques WHERE ${cond} LIMIT 1`, params);
-  return !!rows[0];
-};
-
-// Mismo contrato de ?local_id= que GET /insumos: sin local_id (o
-// local_id=all) → consolidado con "porLocal"; local_id=<id> → solo el
-// stock de ese local (un empaque sin fila ahí no aparece).
-empRouterEmpaques.get('/', auth, async (req, res) => {
-  try {
-  const { estado, q, local_id } = req.query;
-  const condiciones = [];
-  const params = [];
-  if (estado) { params.push(estado); condiciones.push(`e.estado = $${params.length}`); }
-  if (q)      { params.push(`%${q}%`); condiciones.push(`e.nombre ILIKE $${params.length}`); }
-  const where = condiciones.length ? `WHERE ${condiciones.join(' AND ')}` : '';
-  const { rows: base } = await pool.query(`SELECT ${EMPAQUE_COLS} FROM empaques e ${where} ORDER BY e.id DESC`, params);
-  if (!base.length) return res.json([]);
-
-  const ids = base.map(b => b.id);
-  const { rows: locs } = await pool.query(
-    `SELECT el.empaque_id AS "empaqueId", el.local_id AS "localId", lo.nombre AS "localNombre",
-            el.stock, el.stock_minimo AS "stockMinimo", el.activo
-       FROM empaque_local el JOIN locales lo ON lo.id = el.local_id WHERE el.empaque_id = ANY($1::int[]) ORDER BY lo.id`,
-    [ids]
-  );
-  const porEmpaque = new Map();
-  for (const l of locs) {
-    if (!porEmpaque.has(l.empaqueId)) porEmpaque.set(l.empaqueId, []);
-    porEmpaque.get(l.empaqueId).push({
-      localId: l.localId, localNombre: l.localNombre, stock: l.stock, stockMinimo: l.stockMinimo, activo: l.activo,
-      estadoStock: calcularEstadoStock(l.stock, l.stockMinimo),
-    });
-  }
-
-  let resultado;
-  if (local_id !== undefined && local_id !== '' && local_id !== 'all') {
-    const idLocal = Number(local_id);
-    resultado = base
-      .map(b => {
-        const fila = (porEmpaque.get(b.id) || []).find(l => l.localId === idLocal);
-        if (!fila) return null;
-        return { ...b, stockActual: fila.stock, stockMinimo: fila.stockMinimo, activoEnLocal: fila.activo, estadoStock: fila.estadoStock, localId: fila.localId, localNombre: fila.localNombre };
-      })
-      .filter(Boolean);
-  } else {
-    resultado = base.map(b => {
-      const filas = porEmpaque.get(b.id) || [];
-      const stockActual = filas.reduce((a, f) => a + Number(f.stock || 0), 0);
-      const stockMinimo = filas.reduce((a, f) => a + Number(f.stockMinimo || 0), 0);
-      return { ...b, stockActual, stockMinimo, estadoStock: calcularEstadoStock(stockActual, stockMinimo), porLocal: filas };
-    });
-  }
-  res.json(resultado);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-empRouterEmpaques.get('/:id', auth, async (req, res) => {
-  try {
-  const empaque = await obtenerEmpaqueCompleto(req.params.id);
-  if (!empaque) return res.status(404).json({ error: 'Empaque no encontrado' });
-  res.json(empaque);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-empRouterEmpaques.post('/', auth, async (req, res) => {
-  try {
-  const { unidadMedida, precioUnitario, descripcion, estado, stockActual, stockMinimo } = req.body;
-  const errorNom = errorNombre(req.body.nombre, 'El nombre del empaque', LIMITES.NOMBRE);
-  if (errorNom) return res.status(400).json({ error: errorNom });
-  const errorDesc = errorLongitud(descripcion, 'La descripción del empaque', LIMITES.DESCRIPCION);
-  if (errorDesc) return res.status(400).json({ error: errorDesc });
-  const nombre = nombreNormalizado(req.body.nombre);
-  if (unidadMedida && !UNIDADES_VALIDAS.includes(unidadMedida)) {
-    return res.status(400).json({ error: `Unidad de medida inválida. Debe ser una de: ${UNIDADES_VALIDAS.join(', ')}.` });
-  }
-  if (await empaqueNombreDuplicado(nombre, null)) {
-    return res.status(400).json({ error: 'Ya existe un empaque con ese nombre.' });
-  }
-  const { rows } = await pool.query(
-    `INSERT INTO empaques(nombre, unidad, precio_unitario, descripcion, estado)
-       VALUES($1,$2,$3,$4,$5) RETURNING id`,
-    [nombre, unidadMedida || 'unidad', precioUnitario || 0, descripcion || null, estado || 'Activo']
-  );
-  const empaqueId = rows[0].id;
-  const { localId } = await resolverLocalDeTrabajo(req);
-  if (localId) {
-    await pool.query(
-      `INSERT INTO empaque_local(empaque_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,$3,$4,true)`,
-      [empaqueId, localId, Number(stockActual) || 0, Number(stockMinimo) || 0]
-    );
-  }
-  res.status(201).json(await obtenerEmpaqueCompleto(empaqueId));
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un empaque con ese nombre.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-empRouterEmpaques.put('/:id', auth, async (req, res) => {
-  try {
-  const { unidadMedida, precioUnitario, descripcion, estado } = req.body;
-  const errorNom = errorNombre(req.body.nombre, 'El nombre del empaque', LIMITES.NOMBRE);
-  if (errorNom) return res.status(400).json({ error: errorNom });
-  const errorDesc = errorLongitud(descripcion, 'La descripción del empaque', LIMITES.DESCRIPCION);
-  if (errorDesc) return res.status(400).json({ error: errorDesc });
-  const nombre = nombreNormalizado(req.body.nombre);
-  const { rows: actual } = await pool.query('SELECT unidad FROM empaques WHERE id=$1', [req.params.id]);
-  if (!actual[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  const unidadEnviada = unidadMedida || actual[0].unidad;
-  if (await empaqueNombreDuplicado(nombre, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe un empaque con ese nombre.' });
-  }
-  const { rows } = await pool.query(
-    `UPDATE empaques SET nombre=$1, unidad=$2, precio_unitario=$3, descripcion=$4, estado=$5 WHERE id=$6 RETURNING id`,
-    [nombre, unidadEnviada, precioUnitario, descripcion || null, estado, req.params.id]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  res.json(await obtenerEmpaqueCompleto(req.params.id));
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un empaque con ese nombre.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-empRouterEmpaques.patch('/:id/estado', auth, async (req, res) => {
-  try {
-  const { rows } = await pool.query(
-    `UPDATE empaques SET estado=CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING id`,
-    [req.params.id]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  res.json(await obtenerEmpaqueCompleto(req.params.id));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-empRouterEmpaques.delete('/:id', auth, async (req, res) => {
-  try {
-  const { rows: enUso } = await pool.query(
-    `SELECT 1 FROM producto_empaque WHERE vaso_empaque_id=$1 OR pitillo_empaque_id=$1
-     UNION SELECT 1 FROM toppings WHERE empaque_id=$1
-     UNION SELECT 1 FROM adiciones WHERE empaque_id=$1 LIMIT 1`,
-    [req.params.id]
-  );
-  if (enUso[0]) {
-    return res.status(400).json({ error: 'No se puede eliminar: este empaque está configurado en algún producto, topping o adición. Desactívalo en su lugar.' });
-  }
-  const { rows } = await pool.query('DELETE FROM empaques WHERE id=$1 RETURNING id', [req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── EMPAQUE_LOCAL: stock/mínimo por local (mismo patrón que insumo_local) ──
-empRouterEmpaques.get('/:id/locales', auth, async (req, res) => {
-  try {
-  const { rows: existe } = await pool.query('SELECT id FROM empaques WHERE id=$1', [req.params.id]);
-  if (!existe[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  const { rows } = await pool.query(
-    `SELECT el.id, el.local_id AS "localId", lo.nombre AS "localNombre", el.stock, el.stock_minimo AS "stockMinimo", el.activo
-       FROM empaque_local el JOIN locales lo ON lo.id = el.local_id WHERE el.empaque_id=$1 ORDER BY lo.id`,
-    [req.params.id]
-  );
-  res.json(rows.map(r => ({ ...r, estadoStock: calcularEstadoStock(r.stock, r.stockMinimo) })));
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-empRouterEmpaques.post('/:id/locales', auth, async (req, res) => {
-  try {
-  const { rows: existe } = await pool.query('SELECT id FROM empaques WHERE id=$1', [req.params.id]);
-  if (!existe[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
-  const localId = Number(req.body.local_id);
-  if (!Number.isInteger(localId) || localId <= 0) return res.status(400).json({ error: 'Debes indicar el local ("local_id").' });
-  const { rows: localOk } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
-  if (!localOk[0]) return res.status(400).json({ error: 'El local indicado no existe o no está activo.' });
-  const stockActual = Number(req.body.stockActual) || 0;
-  const stockMinimo = Number(req.body.stockMinimo) || 0;
-  if (stockActual < 0 || stockMinimo < 0) return res.status(400).json({ error: 'El stock y el stock mínimo no pueden ser negativos.' });
-  const { rows } = await pool.query(
-    `INSERT INTO empaque_local(empaque_id, local_id, stock, stock_minimo, activo)
-       VALUES($1,$2,$3,$4,$5) RETURNING id, local_id AS "localId", stock, stock_minimo AS "stockMinimo", activo`,
-    [req.params.id, localId, stockActual, stockMinimo, req.body.activo !== false]
-  );
-  res.status(201).json({ ...rows[0], estadoStock: calcularEstadoStock(rows[0].stock, rows[0].stockMinimo) });
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Este empaque ya tiene una fila de stock para ese local — usa PUT para editarla.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-empRouterEmpaques.put('/:id/locales/:localId', auth, async (req, res) => {
-  try {
-  const { stockActual, stockMinimo, activo } = req.body;
-  if (stockActual !== undefined && Number(stockActual) < 0) return res.status(400).json({ error: 'El stock no puede ser negativo.' });
-  if (stockMinimo !== undefined && Number(stockMinimo) < 0) return res.status(400).json({ error: 'El stock mínimo no puede ser negativo.' });
-  const { rows } = await pool.query(
-    `UPDATE empaque_local SET
-       stock = COALESCE($1, stock), stock_minimo = COALESCE($2, stock_minimo), activo = COALESCE($3, activo)
-     WHERE empaque_id=$4 AND local_id=$5
-     RETURNING id, local_id AS "localId", stock, stock_minimo AS "stockMinimo", activo`,
-    [stockActual ?? null, stockMinimo ?? null, activo ?? null, req.params.id, req.params.localId]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Este empaque no tiene stock registrado en ese local.' });
-  res.json({ ...rows[0], estadoStock: calcularEstadoStock(rows[0].stock, rows[0].stockMinimo) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-empRouterEmpaques.delete('/:id/locales/:localId', auth, async (req, res) => {
-  try {
-  const { rows } = await pool.query(
-    `DELETE FROM empaque_local WHERE empaque_id=$1 AND local_id=$2 RETURNING id`,
-    [req.params.id, req.params.localId]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Este empaque no tiene stock registrado en ese local.' });
-  res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-r.use('/empaques', empRouterEmpaques);
-
-// ── PRODUCTO_EMPAQUE ────────────────────────────────────────────────────
-// Qué vaso usa cada producto/tamaño y si lleva pitillo (y cuál) — se
-// descuenta automáticamente al vender (ver calcularRecetaEfectiva /
-// descontarInventarioPorVenta más abajo).
-const prodEmpRouter = require('express').Router();
-prodEmpRouter.param('id', validateId);
-const PROD_EMP_COLS = `
-  pe.id, pe.producto_id AS "productoId", p.nombre AS "productoNombre", pe.tamano,
-  pe.vaso_empaque_id AS "vasoEmpaqueId", ve.nombre AS "vasoEmpaqueNombre",
-  pe.lleva_pitillo AS "llevaPitillo",
-  pe.pitillo_empaque_id AS "pitilloEmpaqueId", pi.nombre AS "pitilloEmpaqueNombre",
-  pe.created_at AS "fechaCreacion"
-`;
-const PROD_EMP_JOINS = `
-  FROM producto_empaque pe
-  JOIN productos p ON p.id = pe.producto_id
-  LEFT JOIN empaques ve ON ve.id = pe.vaso_empaque_id
-  LEFT JOIN empaques pi ON pi.id = pe.pitillo_empaque_id
-`;
-prodEmpRouter.get('/', auth, async (req, res) => {
-  try {
-  const { producto_id } = req.query;
-  const params = [];
-  let where = '';
-  if (producto_id) { params.push(Number(producto_id)); where = `WHERE pe.producto_id = $1`; }
-  const { rows } = await pool.query(`SELECT ${PROD_EMP_COLS} ${PROD_EMP_JOINS} ${where} ORDER BY pe.id DESC`, params);
-  res.json(rows);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-prodEmpRouter.get('/:id', auth, async (req, res) => {
-  try {
-  const { rows } = await pool.query(`SELECT ${PROD_EMP_COLS} ${PROD_EMP_JOINS} WHERE pe.id=$1`, [req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: 'Configuración de empaque no encontrada' });
-  res.json(rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-const validarProductoEmpaqueBody = async (body) => {
-  const productoId = Number(body.producto_id);
-  if (!Number.isInteger(productoId) || productoId <= 0) return { error: 'Debes indicar el producto ("producto_id").' };
-  const { rows: prod } = await pool.query('SELECT id FROM productos WHERE id=$1', [productoId]);
-  if (!prod[0]) return { error: 'El producto indicado no existe.' };
-
-  const tamano = body.tamano ? textoLimpio(body.tamano) : null;
-  const vasoEmpaqueId = body.vaso_empaque_id ? Number(body.vaso_empaque_id) : null;
-  if (vasoEmpaqueId) {
-    const { rows } = await pool.query('SELECT id FROM empaques WHERE id=$1', [vasoEmpaqueId]);
-    if (!rows[0]) return { error: 'El vaso (empaque) indicado no existe.' };
-  }
-  const llevaPitillo = !!body.lleva_pitillo;
-  const pitilloEmpaqueId = body.pitillo_empaque_id ? Number(body.pitillo_empaque_id) : null;
-  if (llevaPitillo && !pitilloEmpaqueId) {
-    return { error: 'Selecciona qué pitillo (empaque) lleva este producto/tamaño.' };
-  }
-  if (pitilloEmpaqueId) {
-    const { rows } = await pool.query('SELECT id FROM empaques WHERE id=$1', [pitilloEmpaqueId]);
-    if (!rows[0]) return { error: 'El pitillo (empaque) indicado no existe.' };
-  }
-  return { datos: { productoId, tamano, vasoEmpaqueId, llevaPitillo, pitilloEmpaqueId } };
-};
-prodEmpRouter.post('/', auth, async (req, res) => {
-  try {
-  const { error, datos } = await validarProductoEmpaqueBody(req.body);
-  if (error) return res.status(400).json({ error });
-  const { rows } = await pool.query(
-    `INSERT INTO producto_empaque(producto_id, tamano, vaso_empaque_id, lleva_pitillo, pitillo_empaque_id)
-       VALUES($1,$2,$3,$4,$5) RETURNING id`,
-    [datos.productoId, datos.tamano, datos.vasoEmpaqueId, datos.llevaPitillo, datos.pitilloEmpaqueId]
-  );
-  const { rows: full } = await pool.query(`SELECT ${PROD_EMP_COLS} ${PROD_EMP_JOINS} WHERE pe.id=$1`, [rows[0].id]);
-  res.status(201).json(full[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Este producto ya tiene una configuración de empaque para ese tamaño — edítala en vez de crear otra.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-prodEmpRouter.put('/:id', auth, async (req, res) => {
-  try {
-  const { error, datos } = await validarProductoEmpaqueBody(req.body);
-  if (error) return res.status(400).json({ error });
-  const { rows } = await pool.query(
-    `UPDATE producto_empaque SET producto_id=$1, tamano=$2, vaso_empaque_id=$3, lleva_pitillo=$4, pitillo_empaque_id=$5
-     WHERE id=$6 RETURNING id`,
-    [datos.productoId, datos.tamano, datos.vasoEmpaqueId, datos.llevaPitillo, datos.pitilloEmpaqueId, req.params.id]
-  );
-  if (!rows[0]) return res.status(404).json({ error: 'Configuración de empaque no encontrada' });
-  const { rows: full } = await pool.query(`SELECT ${PROD_EMP_COLS} ${PROD_EMP_JOINS} WHERE pe.id=$1`, [req.params.id]);
-  res.json(full[0]);
-  } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Este producto ya tiene una configuración de empaque para ese tamaño — edítala en vez de crear otra.' });
-    res.status(500).json({ error: e.message });
-  }
-});
-prodEmpRouter.delete('/:id', auth, async (req, res) => {
-  try {
-  const { rows } = await pool.query('DELETE FROM producto_empaque WHERE id=$1 RETURNING id', [req.params.id]);
-  if (!rows[0]) return res.status(404).json({ error: 'Configuración de empaque no encontrada' });
-  res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-r.use('/producto-empaque', prodEmpRouter);
 
 // ── COMPRAS ────────────────────────────────────────────────
 // Alias camelCase → lo que ya usa el frontend (ComprasPage, VerCompraPage,
@@ -2473,78 +1595,27 @@ const COMPRA_COLS = `
   c.comprobante_url, c.comprobante_verificado, c.comprobante_total_ocr,
   c.ocr_resultado AS "ocrResultado",
   c.motivo_anulacion AS "motivoAnulacion",
-  c.local_id AS "localId", lo.nombre AS "localNombre",
   c.created_at AS "fechaCreacion", c.fecha_anulacion AS "fechaAnulacion"
 `;
-const COMPRA_JOINS = `FROM compras c
-  LEFT JOIN proveedores p ON c.proveedor_id = p.id
-  LEFT JOIN locales lo ON c.local_id = lo.id`;
+const COMPRA_JOINS = `FROM compras c LEFT JOIN proveedores p ON c.proveedor_id = p.id`;
 
-// Registra en movimientos_inventario el delta aplicado a un insumo/empaque
-// en un local — puramente aditivo (kardex/auditoría): nadie lee esta tabla
-// todavía para calcular nada, el stock vigente sigue viviendo en
-// insumo_local/empaque_local. Nunca debe tumbar el ajuste de stock que la
-// acompaña, así que cualquier error acá solo se registra en consola.
-const registrarMovimientoInventario = async (db, { tipo, insumoId, empaqueId, localId, cantidad, referenciaTipo, referenciaId }) => {
-  try {
-    await db.query(
-      `INSERT INTO movimientos_inventario(tipo, insumo_id, empaque_id, local_id, cantidad, referencia_tipo, referencia_id)
-         VALUES($1,$2,$3,$4,$5,$6,$7)`,
-      [tipo, insumoId || null, empaqueId || null, localId, cantidad, referenciaTipo || null, referenciaId || null]
+// Ajusta el stock de un insumo buscándolo por nombre (el formulario de
+// Compras solo guarda el nombre del insumo en cada ítem, no su id).
+// delta > 0 suma stock (al registrar la compra), delta < 0 lo resta (al
+// anularla) sin dejarlo nunca negativo.
+const ajustarStockInsumo = async (nombreInsumo, delta) => {
+  if (!nombreInsumo) return;
+  if (delta >= 0) {
+    await pool.query(
+      `UPDATE insumos SET stock = COALESCE(stock,0) + $1 WHERE lower(nombre) = lower($2)`,
+      [delta, nombreInsumo]
     );
-  } catch (e) {
-    console.error('⚠️  No se pudo registrar el movimiento de inventario (el ajuste de stock igual se aplicó):', e.message);
+  } else {
+    await pool.query(
+      `UPDATE insumos SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE lower(nombre) = lower($2)`,
+      [delta, nombreInsumo]
+    );
   }
-};
-
-// Ajusta el stock de un insumo EN UN LOCAL puntual (la fila insumo_local
-// de ese insumo+local) — nunca el resto de locales. Si el insumo todavía
-// no tiene fila en ese local, se le crea (arranca en 0 antes del ajuste),
-// para que una primera compra en un local nuevo no se rechace.
-// delta > 0 suma stock (compra), delta < 0 lo resta (venta, anulación de
-// compra) sin dejarlo nunca negativo. `db` opcional: cliente de una
-// transacción en curso (ver descontarInventarioPorVenta).
-const ajustarStockInsumoLocal = async (insumoId, localId, delta, meta = {}, db = pool) => {
-  if (!insumoId || !localId) return;
-  await db.query(
-    `INSERT INTO insumo_local(insumo_id, local_id, stock) VALUES($1,$2,0)
-       ON CONFLICT (insumo_id, local_id) DO NOTHING`,
-    [insumoId, localId]
-  );
-  await db.query(
-    `UPDATE insumo_local SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE insumo_id=$2 AND local_id=$3`,
-    [delta, insumoId, localId]
-  );
-  await registrarMovimientoInventario(db, { ...meta, insumoId, localId, cantidad: delta });
-};
-
-// Igual que ajustarStockInsumoLocal, pero para un EMPAQUE.
-const ajustarEmpaqueLocal = async (empaqueId, localId, delta, meta = {}, db = pool) => {
-  if (!empaqueId || !localId) return;
-  await db.query(
-    `INSERT INTO empaque_local(empaque_id, local_id, stock) VALUES($1,$2,0)
-       ON CONFLICT (empaque_id, local_id) DO NOTHING`,
-    [empaqueId, localId]
-  );
-  await db.query(
-    `UPDATE empaque_local SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE empaque_id=$2 AND local_id=$3`,
-    [delta, empaqueId, localId]
-  );
-  await registrarMovimientoInventario(db, { ...meta, empaqueId, localId, cantidad: delta });
-};
-
-// Resuelve el insumo_id real (catálogo global) a partir del NOMBRE que
-// guarda un ítem de compra viejo (de antes de que cada ítem sellara su
-// propio insumo_id — ver POST /compras). Antes esto se buscaba dentro de
-// los insumos del LOCAL de la compra (cuando el insumo era una fila por
-// local); ahora el catálogo es global, así que basta con el nombre.
-const resolverInsumoIdPorNombre = async (nombreInsumo) => {
-  if (!nombreInsumo) return null;
-  const { rows } = await pool.query(
-    `SELECT id FROM insumos WHERE lower(btrim(nombre)) = lower(btrim($1)) LIMIT 1`,
-    [nombreInsumo]
-  );
-  return rows[0]?.id ?? null;
 };
 
 // ── Presentación de compra ──────────────────────────────────────────────
@@ -2644,6 +1715,16 @@ const calcularCantidadStock = (item) => {
   return Number(item?.cantidad) || 0;
 };
 
+// Igual que ajustarStockInsumo, pero buscando el insumo por id en vez de
+// por nombre — las fichas técnicas guardan id_insumo/vaso_id (no nombres),
+// así se reutiliza el mismo criterio de "nunca dejar el stock negativo".
+const ajustarStockInsumoPorId = async (idInsumo, delta) => {
+  if (!idInsumo) return;
+  await pool.query(
+    `UPDATE insumos SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE id = $2`,
+    [delta, idInsumo]
+  );
+};
 
 // Los combos del carrito (Landing.jsx) se identifican con un id sintético
 // tipo "combo-5" (string, no un id real de productos) para distinguirlos
@@ -2698,30 +1779,16 @@ const prepararDatosReceta = async (items) => {
   const fichaPorProducto = new Map();
   if (productoIds.length) {
     const { rows: fichas } = await pool.query(
-      `SELECT producto_id, ingredientes, preparacion, toppings_ficha,
-              vaso_insumo_id, cantidad_vaso, lleva_pitillo, pitillo_insumo_id, cantidad_pitillo
-         FROM fichas_tecnicas
+      `SELECT producto_id, ingredientes, vaso_id, preparacion, toppings_ficha FROM fichas_tecnicas
          WHERE producto_id = ANY($1) AND estado = true`,
       [productoIds]
     );
     for (const f of fichas) fichaPorProducto.set(f.producto_id, f);
   }
-  const [{ rows: toppings }, { rows: adiciones }, { rows: empaquesProducto }] = await Promise.all([
-    pool.query(`SELECT id, nombre, insumo_id, empaque_id, cantidad FROM toppings`),
-    pool.query(`SELECT id, nombre, insumo_id, empaque_id, cantidad FROM adiciones`),
-    // producto_empaque (requisito 4): qué vaso/pitillo usa cada producto —
-    // solo hace falta consultarlo para los productos presentes en el
-    // pedido (directos o dentro de un combo), igual que fichaPorProducto.
-    productoIds.length
-      ? pool.query(
-          `SELECT producto_id, tamano, vaso_empaque_id, lleva_pitillo, pitillo_empaque_id
-             FROM producto_empaque WHERE producto_id = ANY($1)`,
-          [productoIds]
-        )
-      : Promise.resolve({ rows: [] }),
+  const [{ rows: toppings }, { rows: adiciones }] = await Promise.all([
+    pool.query(`SELECT id, nombre, insumo_id, cantidad FROM toppings`),
+    pool.query(`SELECT id, nombre, insumo_id, cantidad FROM adiciones`),
   ]);
-  const claveEmpaque = (productoId, tamano) => `${productoId}|${tamano ?? ''}`;
-  const empaquePorProductoTamano = new Map(empaquesProducto.map(pe => [claveEmpaque(pe.producto_id, pe.tamano), pe]));
   return {
     idProducto: idProductoDeItem,
     idCombo,
@@ -2729,7 +1796,6 @@ const prepararDatosReceta = async (items) => {
     comboPorId,
     toppingPorId: new Map(toppings.map(t => [t.id, t])),
     adicionPorId: new Map(adiciones.map(a => [a.id, a])),
-    empaquePorProductoTamano,
   };
 };
 
@@ -2761,46 +1827,27 @@ const prepararDatosReceta = async (items) => {
 // adiciones no tienen override por producto (son universales, sin
 // producto_id): siempre usan su propio "cantidad".
 //
-// Devuelve { insumos: Map<id_insumo, cantidad>, empaques: Map<id_empaque,
-// cantidad> } — separados porque viven en tablas y en un stock por local
-// distintos (insumo_local / empaque_local, ver descontarInventarioPorVenta).
-// Empaques entra por dos vías: un topping/adición con empaque_id (en vez
-// de insumo_id — ej. "Pitillo extra"), o producto_empaque (el vaso/pitillo
-// que trae POR DEFECTO el producto/tamaño de esta línea — requisito 4).
-// enriquecerItemsPedido solo necesita convertir cada Map a array al final.
+// Devuelve un Map<id_insumo, cantidad> (no un array): así
+// descontarInventarioPorVenta puede recorrerlo directo, y
+// enriquecerItemsPedido solo necesita convertirlo a array al final.
 const calcularRecetaEfectiva = (it, datos) => {
-  const { idProducto, idCombo, fichaPorProducto, comboPorId, toppingPorId, adicionPorId, empaquePorProductoTamano } = datos;
-  const insumos = new Map();
-  const empaques = new Map();
-  const sumarInsumo = (id, cantidad) => {
-    if (!id || !(cantidad > 0)) return;
-    insumos.set(id, (insumos.get(id) || 0) + cantidad);
-  };
-  const sumarEmpaque = (id, cantidad) => {
-    if (!id || !(cantidad > 0)) return;
-    empaques.set(id, (empaques.get(id) || 0) + cantidad);
+  const { idProducto, idCombo, fichaPorProducto, comboPorId, toppingPorId, adicionPorId } = datos;
+  const totales = new Map();
+  const sumar = (idInsumo, cantidad) => {
+    if (!idInsumo || !(cantidad > 0)) return;
+    totales.set(idInsumo, (totales.get(idInsumo) || 0) + cantidad);
   };
 
   // Suma la receta de UN producto (ficha + toppings mantenidos + adiciones
-  // elegidas + vaso/pitillo por defecto del producto/tamaño), multiplicada
-  // por cuántas unidades de ese producto aplican acá — 1 para un producto
-  // pedido directamente, o la cantidad que ese producto tenga DENTRO del
-  // combo. `tamano` es el tamaño elegido en esta línea (o en el
-  // componente del combo), si el carrito lo manda; sin tamaño se usa la
-  // configuración por defecto del producto (producto_empaque.tamano NULL).
-  const sumarProducto = (productoId, unidades, toppingsSeleccionados, adicionesSeleccionadas, tamano) => {
+  // elegidas), multiplicada por cuántas unidades de ese producto aplican
+  // acá — 1 para un producto pedido directamente, o la cantidad que ese
+  // producto tenga DENTRO del combo.
+  const sumarProducto = (productoId, unidades, toppingsSeleccionados, adicionesSeleccionadas) => {
     const ficha = productoId ? fichaPorProducto.get(productoId) : null;
     for (const ingrediente of (ficha?.ingredientes || [])) {
-      sumarInsumo(ingrediente.id_insumo, (Number(ingrediente.cantidad) || 0) * unidades);
+      sumar(ingrediente.id_insumo, (Number(ingrediente.cantidad) || 0) * unidades);
     }
-    // Vaso y pitillo (requisito 4, esta ronda): son insumos NORMALES de la
-    // ficha técnica — se descuentan igual que cualquier ingrediente, con
-    // la cantidad que la propia ficha define (ya no fija en 1). El pitillo
-    // solo se descuenta si la ficha lo marca (lleva_pitillo=true).
-    if (ficha?.vaso_insumo_id) sumarInsumo(ficha.vaso_insumo_id, (Number(ficha.cantidad_vaso) || 1) * unidades);
-    if (ficha?.lleva_pitillo && ficha?.pitillo_insumo_id) {
-      sumarInsumo(ficha.pitillo_insumo_id, (Number(ficha.cantidad_pitillo) || 1) * unidades);
-    }
+    if (ficha?.vaso_id) sumar(ficha.vaso_id, unidades);
 
     const overridePorTopping = new Map(
       (ficha?.toppings_ficha || []).map(tf => [tf.topping_id, Number(tf.cantidad)])
@@ -2811,36 +1858,16 @@ const calcularRecetaEfectiva = (it, datos) => {
       // personalizacion.toppings.
       const toppingId = (t !== null && typeof t === 'object') ? t.id : t;
       const topping = toppingPorId.get(toppingId);
-      if (!topping) continue;
+      if (!topping || !topping.insumo_id) continue; // topping sin insumo asociado: nada que descontar
       const cantidadPorUnidad = overridePorTopping.has(toppingId) ? overridePorTopping.get(toppingId) : (Number(topping.cantidad) || 0);
-      if (topping.insumo_id) sumarInsumo(topping.insumo_id, cantidadPorUnidad * unidades);
-      else if (topping.empaque_id) sumarEmpaque(topping.empaque_id, cantidadPorUnidad * unidades);
-      // sin insumo_id ni empaque_id: topping puramente informativo, nada que descontar
+      sumar(topping.insumo_id, cantidadPorUnidad * unidades);
     }
 
     for (const a of (Array.isArray(adicionesSeleccionadas) ? adicionesSeleccionadas : [])) {
       const adicionId = (a !== null && typeof a === 'object') ? a.id : a;
       const adicion = adicionPorId.get(adicionId);
-      if (!adicion) continue;
-      const cant = Number(adicion.cantidad) || 0;
-      if (adicion.insumo_id) sumarInsumo(adicion.insumo_id, cant * unidades);
-      else if (adicion.empaque_id) sumarEmpaque(adicion.empaque_id, cant * unidades);
-    }
-
-    // Vaso/pitillo por defecto del producto/tamaño vía "producto_empaque"
-    // (mecanismo de una ronda anterior, basado en la entidad "empaques" —
-    // hoy sin ninguna fila real cargada). Es ADITIVO al vaso/pitillo de la
-    // FICHA TÉCNICA (fichas_tecnicas.vaso_insumo_id/pitillo_insumo_id, que
-    // son insumos NORMALES — requisito 3, esta ronda): un producto puede
-    // tener configurado uno, otro, ambos o ninguno, sin que se pisen entre
-    // sí (deducen de catálogos distintos — empaques vs. insumos).
-    if (productoId) {
-      const pe = empaquePorProductoTamano.get(`${productoId}|${tamano ?? ''}`)
-        ?? empaquePorProductoTamano.get(`${productoId}|`); // sin match exacto de tamaño: cae a la config. por defecto
-      if (pe) {
-        if (pe.vaso_empaque_id) sumarEmpaque(pe.vaso_empaque_id, unidades);
-        if (pe.lleva_pitillo && pe.pitillo_empaque_id) sumarEmpaque(pe.pitillo_empaque_id, unidades);
-      }
+      if (!adicion || !adicion.insumo_id) continue; // adición sin insumo asociado: nada que descontar
+      sumar(adicion.insumo_id, (Number(adicion.cantidad) || 0) * unidades);
     }
   };
 
@@ -2850,169 +1877,34 @@ const calcularRecetaEfectiva = (it, datos) => {
     for (const componente of (combo?.items || [])) {
       const productoId = idProducto(componente);
       if (!productoId) continue; // un combo dentro de otro combo (caso raro/no soportado): se omite en vez de tronar
-      sumarProducto(productoId, Number(componente.cantidad) || 1, componente.toppings, componente.adiciones, componente.tamano);
+      sumarProducto(productoId, Number(componente.cantidad) || 1, componente.toppings, componente.adiciones);
     }
   } else {
-    sumarProducto(idProducto(it), 1, it.toppings, it.adiciones, it.tamano);
+    sumarProducto(idProducto(it), 1, it.toppings, it.adiciones);
   }
 
-  return { insumos, empaques };
-};
-
-// El local OPERATIVO de un pedido — a qué local pertenece la venta, para
-// saber de qué insumos (los de ESE local) descontar el stock. Se resuelve:
-//   1º) el local activo cuyo nombre coincide con pedidos.sede (los pedidos
-//       nuevos ya guardan ahí el nombre real del local), y si no
-//   2º) pedidos.local_id, si apunta a un local activo.
-// Si ninguno resuelve, devuelve { error }: la venta NO se puede registrar
-// porque el descuento de inventario no sabría a qué local imputarlo (esto
-// no debería pasar tras la migración de los pedidos residuales en db.js,
-// pero el bloqueo queda como protección).
-const resolverLocalOperativoPedido = async (pedido) => {
-  if (pedido?.sede) {
-    const { rows } = await pool.query(
-      `SELECT id, nombre FROM locales WHERE estado='Activo' AND lower(btrim(nombre)) = lower(btrim($1)) LIMIT 1`,
-      [pedido.sede]
-    );
-    if (rows[0]) return { localId: rows[0].id, localNombre: rows[0].nombre };
-  }
-  if (pedido?.local_id) {
-    const { rows } = await pool.query(
-      `SELECT id, nombre FROM locales WHERE estado='Activo' AND id=$1 LIMIT 1`, [pedido.local_id]
-    );
-    if (rows[0]) return { localId: rows[0].id, localNombre: rows[0].nombre };
-  }
-  return { error: 'No se puede registrar la venta: el pedido no tiene un local válido resuelto (su "sede"/local_id no corresponde a ningún local activo). Asígnale un local al pedido antes de venderlo.' };
+  return totales;
 };
 
 // Descuenta del inventario, por cada línea del pedido, la receta efectiva
 // completa (× la cantidad vendida de esa línea) — insumos base + vaso de
 // la ficha técnica + toppings que la unidad conservó + adiciones elegidas
-// + vaso/pitillo por defecto del producto/tamaño (producto_empaque)
 // (sumando también, si la línea es un combo, la receta de cada producto
-// que lo compone), ya combinados y sumados por insumo/empaque (ver
-// calcularRecetaEfectiva).
-//
-// Multi-local: el insumo/empaque es ahora un catálogo GLOBAL (un solo id,
-// sin duplicar por local — ver insumo_local/empaque_local), así que el id
-// que trae la receta (ficha técnica, topping, adición, producto_empaque)
-// YA ES el id real a descontar: solo hace falta su fila insumo_local/
-// empaque_local EN EL LOCAL DEL PEDIDO (localId). Si algún insumo/empaque
-// de la receta no tiene fila activa en ese local, NO bloquea la venta: se
-// descuenta todo lo que sí se puede y el resto se devuelve como aviso (ver
-// `faltantes`) — el producto ya se preparó y se entregó, impedir el
-// registro no devuelve nada al almacén, solo esconde la venta. El stock en
-// CERO nunca fue el problema: ajustarStockInsumoLocal/ajustarEmpaqueLocal
-// usan GREATEST(stock + delta, 0), así que un insumo en cero se descuenta
-// hasta cero y la venta pasa igual.
-// `db` opcional (client de transacción): cuando se llama al marcar un pedido
-// 'entregado', el descuento va dentro del mismo BEGIN/COMMIT que crea la
-// venta. Por defecto usa el pool.
-const descontarInventarioPorVenta = async (items, localId, db = pool, pedidoId = null) => {
-  // Devuelve SIEMPRE { faltantes: [...] } — nunca un string de error. Los
-  // insumos/empaques que no se pudieron descontar son un aviso, no un bloqueo.
+// que lo compone), ya combinados y sumados por insumo (ver
+// calcularRecetaEfectiva), así que un insumo compartido entre dos fuentes
+// se descuenta una sola vez por su total, no dos veces por separado. Se
+// usa al registrar una venta — antes ninguna venta tocaba el stock, solo
+// las compras lo aumentaban.
+const descontarInventarioPorVenta = async (items) => {
   const lista = Array.isArray(items) ? items : [];
-  if (!lista.length) return { faltantes: [] };
+  if (!lista.length) return;
   const datos = await prepararDatosReceta(lista);
-
-  // 1) Acumular la receta efectiva de TODO el pedido, separada por insumo/empaque.
-  const totalInsumo = new Map();
-  const totalEmpaque = new Map();
   for (const it of lista) {
     const cantidadVendida = Number(it.cantidad) || 1;
-    const { insumos, empaques } = calcularRecetaEfectiva(it, datos);
-    for (const [id, cant] of insumos) totalInsumo.set(id, (totalInsumo.get(id) || 0) + cant * cantidadVendida);
-    for (const [id, cant] of empaques) totalEmpaque.set(id, (totalEmpaque.get(id) || 0) + cant * cantidadVendida);
-  }
-  if (!totalInsumo.size && !totalEmpaque.size) return { faltantes: [] };
-
-  // 2) Validar TODO antes de tocar stock: cada insumo/empaque debe tener
-  //    fila ACTIVA en insumo_local/empaque_local para el local del pedido
-  //    (y, para insumos, el catálogo debe seguir Activo).
-  const idsInsumo = [...totalInsumo.keys()].map(Number).filter(Number.isFinite);
-  const idsEmpaque = [...totalEmpaque.keys()].map(Number).filter(Number.isFinite);
-  const [{ rows: insActivos }, { rows: empActivos }] = await Promise.all([
-    idsInsumo.length
-      ? db.query(
-          `SELECT i.id, i.nombre FROM insumos i
-             JOIN insumo_local il ON il.insumo_id = i.id AND il.local_id = $2 AND il.activo = true
-            WHERE i.id = ANY($1::int[]) AND i.estado = 'Activo'`,
-          [idsInsumo, localId]
-        )
-      : { rows: [] },
-    idsEmpaque.length
-      ? db.query(
-          `SELECT e.id, e.nombre FROM empaques e
-             JOIN empaque_local el ON el.empaque_id = e.id AND el.local_id = $2 AND el.activo = true
-            WHERE e.id = ANY($1::int[]) AND e.estado = 'Activo'`,
-          [idsEmpaque, localId]
-        )
-      : { rows: [] },
-  ]);
-  const insActivosSet = new Set(insActivos.map(r => r.id));
-  const empActivosSet = new Set(empActivos.map(r => r.id));
-  const { rows: nombresInsumo } = idsInsumo.length
-    ? await db.query(`SELECT id, nombre FROM insumos WHERE id = ANY($1::int[])`, [idsInsumo]) : { rows: [] };
-  const { rows: nombresEmpaque } = idsEmpaque.length
-    ? await db.query(`SELECT id, nombre FROM empaques WHERE id = ANY($1::int[])`, [idsEmpaque]) : { rows: [] };
-  const nombreInsumoPorId = new Map(nombresInsumo.map(r => [r.id, r.nombre]));
-  const nombreEmpaquePorId = new Map(nombresEmpaque.map(r => [r.id, r.nombre]));
-
-  const faltantes = [];
-  const ajustesInsumo = [];
-  for (const [id, total] of totalInsumo) {
-    if (!(total > 0)) continue;
-    if (!insActivosSet.has(id)) { faltantes.push(nombreInsumoPorId.get(id) || `insumo #${id}`); continue; }
-    ajustesInsumo.push({ id, delta: -total });
-  }
-  const ajustesEmpaque = [];
-  for (const [id, total] of totalEmpaque) {
-    if (!(total > 0)) continue;
-    if (!empActivosSet.has(id)) { faltantes.push(nombreEmpaquePorId.get(id) || `empaque #${id}`); continue; }
-    ajustesEmpaque.push({ id, delta: -total });
-  }
-
-  // 3) Aplicar los descuentos que sí se pudieron resolver.
-  for (const a of ajustesInsumo) {
-    await ajustarStockInsumoLocal(a.id, localId, a.delta, { tipo: 'venta', referenciaTipo: 'pedido', referenciaId: pedidoId }, db);
-  }
-  for (const a of ajustesEmpaque) {
-    await ajustarEmpaqueLocal(a.id, localId, a.delta, { tipo: 'venta', referenciaTipo: 'pedido', referenciaId: pedidoId }, db);
-  }
-  return { faltantes: [...new Set(faltantes)] };
-};
-
-// Registra la venta de un pedido + descuenta su inventario, TODO en una
-// transacción y de forma IDEMPOTENTE: si el pedido ya tiene venta, no hace
-// nada (no re-inserta ni re-descuenta). Devuelve { ventaId } si quedó
-// registrada (nueva o ya existente) o { error } si el local no resuelve o
-// falta un insumo — en ese caso no se toca nada (ROLLBACK).
-// La usan tanto PATCH /pedidos/:id/estado (al pasar a 'entregado') como
-// POST /ventas/desde-pedido.
-const registrarVentaDePedido = async (pedido) => {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const { rows: ya } = await client.query('SELECT id FROM ventas WHERE pedido_id=$1 LIMIT 1', [pedido.id]);
-    if (ya[0]) { await client.query('COMMIT'); return { ventaId: ya[0].id, yaExistia: true }; }
-
-    const local = await resolverLocalOperativoPedido(pedido);
-    if (local.error) { await client.query('ROLLBACK'); return { error: local.error }; }
-
-    // Ya no aborta por insumos faltantes: devuelve la lista para avisar.
-    const { faltantes } = await descontarInventarioPorVenta(pedido.items, local.localId, client, pedido.id);
-
-    const { rows } = await client.query(
-      `INSERT INTO ventas(pedido_id, total, estado) VALUES($1,$2,'vendido') RETURNING id`,
-      [pedido.id, pedido.total]
-    );
-    await client.query('COMMIT');
-    return { ventaId: rows[0].id, faltantes };
-  } catch (e) {
-    try { await client.query('ROLLBACK'); } catch {}
-    return { error: e.message };
-  } finally {
-    client.release();
+    const totales = calcularRecetaEfectiva(it, datos);
+    for (const [idInsumo, cantidadPorUnidad] of totales) {
+      await ajustarStockInsumoPorId(idInsumo, -(cantidadPorUnidad * cantidadVendida));
+    }
   }
 };
 
@@ -3037,16 +1929,7 @@ const generarCodigoCompra = async () => {
 const compRouter = require('express').Router();
 compRouter.get('/', auth, async (req, res) => {
   try {
-  // Filtro opcional por local (?local_id=): para "ver compras de este
-  // local". Sin el parámetro, devuelve todas las activas (igual que antes).
-  const { local_id } = req.query;
-  const params = [];
-  let cond = `c.estado='activa'`;
-  if (local_id !== undefined && local_id !== '') {
-    params.push(Number(local_id));
-    cond += ` AND c.local_id = $${params.length}`;
-  }
-  const { rows } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE ${cond} ORDER BY c.id DESC`, params);
+  const { rows } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE c.estado='activa' ORDER BY c.id DESC`);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -3058,24 +1941,13 @@ compRouter.get('/', auth, async (req, res) => {
 // visible en el historial.
 compRouter.get('/historial', auth, async (req, res) => {
   try {
-  // Historial exclusivo de compras ANULADAS — antes también incluía
-  // compras activas con más de "dias" de antigüedad (regla de 30 días),
-  // pero eso ya no aplica: la tabla principal (GET /compras) ahora
-  // muestra TODAS las compras activas sin límite de tiempo, con su propia
-  // paginación en el frontend. El historial queda reservado únicamente
-  // para lo que salió de circulación por haberse anulado.
-  const { local_id } = req.query;
-  const params = [];
-  let filtroLocal = '';
-  if (local_id !== undefined && local_id !== '') {
-    params.push(Number(local_id));
-    filtroLocal = ` AND c.local_id = $${params.length}`;
-  }
+  const diasParam = Number(req.query.dias);
+  const dias = Number.isFinite(diasParam) && diasParam > 0 ? diasParam : 30;
   const { rows } = await pool.query(
     `SELECT ${COMPRA_COLS} ${COMPRA_JOINS}
-     WHERE c.estado = 'anulada'${filtroLocal}
+     WHERE c.fecha < (CURRENT_DATE - $1::int) OR c.estado = 'anulada'
      ORDER BY c.id DESC`,
-    params
+    [dias]
   );
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3095,28 +1967,6 @@ compRouter.post('/', auth, async (req, res) => {
     proveedorId, fecha, total, descuento, items, observaciones,
     comprobante_url, comprobante_verificado, comprobante_total_ocr, ocr_resultado,
   } = req.body;
-
-  // Local de la compra: define a qué local se le suma el stock.
-  //   • Usuario CON local fijo: si no manda `local_id`, se usa el suyo; si
-  //     lo manda, se respeta (una compra puede ser para otro local).
-  //   • Superadministrador / usuario SIN local fijo: DEBE elegirlo (selector).
-  let localIdCompra = Number(req.body.local_id) || null;
-  if (!localIdCompra) {
-    const superadmin = await esSuperadmin(req.user);
-    localIdCompra = superadmin ? null : (Number(req.user?.local_id) || null);
-  }
-  if (!Number.isInteger(localIdCompra) || localIdCompra <= 0) {
-    return res.status(400).json({
-      error: 'Elegí el local de la compra (campo "local_id"): define a qué local se le suma el stock.',
-      requiereSeleccionLocal: true,
-    });
-  }
-  const { rows: localOk } = await pool.query(
-    `SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localIdCompra]
-  );
-  if (!localOk[0]) {
-    return res.status(400).json({ error: 'El local de la compra no existe o no está activo.', requiereSeleccionLocal: true });
-  }
 
   // Una compra es un hecho ya ocurrido: no se puede registrar con una
   // fecha posterior al día de hoy. El frontend ya bloquea esto en el
@@ -3160,25 +2010,6 @@ compRouter.post('/', auth, async (req, res) => {
     if (errorItem) return res.status(400).json({ error: `Ítem inválido: ${errorItem}` });
   }
 
-  // Cada ítem de la compra se identifica por nombre (el formulario de
-  // Compras no manda insumo_id) — se resuelve aquí el insumo_id REAL del
-  // catálogo GLOBAL (ya no hay una fila de insumo por local: ver requisito
-  // 1) y se sella en cada ítem, para que el incremento de stock (y su
-  // reversión al anular) golpee exactamente ese insumo. Si el nombre no
-  // corresponde a NINGÚN insumo del catálogo, la compra completa se
-  // rechaza (no se puede comprar algo que no está registrado como insumo).
-  const itemsFinales = [];
-  for (let i = 0; i < (items || []).length; i++) {
-    const it = items[i];
-    const insumoId = await resolverInsumoIdPorNombre(it?.insumo);
-    if (!insumoId) {
-      return res.status(400).json({
-        error: `El insumo "${it?.insumo || `#${i + 1}`}" no existe en el catálogo de insumos.`,
-      });
-    }
-    itemsFinales.push({ ...it, insumo_id: insumoId });
-  }
-
   // El código legible (ej. "CMP-2026-0001") lo genera siempre el backend,
   // nunca lo manda el cliente. Se reintenta unas pocas veces por si dos
   // compras casi simultáneas llegan a calcular el mismo consecutivo
@@ -3190,13 +2021,13 @@ compRouter.post('/', auth, async (req, res) => {
     const codigo = await generarCodigoCompra();
     try {
       const { rows } = await pool.query(
-        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,ocr_resultado,local_id,estado)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'activa') RETURNING id`,
+        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,ocr_resultado,estado)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'activa') RETURNING id`,
         [
           codigo, proveedorId || null, fecha || new Date(), descuentoNum, totalFinal,
-          JSON.stringify(itemsFinales), observaciones || null, comprobante_url || null,
+          JSON.stringify(items || []), observaciones || null, comprobante_url || null,
           comprobante_verificado || false, comprobante_total_ocr ?? null,
-          ocr_resultado ? JSON.stringify(ocr_resultado) : null, localIdCompra,
+          ocr_resultado ? JSON.stringify(ocr_resultado) : null,
         ]
       );
       compraId = rows[0].id;
@@ -3209,16 +2040,10 @@ compRouter.post('/', auth, async (req, res) => {
     return res.status(500).json({ error: 'No se pudo generar un código de compra único, intenta de nuevo.' });
   }
 
-  // Sumar al stock — SOLO en la fila insumo_local del local elegido
-  // (ningún otro local se ve afectado; si el insumo todavía no tenía fila
-  // en ese local, ajustarStockInsumoLocal se la crea arrancando en 0). La
-  // cantidad se calcula igual que antes (directa o por presentación): esa
-  // lógica no cambia.
-  for (const it of itemsFinales) {
-    await ajustarStockInsumoLocal(
-      it.insumo_id, localIdCompra, calcularCantidadStock(it),
-      { tipo: 'compra', referenciaTipo: 'compra', referenciaId: compraId }
-    );
+  // Sumar al stock de cada insumo comprado — convertido a su unidad real
+  // si el ítem vino en modo "presentacion" (ver calcularCantidadStock).
+  for (const it of (items || [])) {
+    await ajustarStockInsumo(it.insumo, calcularCantidadStock(it));
   }
   const { rows: full } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE c.id=$1`, [compraId]);
   res.status(201).json(full[0]);
@@ -3235,21 +2060,16 @@ compRouter.patch('/:id/anular', auth, async (req, res) => {
   const errorMotivo = errorLongitud(motivo, 'El motivo de anulación', LIMITES.MOTIVO);
   if (errorMotivo) return res.status(400).json({ error: errorMotivo });
 
-  const { rows: actual } = await pool.query('SELECT estado, items, local_id FROM compras WHERE id=$1', [req.params.id]);
+  const { rows: actual } = await pool.query('SELECT estado, items FROM compras WHERE id=$1', [req.params.id]);
   if (!actual[0]) return res.status(404).json({ error: 'Compra no encontrada' });
   if (actual[0].estado === 'anulada') return res.status(400).json({ error: 'Esta compra ya está anulada.' });
 
   // Revertir el stock que esta compra había sumado — con la misma cuenta
-  // que se usó al crearla, SOLO en el local de la compra. Las compras
-  // nuevas traen it.insumo_id sellado; las viejas (de antes de ese cambio)
-  // no lo traen y se resuelven por nombre contra el catálogo global.
+  // que se usó al crearla (los ítems guardados ya traen modo/
+  // tipo_presentacion/etc., así que un ítem en cajas se revierte en la
+  // unidad real del insumo, no en cajas).
   for (const it of (actual[0].items || [])) {
-    const insumoId = it.insumo_id || await resolverInsumoIdPorNombre(it.insumo);
-    if (!insumoId || !actual[0].local_id) continue; // sin insumo o sin local resuelto: nada que revertir
-    await ajustarStockInsumoLocal(
-      insumoId, actual[0].local_id, -calcularCantidadStock(it),
-      { tipo: 'anulacion_compra', referenciaTipo: 'compra', referenciaId: Number(req.params.id) }
-    );
+    await ajustarStockInsumo(it.insumo, -calcularCantidadStock(it));
   }
 
   await pool.query(
@@ -3268,14 +2088,8 @@ r.use('/compras', compRouter);
 // 'cancelado' es aparte — no vive en esta secuencia porque se puede dar en
 // cualquier momento antes de 'entregado', sin importar en qué paso vaya el
 // pedido (ver PATCH /:id/estado más abajo).
-// Secuencia VISIBLE del flujo: pendiente → en_proceso → en_camino → entregado.
-// Se quitó 'listo' y se agregó 'en_camino' — para un pedido a domicilio el
-// frontend lo muestra "En camino"; para uno de recogida en local, el MISMO
-// estado se muestra "Listo para recoger". 'pendiente_verificacion' encabeza
-// la secuencia porque es el paso previo real de un pedido con comprobante.
-const ESTADOS_PEDIDO_ORDEN = ['pendiente_verificacion', 'pendiente', 'en_proceso', 'en_camino', 'entregado'];
+const ESTADOS_PEDIDO_ORDEN = ['pendiente_verificacion', 'pendiente', 'en_proceso', 'listo', 'entregado'];
 const IDX_EN_PROCESO = ESTADOS_PEDIDO_ORDEN.indexOf('en_proceso');
-const IDX_EN_CAMINO  = ESTADOS_PEDIDO_ORDEN.indexOf('en_camino');
 // Único conjunto de valores válidos para pedidos.estado en TODA la API —
 // la secuencia de arriba más 'cancelado' (que no vive en la secuencia
 // porque se puede dar en cualquier punto, no en un paso fijo). Antes, esta
@@ -3288,14 +2102,6 @@ const IDX_EN_CAMINO  = ESTADOS_PEDIDO_ORDEN.indexOf('en_camino');
 // con el CHECK pedidos_estado_check de config/db.js/schema.sql, que es la
 // misma regla aplicada también a nivel de base de datos.
 const ESTADOS_PEDIDO_VALIDOS = [...ESTADOS_PEDIDO_ORDEN, 'cancelado'];
-// Normaliza el "estado" que llega del cliente ANTES de validarlo: los
-// valores canónicos son minúscula con guion_bajo ('en_proceso'), pero el
-// frontend a veces manda la etiqueta de pantalla ('En proceso', 'Entregado',
-// 'entregado ' con espacio final). Se recorta, se pasa a minúscula y se
-// reemplaza cualquier espacio/guion por '_' — así 'En proceso' → 'en_proceso'
-// deja de ser un "estado inválido".
-const normalizarEstadoPedido = (v) =>
-  String(v ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
 
 // Único conjunto de métodos de pago válido para pedidos NUEVOS — coincide
 // con el CHECK pedidos_pago_check de config/db.js/schema.sql (agregado con
@@ -3305,23 +2111,8 @@ const normalizarEstadoPedido = (v) =>
 // realmente el frontend — antes la lista estaba en mayúscula
 // ('Nequi'/'Bancolombia'/'Efectivo'), lo que nunca coincidía con lo que de
 // verdad llegaba y rechazaba pedidos válidos.
-// El valor guardado sigue siendo 'transferencia' — el frontend solo cambió
-// la ETIQUETA visible a "Llave Bancolombia" y sigue enviando 'transferencia'.
-// No se toca el enum ni el CHECK de la BD.
 const METODOS_PAGO_VALIDOS = ['efectivo', 'nequi', 'transferencia'];
 const metodoPagoInvalido = (pago) => !!pago && !METODOS_PAGO_VALIDOS.includes(String(pago).toLowerCase());
-// Métodos que se pagan con comprobante que el cliente sube y el cajero
-// aprueba (nequi / llave bancolombia). Son los ÚNICOS que bloquean el avance
-// a 'en_proceso' hasta que el pago esté confirmado — el efectivo se cobra en
-// persona a la entrega y no frena la preparación. Es la definición que usan
-// tanto el gate de PATCH /:id/estado como /confirmar-pago y /comprobante/*.
-const METODOS_CON_COMPROBANTE = ['nequi', 'transferencia'];
-const pagoRequiereComprobante = (pago) => METODOS_CON_COMPROBANTE.includes(String(pago || '').toLowerCase());
-// Un pedido creado por el propio cliente en la tienda (landing/app) SIEMPRE
-// debe llevar un método de pago real — no existe "pagar después" / "pagar al
-// recoger sin verificación". Un pedido cargado por personal de mostrador sí
-// puede quedar sin método (se cobra en caja).
-const ORIGENES_CLIENTE = ['landing', 'app', 'tienda', 'web'];
 // Normaliza a minúscula antes de guardar: así CUALQUIER comparación
 // posterior contra 'pago' (acá o en cualquier otra ruta) puede confiar en
 // que un pedido nuevo siempre lo tiene en minúscula, sin tener que volver
@@ -3379,24 +2170,14 @@ const enriquecerItemsPedido = async (items) => {
   // de Bartender y no solo una lista de ids. Se resuelven de una sola vez
   // TODOS los insumos que aparezcan en cualquier receta_efectiva (cubre
   // insumos base, vaso, toppings y adiciones — es un superset de lo que
-  // antes solo cubría los insumos base de la ficha). Igual para los
-  // empaques (vaso/pitillo, vía topping/adición con empaque_id o vía
-  // producto_empaque).
-  const insumoIds = [...new Set(recetaEfectivaPorItem.flatMap(r => [...r.insumos.keys()]))];
-  const empaqueIds = [...new Set(recetaEfectivaPorItem.flatMap(r => [...r.empaques.keys()]))];
+  // antes solo cubría los insumos base de la ficha).
+  const insumoIds = [...new Set(recetaEfectivaPorItem.flatMap(m => [...m.keys()]))];
   const insumoPorId = new Map();
   if (insumoIds.length) {
     const { rows: insumos } = await pool.query(
       `SELECT id, nombre, unidad FROM insumos WHERE id = ANY($1)`, [insumoIds]
     );
     for (const i of insumos) insumoPorId.set(i.id, i);
-  }
-  const empaquePorId = new Map();
-  if (empaqueIds.length) {
-    const { rows: empaques } = await pool.query(
-      `SELECT id, nombre, unidad FROM empaques WHERE id = ANY($1)`, [empaqueIds]
-    );
-    for (const e of empaques) empaquePorId.set(e.id, e);
   }
 
   // Por si el ítem del carrito solo guardó los ids elegidos (no el objeto
@@ -3445,20 +2226,10 @@ const enriquecerItemsPedido = async (items) => {
       // "cantidad"). Si la línea es un combo, ya incluye la suma de todos
       // sus productos componentes. El Bartender solo necesita leer esta
       // lista, sin recalcular nada.
-      receta_efectiva: [...recetaEfectivaPorItem[i].insumos.entries()].map(([idInsumo, cant]) => ({
+      receta_efectiva: [...recetaEfectivaPorItem[i].entries()].map(([idInsumo, cant]) => ({
         id_insumo: idInsumo,
         nombre: insumoPorId.get(idInsumo)?.nombre ?? null,
         unidad: insumoPorId.get(idInsumo)?.unidad ?? null,
-        cantidad: cant,
-      })),
-      // Empaques (vaso/pitillo) que esta unidad consume — mismo criterio
-      // que receta_efectiva, pero para empaque_local (requisito 4): un
-      // topping/adición con empaque_id, o el vaso/pitillo por defecto del
-      // producto/tamaño (producto_empaque).
-      empaques_efectivos: [...recetaEfectivaPorItem[i].empaques.entries()].map(([idEmpaque, cant]) => ({
-        id_empaque: idEmpaque,
-        nombre: empaquePorId.get(idEmpaque)?.nombre ?? null,
-        unidad: empaquePorId.get(idEmpaque)?.unidad ?? null,
         cantidad: cant,
       })),
     };
@@ -3467,31 +2238,6 @@ const enriquecerItemsPedido = async (items) => {
 
 const pedRouter = require('express').Router();
 pedRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
-
-// SELECT + JOINs comunes a las 3 rutas GET de pedidos. Trae:
-//   local_nombre        → nombre del local que atiende el pedido
-//   atendidoPorNombre   → nombre del cajero/bartender que lo dejó "en_camino"
-//   tieneComprobante     → true/false según comprobante_img esté lleno — deja
-//                          al frontend distinguir, dentro de la lista de
-//                          'pendiente_verificacion', los pedidos con
-//                          comprobante listo para revisar de los que quedaron
-//                          sin comprobante subido (hay que contactar al cliente)
-// El domiciliario (repartidor asignado) se ELIMINÓ del flujo de pedidos
-// (requisito 1, esta ronda): el sistema no maneja domiciliarios. El tipo de
-// entrega 'domicilio' se mantiene — lo que desaparece es la PERSONA
-// asignada, no la modalidad.
-const PEDIDO_SELECT = `
-  SELECT ped.*,
-         l.nombre  AS local_nombre,
-         ua.nombre AS "atendidoPorNombre",
-         (ped.comprobante_img IS NOT NULL) AS "tieneComprobante",
-         ped.comprobante_img AS "comprobanteImg",
-         ped.comprobante_ocr AS "comprobanteOcr"
-    FROM pedidos ped
-    LEFT JOIN locales  l  ON ped.local_id        = l.id
-    LEFT JOIN usuarios ua ON ped.atendido_por    = ua.id
-`;
-
 pedRouter.get('/', auth, async (req, res) => {
   try {
   // El frontend espera "productos" y "comprobanteImg"; la tabla real usa
@@ -3499,36 +2245,35 @@ pedRouter.get('/', auth, async (req, res) => {
   // la tabla (con un fallback manual) y nunca en el modal de detalle, así
   // que el detalle de un pedido siempre mostraba "Sin productos
   // registrados" y jamás el comprobante subido.
-  // Filtro por local:
-  //   • Cliente autenticado → SIEMPRE solo sus propios pedidos (cliente_id
-  //     del token, nunca de un query param manipulable).
-  //   • Cajero / Bartender → su local, tomado del token (req.user.local_id):
-  //     ve los pedidos ya asignados a SU local + los que están sin asignar
-  //     (local_id IS NULL, reclamables). Nunca ve los de otro local.
-  //   • Administrador (sin local_id) → ve todos; puede acotar con ?local_id=.
-  //   • ?sede= se mantiene solo como respaldo para tokens viejos sin local_id.
-  const { sede, local_id: localIdQuery, comprobante } = req.query;
+  // Filtro opcional por local (?sede=Local 1 / Local 2). El Administrador
+  // (sede='Ambos') no manda este filtro y ve todos los pedidos; el cajero
+  // y el bartender de cada local sí lo mandan para no ver pedidos ajenos.
+  //
+  // Un cliente autenticado es un caso aparte: SIEMPRE se filtra por su
+  // propio cliente_id (del token, nunca de un query param que pudiera
+  // manipular) — antes esta ruta no distinguía el rol del token, así que
+  // cualquier cliente logueado veía el historial de pedidos de TODOS los
+  // clientes. ?sede= no aplica a un cliente (es un filtro de uso interno).
+  const { sede } = req.query;
   const params = [];
-  const conds = [];
+  let where = '';
   if (req.user.rol === 'Cliente') {
     params.push(req.user.id);
-    conds.push(`ped.cliente_id = $${params.length}`);
-  } else {
-    const localOperativo = Number(req.user.local_id) || Number(localIdQuery) || null;
-    if (localOperativo) {
-      params.push(localOperativo);
-      conds.push(`(ped.local_id = $${params.length} OR ped.local_id IS NULL)`);
-    } else if (sede) {
-      params.push(sede);
-      conds.push(`(ped.sede = $${params.length} OR ped.sede IS NULL)`);
-    }
+    where = 'WHERE ped.cliente_id = $1';
+  } else if (sede) {
+    params.push(sede);
+    where = 'WHERE ped.sede = $1 OR ped.sede IS NULL';
   }
-  // ?comprobante=con|sin → filtra la lista por si el comprobante_img está
-  // lleno o no (útil para revisar los 'pendiente_verificacion' por separado).
-  if (comprobante === 'con') conds.push('ped.comprobante_img IS NOT NULL');
-  if (comprobante === 'sin') conds.push('ped.comprobante_img IS NULL');
-  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-  const { rows } = await pool.query(`${PEDIDO_SELECT} ${where} ORDER BY ped.id DESC`, params);
+  // LEFT JOIN locales: "local_nombre" es el nombre del local elegido para
+  // recoger (solo si tipo = 'local' — ver POST /pedidos). "ped.*" (no "*"
+  // a secas) evita el choque de nombre entre pedidos.estado y
+  // locales.estado.
+  const { rows } = await pool.query(
+    `SELECT ped.*, l.nombre AS local_nombre, ped.comprobante_img AS "comprobanteImg"
+       FROM pedidos ped LEFT JOIN locales l ON ped.local_id = l.id
+       ${where} ORDER BY ped.id DESC`,
+    params
+  );
   // "productos" (mismo nombre que ya usaba el frontend) ahora trae, por
   // cada línea, la receta fija de la ficha técnica separada de la
   // personalización elegida en esa línea — ver enriquecerItemsPedido.
@@ -3541,43 +2286,22 @@ pedRouter.get('/', auth, async (req, res) => {
 pedRouter.get('/stats', auth, async (req, res) => {
   try {
   // El frontend (PedidosPage y Dashboard) espera { total, pendiente,
-  // porVerificar, proceso, listo, ventas }.
-  //
-  // Requisito 7 (esta ronda) — bug real encontrado y corregido: las dos
-  // condiciones de abajo filtraban `estado <> 'anulado'` / `estado NOT IN
-  // ('cancelado','anulado')`, pero **'anulado' nunca fue un estado válido
-  // de pedido** (los estados reales son pendiente_verificacion, pendiente,
-  // en_proceso, en_camino, entregado, cancelado — ver ESTADOS_PEDIDO_VALIDOS
-  // y el CHECK pedidos_estado_check) — probablemente copiado del dominio de
-  // Compras/Ventas, que sí usa 'anulada'. Como ningún pedido tiene jamás ese
-  // valor, el filtro era un no-op silencioso:
-  //   • "total" contaba TODOS los pedidos, incluidos 'entregado' y
-  //     'cancelado' — quedaba desfasado contra la suma real de las otras
-  //     tarjetas (pendiente + porVerificar + proceso + listo), que sí son
-  //     subconjuntos mutuamente excluyentes. Ahora "total" es exactamente
-  //     esa suma: pedidos que siguen "en vuelo" (ni entregados ni
-  //     cancelados) — nunca cuenta un pedido que ya salió del pipeline.
-  //   • "ventas" (ingresos de HOY) sumaba pedidos.total de cualquier pedido
-  //     de hoy que no estuviera cancelado — **incluidos los que todavía ni
-  //     siquiera pasaron por caja** (pendiente_verificacion/pendiente/
-  //     en_proceso/en_camino, sin pago confirmado ni venta real creada).
-  //     Un pedido nuevo, sin confirmar, ya inflaba "ventas del día" antes
-  //     de entregarse. Se corrige sumando de la tabla `ventas` (la fuente
-  //     real: solo existe una fila ahí cuando el pedido se marcó
-  //     'entregado' — ver registrarVentaDePedido), igual que ya hace
-  //     GET /ventas/stats.
+  // porVerificar, proceso, listo, ventas }. Antes esta consulta devolvía
+  // { total, ingresos } — un objeto que no coincidía con ningún campo
+  // usado en pantalla, así que las tarjetas de estadísticas de Pedidos
+  // (Pendientes, Por verificar, En proceso, Ventas del día) siempre
+  // quedaban en 0/undefined sin importar los pedidos reales.
   const { rows } = await pool.query(`
     SELECT
-      COUNT(*) FILTER (WHERE estado NOT IN ('entregado','cancelado')) AS total,
+      COUNT(*) FILTER (WHERE estado <> 'anulado')                AS total,
       COUNT(*) FILTER (WHERE estado = 'pendiente')                AS pendiente,
       COUNT(*) FILTER (WHERE estado = 'pendiente_verificacion')   AS "porVerificar",
       COUNT(*) FILTER (WHERE estado = 'en_proceso')                AS proceso,
-      -- 'listo' se reemplazó por 'en_camino'. Se exponen las dos claves con
-      -- el mismo valor para no romper al frontend durante la transición.
-      COUNT(*) FILTER (WHERE estado = 'en_camino')                 AS "enCamino",
-      COUNT(*) FILTER (WHERE estado = 'en_camino')                 AS listo,
-      (SELECT COALESCE(SUM(v.total), 0) FROM ventas v
-        WHERE v.created_at::date = CURRENT_DATE AND v.estado = 'vendido')  AS ventas
+      COUNT(*) FILTER (WHERE estado = 'listo')                     AS listo,
+      COALESCE(SUM(total) FILTER (
+        WHERE created_at::date = CURRENT_DATE
+          AND estado NOT IN ('cancelado','anulado')
+      ), 0)                                                        AS ventas
     FROM pedidos
   `);
   res.json(rows[0]);
@@ -3595,7 +2319,9 @@ pedRouter.get('/stats', auth, async (req, res) => {
 pedRouter.get('/mis-pedidos', auth, async (req, res) => {
   try {
   const { rows } = await pool.query(
-    `${PEDIDO_SELECT} WHERE ped.cliente_id = $1 ORDER BY ped.id DESC`,
+    `SELECT ped.*, l.nombre AS local_nombre, ped.comprobante_img AS "comprobanteImg"
+       FROM pedidos ped LEFT JOIN locales l ON ped.local_id = l.id
+       WHERE ped.cliente_id = $1 ORDER BY ped.id DESC`,
     [req.user.id]
   );
   const pedidos = await Promise.all(
@@ -3607,7 +2333,9 @@ pedRouter.get('/mis-pedidos', auth, async (req, res) => {
 pedRouter.get('/:id', auth, async (req, res) => {
   try {
   const { rows } = await pool.query(
-    `${PEDIDO_SELECT} WHERE ped.id=$1`,
+    `SELECT ped.*, l.nombre AS local_nombre, ped.comprobante_img AS "comprobanteImg"
+       FROM pedidos ped LEFT JOIN locales l ON ped.local_id = l.id
+       WHERE ped.id=$1`,
     [req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
@@ -3625,88 +2353,31 @@ pedRouter.get('/:id', auth, async (req, res) => {
   res.json({ ...rows[0], productos });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Requisito 2: UN SOLO endpoint de creación de pedido para Admin y
-// Cajero (y, sin token, para el cliente/landing) — mismo contrato para
-// los tres; la diferencia es solo el valor por defecto/forzado según
-// quién está autenticado. `authOpcional` decodifica el JWT si viene, pero
-// nunca exige uno (el checkout de la landing no tiene sesión de
-// admin/cajero) — ver middleware/auth.js.
-pedRouter.post('/', authOpcional, async (req, res) => {
-  const { cliente_id, numero, cliente, tipo, pago, mesa, total, items, comprobante, comprobante_img, comprobante_ocr, origen, direccion_alternativa, hora, estado, atendido_por, sede, local_id, _meta } = req.body;
+pedRouter.post('/', async (req, res) => {
+  const { cliente_id, numero, cliente, tipo, pago, mesa, total, items, comprobante, comprobante_img, origen, direccion_alternativa, hora, estado, barista, domiciliario, sede, local_id, _meta } = req.body;
   // Compatibilidad: si vienen en _meta los usamos también
   const meta = _meta || {};
-
-  // El Cajero NO elige local ni "atendido por": siempre son los suyos
-  // (req.user, del token), sin importar qué traiga el body — así el
-  // frontend puede usar el MISMO formulario/payload que el Administrador
-  // (que sí puede elegir cualquier local/atendido_por, igual que hoy) sin
-  // que un cajero pueda crear un pedido a nombre de otro local o de otra
-  // persona. Sin token, o con cualquier otro rol (Cliente desde la
-  // landing), el comportamiento es exactamente el de siempre: local/
-  // atendido_por se resuelven desde el body más abajo.
-  let localIdBody = local_id;
-  let atendidoPorBody = atendido_por;
-  if (req.user?.rol === 'Cajero') {
-    if (!req.user.local_id) {
-      return res.status(400).json({ error: 'Tu usuario no tiene un local de trabajo asignado: pedile a un administrador que te asigne uno antes de crear pedidos.' });
-    }
-    localIdBody = req.user.local_id;
-    atendidoPorBody = req.user.id;
-  }
   const comprobanteImgFinal = comprobante_img || meta.comprobanteImg || null;
-  // OCR del comprobante: se guarda tal cual llega, SIN validar nada. Aunque
-  // el OCR haya fallado, no haya leído nada, o el monto no cuadre, el pedido
-  // se crea igual y el comprobante queda adjunto — la decisión de aprobar o
-  // rechazar el pago es 100% manual (Cajero/Admin).
-  const comprobanteOcrFinal = comprobante_ocr ?? meta.comprobanteOcr ?? meta.ocr ?? null;
   const pagoFinal = normalizarPago(pago || meta.pago || null);
   if (metodoPagoInvalido(pagoFinal)) {
     return res.status(400).json({ error: `Método de pago inválido. Debe ser uno de: ${METODOS_PAGO_VALIDOS.join(', ')}.` });
   }
-  const origenFinal = origen || meta.origen || 'landing';
-  // Sin "pagar después": un pedido que arma el propio cliente en la tienda
-  // (landing/app) SIEMPRE tiene que elegir un método de pago. Efectivo (se
-  // cobra a la entrega) o pago con comprobante (Nequi / Llave Bancolombia).
-  if (ORIGENES_CLIENTE.includes(String(origenFinal).toLowerCase()) && !pagoFinal) {
-    return res.status(400).json({ error: 'Debés elegir un método de pago: Efectivo, Nequi o Llave Bancolombia.' });
-  }
+  // local_id solo tiene sentido cuando el tipo de entrega es 'local'
+  // ("recoger en el local") — para cualquier otro tipo (ej. 'domicilio')
+  // se ignora, aunque llegue en el body. Ver GET /api/locales.
   const tipoFinal = tipo || meta.tipo || null;
-  // Local OPERATIVO del pedido — qué local lo atiende (cajeros/bartender de
-  // ESE local lo ven; los de otro local, no). Se fija desde la creación:
-  //   • el cliente que recoge en local (tipo='local') → su local elegido;
-  //   • el Admin/cajero que crea el pedido y elige un local en el formulario
-  //     → ese local, ya asignado (NO hay que "reclamarlo").
-  // Puede llegar como `local_id` numérico o como nombre en `sede`. Si no se
-  // especifica ninguno, queda NULL = pedido sin asignar, reclamable por
-  // cualquier local vía PATCH /:id/tomar.
-  let localIdFinal = null;
-  const localIdRaw = localIdBody ?? meta.local_id ?? null;
-  const sedeNombre = sede || meta.sede || null;
+  const localIdFinal = tipoFinal === 'local' ? (local_id ?? meta.local_id ?? null) : null;
   try {
-    if (localIdRaw != null && String(localIdRaw).trim() !== '') {
-      localIdFinal = Number(localIdRaw);
-      if (!Number.isInteger(localIdFinal) || localIdFinal <= 0) {
-        return res.status(400).json({ error: 'El local seleccionado no es válido.' });
+    if (tipoFinal === 'local') {
+      if (!localIdFinal) {
+        return res.status(400).json({ error: 'Debes indicar el local donde vas a recoger el pedido.' });
       }
-    } else if (sedeNombre) {
-      const { rows } = await pool.query(
-        `SELECT id FROM locales WHERE lower(btrim(nombre)) = lower(btrim($1)) AND estado='Activo' LIMIT 1`,
-        [sedeNombre]
-      );
-      if (rows[0]) localIdFinal = rows[0].id;
-    }
-    if (tipoFinal === 'local' && !localIdFinal) {
-      return res.status(400).json({ error: 'Debes indicar el local donde vas a recoger el pedido.' });
-    }
-    let localNombreResuelto = null;
-    if (localIdFinal != null) {
       const { rows: localValido } = await pool.query(
-        `SELECT id, nombre FROM locales WHERE id=$1 AND estado='Activo'`, [localIdFinal]
+        `SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localIdFinal]
       );
       if (!localValido[0]) {
         return res.status(400).json({ error: 'El local seleccionado no existe o no está activo.' });
       }
-      localNombreResuelto = localValido[0].nombre;
     }
 
     // Evitar que el mismo pantallazo de pago se use para más de un pedido.
@@ -3745,30 +2416,14 @@ pedRouter.post('/', authOpcional, async (req, res) => {
     // en absoluto acá (solo en PATCH /:id/estado), así que una petición
     // directa a la API podía crear un pedido con cualquier "estado"
     // inventado — ver ESTADOS_PEDIDO_VALIDOS más arriba.
-    const estadoCrudoPost = estado || meta.estado || null;
-    const estadoSolicitado = estadoCrudoPost ? normalizarEstadoPedido(estadoCrudoPost) : null;
-    if (estadoCrudoPost && !ESTADOS_PEDIDO_VALIDOS.includes(estadoSolicitado)) {
-      return res.status(400).json({ error: `Estado no reconocido: "${estadoCrudoPost}". Los valores válidos son: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.` });
+    const estadoSolicitado = estado || meta.estado || null;
+    if (estadoSolicitado && !ESTADOS_PEDIDO_VALIDOS.includes(estadoSolicitado)) {
+      return res.status(400).json({ error: `Estado inválido: "${estadoSolicitado}". Debe ser uno de: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.` });
     }
-    // Un pedido con método de pago digital (Nequi / Llave Bancolombia)
-    // SIEMPRE nace en 'pendiente_verificacion', tenga o no comprobante
-    // adjunto: si lo trae, el cajero lo revisa; si no, el cajero lo ve en
-    // esa misma lista marcado como "sin comprobante" y contacta al cliente.
-    // En efectivo se usa el estado que pida el body (o 'pendiente').
-    const digital = pagoRequiereComprobante(pagoFinal);
-    const estadoInicial = (comprobanteImgFinal || digital)
-      ? 'pendiente_verificacion'
-      : (estadoSolicitado || 'pendiente');
-    // "Atendido por" (usuarios.id). Normalmente NO se manda al crear — se
-    // asigna en la transición a 'en_camino' (ver PATCH /:id/estado) — pero
-    // se acepta si el formulario lo envía (el Cajero ya lo trae forzado a
-    // sí mismo desde arriba; el Administrador puede elegir cualquiera).
-    // Domiciliario: ELIMINADO del flujo (requisito 1) — el sistema no
-    // maneja domiciliarios. El tipo de entrega 'domicilio' se mantiene.
-    const atendidoPorId = Number.isInteger(Number(atendidoPorBody)) && Number(atendidoPorBody) > 0 ? Number(atendidoPorBody) : null;
+    const estadoInicial = comprobanteImgFinal ? 'pendiente_verificacion' : (estadoSolicitado || 'pendiente');
 
     const { rows } = await pool.query(
-      `INSERT INTO pedidos(cliente_id,numero,cliente,tipo,pago,mesa,total,items,comprobante,comprobante_img,comprobante_hash,comprobante_ocr,origen,direccion_alternativa,hora,estado,atendido_por,sede,local_id)
+      `INSERT INTO pedidos(cliente_id,numero,cliente,tipo,pago,mesa,total,items,comprobante,comprobante_img,comprobante_hash,origen,direccion_alternativa,hora,estado,barista,domiciliario,sede,local_id)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
       [
         cliente_id || null,
@@ -3782,19 +2437,28 @@ pedRouter.post('/', authOpcional, async (req, res) => {
         comprobante || meta.comprobante || null,
         comprobanteImgFinal,
         comprobanteHash,
-        comprobanteOcrFinal ? JSON.stringify(comprobanteOcrFinal) : null,
-        origenFinal,
+        origen || meta.origen || 'landing',
         direccion_alternativa || meta.direccionAlternativa || null,
         hora || meta.hora || null,
         estadoInicial,
-        atendidoPorId,
-        // "sede" (texto) se mantiene solo por compatibilidad: si se resolvió
-        // un local operativo, se guarda su nombre real; si no, el nombre
-        // recibido; si tampoco, NULL (pedido sin asignar). La fuente de
-        // verdad de "qué local atiende el pedido" es local_id (abajo).
-        localNombreResuelto || sedeNombre || null,
-        // Local operativo, ya asignado desde la creación. NULL = pedido sin
-        // asignar, reclamable por cualquier local (ver PATCH /:id/tomar).
+        // "Atendido por" y "domiciliario" — antes se descartaban porque no
+        // existía la columna ni se leían del body en absoluto, así que se
+        // perdían aunque el formulario del admin los pidiera y validara.
+        barista || meta.barista || null,
+        domiciliario || meta.domiciliario || null,
+        // Local al que pertenece el pedido. Lo manda el cajero (su propio
+        // local, tomado de su sesión) o el admin (lo elige en el
+        // formulario). Si no llega ninguno y el pedido viene de la tienda
+        // (origen 'landing'), queda sin local asignado (NULL) — es un
+        // pedido de cliente aún no reclamado por ningún local (ver PATCH
+        // /pedidos/:id/tomar). Si no llega ninguno y el origen NO es
+        // 'landing' (caso raro), se mantiene 'Local 1' como fallback.
+        (() => {
+          const sedeFinal = sede || meta.sede || null;
+          if (sedeFinal) return sedeFinal;
+          const origenFinal = origen || meta.origen || 'landing';
+          return origenFinal === 'landing' ? null : 'Local 1';
+        })(),
         localIdFinal,
       ]
     );
@@ -3808,7 +2472,7 @@ pedRouter.post('/', authOpcional, async (req, res) => {
 pedRouter.put('/:id', auth, async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  const { cliente, tipo, pago, total, items, atendido_por, direccion_alternativa, sede, local_id, comprobante_img } = req.body;
+  const { cliente, tipo, pago, total, items, barista, domiciliario, direccion_alternativa, sede, local_id } = req.body;
   const pagoFinal = normalizarPago(pago);
   if (metodoPagoInvalido(pagoFinal)) {
     return res.status(400).json({ error: `Método de pago inválido. Debe ser uno de: ${METODOS_PAGO_VALIDOS.join(', ')}.` });
@@ -3825,22 +2489,6 @@ pedRouter.put('/:id', auth, async (req, res) => {
         return res.status(400).json({ error: 'El local seleccionado no existe o no está activo.' });
       }
     }
-    // Adjuntar un comprobante DESPUÉS de creado el pedido: sirve para el
-    // caso "cliente pidió por Nequi pero no subió comprobante" — el cajero
-    // lo contacta, el cliente lo manda, y acá se adjunta (con su hash, para
-    // que siga aplicando el anti-reutilización). No se toca 'estado' ni
-    // 'pago_confirmado' — eso lo decide /comprobante/aprobar.
-    let comprobanteHash = null;
-    if (comprobante_img) {
-      comprobanteHash = crypto.createHash('sha256').update(comprobante_img).digest('hex');
-      const { rows: dup } = await pool.query(
-        `SELECT id FROM pedidos WHERE comprobante_hash = $1 AND estado <> 'cancelado' AND id <> $2 LIMIT 1`,
-        [comprobanteHash, id]
-      );
-      if (dup[0]) {
-        return res.status(409).json({ error: 'Este comprobante ya fue usado en otro pedido.', pedidoExistente: dup[0].id });
-      }
-    }
     const { rows } = await pool.query(
       `UPDATE pedidos SET
          cliente = COALESCE($1, cliente),
@@ -3848,26 +2496,24 @@ pedRouter.put('/:id', auth, async (req, res) => {
          pago    = COALESCE($3, pago),
          total   = COALESCE($4, total),
          items   = COALESCE($5, items),
-         atendido_por = COALESCE($6, atendido_por),
-         direccion_alternativa = COALESCE($7, direccion_alternativa),
-         sede = COALESCE($8, sede),
-         local_id = COALESCE($9, local_id),
-         comprobante_img  = COALESCE($11, comprobante_img),
-         comprobante_hash = COALESCE($12, comprobante_hash)
-       WHERE id=$10 RETURNING *`,
+         barista = COALESCE($6, barista),
+         domiciliario = COALESCE($7, domiciliario),
+         direccion_alternativa = COALESCE($8, direccion_alternativa),
+         sede = COALESCE($9, sede),
+         local_id = COALESCE($10, local_id)
+       WHERE id=$11 RETURNING *`,
       [
         cliente ?? null,
         tipo ?? null,
         pagoFinal,
         total ?? null,
         items ? JSON.stringify(items) : null,
-        Number.isInteger(Number(atendido_por)) && Number(atendido_por) > 0 ? Number(atendido_por) : null,
+        barista ?? null,
+        domiciliario ?? null,
         direccion_alternativa ?? null,
         sede ?? null,
         local_id ?? null,
         id,
-        comprobante_img ?? null,
-        comprobanteHash,
       ]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
@@ -3881,112 +2527,56 @@ pedRouter.put('/:id', auth, async (req, res) => {
 // posterior— sin el pago confirmado. 'cancelado' es la única excepción a
 // la regla de avance: se puede dar en cualquier momento antes de
 // 'entregado', sin importar el estado actual.
-//
-// Códigos de respuesta (para que el frontend los distinga):
-//   400 → la PETICIÓN está mal formada (falta 'estado', o su valor no es
-//         ninguno de los reconocidos).
-//   409 → la petición es válida pero CHOCA con el estado real del pedido
-//         (ya terminó, se intenta retroceder, o falta confirmar el pago).
-//         La respuesta incluye estadoActual/estadoSolicitado para que el
-//         frontend pueda re-sincronizar su vista.
-//   404 → el pedido no existe.
 pedRouter.patch('/:id/estado', auth, async (req, res) => {
+  const { estado } = req.body;
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-
-  const estadoCrudo = req.body?.estado;
-  if (estadoCrudo === undefined || estadoCrudo === null || String(estadoCrudo).trim() === '') {
-    return res.status(400).json({
-      error: "Falta el campo 'estado' en la petición. Si lo que querés es solo confirmar el cobro (sin mover el estado), usá PATCH /pedidos/:id/confirmar-pago.",
-    });
-  }
-  const estado = normalizarEstadoPedido(estadoCrudo);
   if (!ESTADOS_PEDIDO_VALIDOS.includes(estado)) {
-    return res.status(400).json({
-      error: `Estado no reconocido: "${estadoCrudo}". Los valores válidos son: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.`,
-      estadoSolicitado: estadoCrudo,
-      valoresValidos: ESTADOS_PEDIDO_VALIDOS,
-    });
+    return res.status(400).json({ error: `Estado inválido: "${estado}". Debe ser uno de: ${ESTADOS_PEDIDO_VALIDOS.join(', ')}.` });
   }
   try {
-    const { rows: actual } = await pool.query(
-      'SELECT id, estado, pago, pago_confirmado, tipo, sede, local_id, items, total FROM pedidos WHERE id=$1', [id]
-    );
+    const { rows: actual } = await pool.query('SELECT estado, pago, pago_confirmado FROM pedidos WHERE id=$1', [id]);
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-    const ped = actual[0];
-    const estadoActual = ped.estado;
-    // Aviso NO bloqueante que viaja junto al pedido actualizado: se llena si
-    // al entregar hubo insumos de la receta que no existen en el local y por
-    // tanto no se pudieron descontar del inventario.
-    let avisoInventario = null;
+    const estadoActual = actual[0].estado;
 
-    if (estadoActual === 'entregado' || estadoActual === 'cancelado') {
-      return res.status(409).json({
-        error: `El pedido #${id} ya está "${estadoActual}" y no admite más cambios de estado.`,
-        estadoActual, estadoSolicitado: estado,
-      });
+    if (estadoActual === 'entregado') {
+      return res.status(400).json({ error: 'Este pedido ya fue entregado y no puede cambiar de estado.' });
+    }
+    if (estadoActual === 'cancelado') {
+      return res.status(400).json({ error: 'Este pedido está cancelado y no puede cambiar de estado.' });
     }
 
-    if (estado !== 'cancelado') { // 'cancelado' siempre permitido en este punto
+    if (estado === 'cancelado') {
+      // Siempre permitido en este punto: ya se descartó 'entregado' arriba.
+    } else {
       const idxActual = ESTADOS_PEDIDO_ORDEN.indexOf(estadoActual);
       const idxNuevo  = ESTADOS_PEDIDO_ORDEN.indexOf(estado);
+      // Si el estado actual no está en la secuencia conocida (dato legado
+      // o valor exótico ya guardado antes de esta validación), no se puede
+      // comparar por índice — se deja pasar en vez de bloquear el pedido
+      // para siempre.
       if (idxActual !== -1 && idxNuevo < idxActual) {
-        return res.status(409).json({
-          error: `El pedido #${id} ya está en "${estadoActual}"; no se puede regresar a "${estado}". Si tu pantalla lo muestra en un estado anterior, recargá la lista de pedidos.`,
-          estadoActual, estadoSolicitado: estado,
-        });
+        return res.status(400).json({ error: `No se puede retroceder de "${estadoActual}" a "${estado}".` });
       }
-      // Gate de pago — UN SOLO camino, según el método real del pedido:
-      //   • nequi / llave bancolombia (transferencia) → el pago se confirma
-      //     aprobando el comprobante (PATCH /:id/comprobante/aprobar), que
-      //     además de aprobar pone pago_confirmado=true. NO se menciona
-      //     /confirmar-pago acá (era la fuente del "pide las dos cosas").
-      //   • efectivo / sin método → sin bloqueo: el cobro se hace en persona
-      //     a la entrega, no frena la preparación.
-      if (idxNuevo >= IDX_EN_PROCESO && pagoRequiereComprobante(ped.pago) && !ped.pago_confirmado) {
-        return res.status(409).json({
-          error: `El pedido #${id} se paga por ${ped.pago} y su comprobante todavía no fue aprobado. Aprobalo con PATCH /pedidos/${id}/comprobante/aprobar antes de pasarlo a "${estado}".`,
-          estadoActual, estadoSolicitado: estado, pago: ped.pago, pagoConfirmado: ped.pago_confirmado,
-        });
-      }
-    }
-
-    // ── Transición a 'entregado': crea la venta + descuenta inventario, en
-    //    una sola transacción e idempotente.
-    //    Un insumo que no existe en el local YA NO bloquea la entrega (ver
-    //    descontarInventarioPorVenta): se descuenta lo que se puede y los
-    //    faltantes viajan en `avisoInventario` para mostrarlos como
-    //    advertencia. Solo sigue bloqueando el caso en que el pedido no
-    //    tiene un local válido, porque ahí no hay inventario contra el cual
-    //    registrar nada.
-    if (estado === 'entregado') {
-      const r = await registrarVentaDePedido(ped);
-      if (r.error) {
-        return res.status(409).json({
-          error: `No se puede marcar el pedido #${id} como entregado: ${r.error}`,
-          estadoActual, estadoSolicitado: estado,
-        });
-      }
-      if (r.faltantes?.length) {
-        avisoInventario = `El pedido se entregó y la venta quedó registrada, pero no se descontó el inventario de: ${r.faltantes.join(', ')} (no existe(n) como insumo activo en el local del pedido). Revisa la receta y el inventario de ese local.`;
+      // El pago debe estar confirmado antes de entrar a preparación (o a
+      // cualquier estado posterior, si el cambio salta pasos) — PERO solo
+      // para pago por transferencia (nequi/transferencia), que depende de
+      // que el cajero apruebe el comprobante (ver PATCH
+      // /:id/comprobante/aprobar). En efectivo el cobro se confirma en
+      // persona al momento de la entrega, no por comprobante, así que no
+      // aplica ninguna restricción de pago acá — el cajero mueve el
+      // estado libremente. esEfectivo() compara sin importar mayúsculas/
+      // minúsculas (bug confirmado: 'pago' se guarda en minúscula, pero
+      // esta condición comparaba contra 'Efectivo' con mayúscula, así que
+      // NUNCA coincidía y todo pedido en efectivo quedaba bloqueado igual
+      // que uno por transferencia).
+      if (idxNuevo >= IDX_EN_PROCESO && !esEfectivo(actual[0].pago) && !actual[0].pago_confirmado) {
+        return res.status(400).json({ error: 'El comprobante de pago debe ser aprobado antes de pasar a preparación.' });
       }
     }
 
-    // ── Transición a 'en_camino' (estado de espera antes de la entrega):
-    //    "atendido_por" = el usuario autenticado que hace la transición
-    //    (automático, no se elige). Ya no se asigna domiciliario (requisito
-    //    1: el sistema no maneja domiciliarios) — el tipo de entrega
-    //    'domicilio' se mantiene igual, solo desaparece la persona asignada.
-    const sets = ['estado=$1'];
-    const vals = [estado];
-    if (estado === 'en_camino') {
-      vals.push(req.user.id); sets.push(`atendido_por = COALESCE(atendido_por, $${vals.length})`);
-    }
-    vals.push(id);
-    const { rows } = await pool.query(
-      `UPDATE pedidos SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals
-    );
-    res.json(avisoInventario ? { ...rows[0], avisoInventario } : rows[0]);
+    const { rows } = await pool.query('UPDATE pedidos SET estado=$1 WHERE id=$2 RETURNING *', [estado, id]);
+    res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // El cajero puede marcar el cobro de un pedido como confirmado a mano —
@@ -4003,23 +2593,15 @@ pedRouter.patch('/:id/confirmar-pago', auth, permitirRoles('Cajero', 'Administra
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   try {
-    const { rows: actual } = await pool.query('SELECT estado, pago FROM pedidos WHERE id=$1', [id]);
-    if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-    // Esta ruta es SOLO para efectivo / pago en el local. Un pedido que se
-    // paga por Nequi o Llave Bancolombia se confirma revisando el
-    // comprobante (PATCH /:id/comprobante/aprobar) — nunca "a mano" acá, que
-    // saltaría la verificación del comprobante.
-    if (pagoRequiereComprobante(actual[0].pago)) {
-      return res.status(400).json({
-        error: `El pedido #${id} se paga por ${actual[0].pago}: su pago se confirma aprobando el comprobante con PATCH /pedidos/${id}/comprobante/aprobar, no con /confirmar-pago.`,
-      });
-    }
-    if (actual[0].estado === 'cancelado' || actual[0].estado === 'entregado') {
+    const { rows } = await pool.query(
+      `UPDATE pedidos SET pago_confirmado = TRUE WHERE id=$1 AND estado NOT IN ('cancelado','entregado') RETURNING *`,
+      [id]
+    );
+    if (!rows[0]) {
+      const { rows: existente } = await pool.query('SELECT id FROM pedidos WHERE id=$1', [id]);
+      if (!existente[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
       return res.status(400).json({ error: 'Este pedido está cancelado o ya entregado, no se puede confirmar el pago.' });
     }
-    const { rows } = await pool.query(
-      `UPDATE pedidos SET pago_confirmado = TRUE WHERE id=$1 RETURNING *`, [id]
-    );
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4041,7 +2623,7 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   try {
-    const { rows: actual } = await pool.query('SELECT estado, pago, comprobante_img FROM pedidos WHERE id=$1', [id]);
+    const { rows: actual } = await pool.query('SELECT estado, pago FROM pedidos WHERE id=$1', [id]);
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (esEfectivo(actual[0].pago)) {
       return res.status(400).json({ error: 'Los pedidos en efectivo no requieren aprobación de comprobante — usa PATCH /:id/confirmar-pago.' });
@@ -4049,16 +2631,6 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
     if (actual[0].estado !== 'pendiente_verificacion') {
       return res.status(400).json({ error: 'Este pedido no tiene un comprobante pendiente de verificación.' });
     }
-    // No se puede "aprobar" un comprobante que no existe. Si el cliente eligió
-    // Nequi/Llave Bancolombia pero no subió la imagen, el pedido quedó igual
-    // en 'pendiente_verificacion' (para que el cajero lo vea en esa lista),
-    // pero acá no hay nada que aprobar hasta que el cliente lo envíe y se
-    // adjunte con PUT /pedidos/:id.
-    if (!actual[0].comprobante_img) {
-      return res.status(400).json({ error: `El pedido #${id} no tiene comprobante subido. Contactá al cliente para que lo envíe y adjuntalo con PUT /pedidos/${id} antes de aprobarlo.` });
-    }
-    // Aprobar = confirmar el pago y pasar a 'pendiente' (listo para que el
-    // cajero dé "empezar preparación" → en_proceso, como paso aparte).
     const { rows } = await pool.query(
       `UPDATE pedidos SET estado = 'pendiente', pago_confirmado = TRUE WHERE id=$1 RETURNING *`,
       [id]
@@ -4069,15 +2641,7 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
 pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Administrador'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  // El motivo es OBLIGATORIO: queda guardado en el pedido para que el
-  // cliente pueda ver por qué se rechazó su comprobante (GET /pedidos lo
-  // devuelve en comprobante_motivo_rechazo).
-  const motivo = textoLimpio(req.body?.motivo);
-  if (!motivo) {
-    return res.status(400).json({ error: 'Tenés que indicar un motivo para rechazar el comprobante.' });
-  }
-  const errorMotivo = errorLongitud(motivo, 'El motivo de rechazo', LIMITES.MOTIVO, 5);
-  if (errorMotivo) return res.status(400).json({ error: errorMotivo });
+  const { motivo } = req.body;
   try {
     const { rows: actual } = await pool.query('SELECT estado, pago FROM pedidos WHERE id=$1', [id]);
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
@@ -4089,38 +2653,32 @@ pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Admi
     }
     const { rows } = await pool.query(
       `UPDATE pedidos SET estado = 'cancelado', comprobante_motivo_rechazo = $1 WHERE id=$2 RETURNING *`,
-      [motivo, id]
+      [motivo || null, id]
     );
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Un cajero/bartender "toma" (reclama) un pedido que todavía NO está
-// asignado a ningún local (local_id IS NULL) — solo aplica a esos; un
-// pedido que el Admin creó ya con un local elegido nunca pasa por aquí.
-// El UPDATE es atómico (WHERE local_id IS NULL en la misma consulta) para
-// que, si dos locales intentan tomarlo a la vez, solo uno lo consiga.
+// Un cajero/bartender de un local específico "toma" (reclama) un pedido de
+// cliente que todavía no tiene local asignado (sede IS NULL). El UPDATE es
+// atómico en una sola consulta (WHERE sede IS NULL en el mismo UPDATE, sin
+// SELECT previo) para que, si dos locales intentan tomarlo casi al mismo
+// tiempo, Postgres garantice que solo uno de los dos lo consiga.
 pedRouter.patch('/:id/tomar', auth, async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  const miLocal = Number(req.user.local_id) || null;
-  if (!miLocal) {
-    return res.status(403).json({ error: 'Solo un cajero o bartender con local asignado puede tomar un pedido.' });
+  const miSede = req.user.sede;
+  if (!miSede || miSede === 'Ambos') {
+    return res.status(403).json({ error: 'Un Administrador no puede tomar pedidos para un local específico.' });
   }
   try {
     const { rows } = await pool.query(
-      `UPDATE pedidos
-          SET local_id = $1,
-              sede = (SELECT nombre FROM locales WHERE id = $1)
-        WHERE id = $2 AND local_id IS NULL
-        RETURNING *`,
-      [miLocal, id]
+      'UPDATE pedidos SET sede=$1 WHERE id=$2 AND sede IS NULL RETURNING *',
+      [miSede, id]
     );
     if (!rows[0]) {
-      const { rows: existente } = await pool.query(
-        `SELECT l.nombre FROM pedidos p LEFT JOIN locales l ON l.id = p.local_id WHERE p.id=$1`, [id]
-      );
+      const { rows: existente } = await pool.query('SELECT sede FROM pedidos WHERE id=$1', [id]);
       if (!existente[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-      return res.status(409).json({ error: `Este pedido ya fue tomado por ${existente[0].nombre || 'otro local'}` });
+      return res.status(409).json({ error: `Este pedido ya fue tomado por ${existente[0].sede}` });
     }
     res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4204,20 +2762,16 @@ ventRouter.post('/desde-pedido', auth, async (req, res) => {
     const { rows: ped } = await pool.query('SELECT * FROM pedidos WHERE id=$1', [id_pedido]);
     if (!ped[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
 
-    // Misma lógica atómica e idempotente que usa PATCH /pedidos/:id/estado al
-    // marcar 'entregado': crea la venta + descuenta inventario en una
-    // transacción, y si el pedido ya tenía venta, no duplica nada. Si el
-    // local no resuelve o falta un insumo → 400 sin tocar stock.
-    const r = await registrarVentaDePedido(ped[0]);
-    if (r.error) return res.status(400).json({ error: r.error });
+    
+    await descontarInventarioPorVenta(ped[0].items);
 
-    const { rows: full } = await pool.query(`${VENTA_SELECT} WHERE v.id=$1`, [r.ventaId]);
-    // Mismo aviso que en PATCH /pedidos/:id/estado: la venta se registra
-    // igual, pero se informa qué insumos no se pudieron descontar.
-    const avisoInv = r.faltantes?.length
-      ? `La venta quedó registrada, pero no se descontó el inventario de: ${r.faltantes.join(', ')} (no existe(n) como insumo activo en el local del pedido).`
-      : undefined;
-    res.status(r.yaExistia ? 200 : 201).json(avisoInv ? { ...full[0], avisoInventario: avisoInv } : full[0]);
+    const { rows } = await pool.query(
+      
+      `INSERT INTO ventas(pedido_id, total, estado) VALUES($1,$2,'vendido') RETURNING *`,
+      [id_pedido, ped[0].total]
+    );
+    const { rows: full } = await pool.query(`${VENTA_SELECT} WHERE v.id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 ventRouter.patch('/:id/estado', auth, async (req, res) => {
@@ -4238,15 +2792,9 @@ const DEV_SELECT = `
     d.id                       AS id_dev,
     d.pedido_id,
     p.cliente,
-    -- cliente_id: sin esta columna el frontend no tenía a quién notificar
-    -- cuando se aprueba o rechaza una devolución (notificacionesService
-    -- descarta la notificación si no recibe clienteId). Es solo una columna
-    -- más en el SELECT: no cambia ninguna fila ni ningún filtro existente.
-    p.cliente_id,
     p.sede,
     v.id                       AS id_venta,
     d.motivo,
-    d.motivo_rechazo,
     d.tipo,
     d.monto,
     d.estado,
@@ -4424,29 +2972,7 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
   if (!['pendiente','aprobada','rechazada'].includes(estado)) {
     return res.status(400).json({ error: 'Estado inválido' });
   }
-
-  // Rechazar SIEMPRE exige un motivo. Antes el rechazo solo cambiaba el
-  // estado, así que la devolución quedaba marcada como rechazada sin que
-  // nadie —ni el cliente ni el siguiente cajero— pudiera saber por qué.
-  // Mismo criterio que ya usa el rechazo de comprobantes
-  // (PATCH /pedidos/:id/comprobante/rechazar), y misma validación: sin
-  // espacios en blanco solamente, y con tope de longitud.
-  let motivoRechazo = null;
-  if (estado === 'rechazada') {
-    motivoRechazo = textoLimpio(req.body.motivo_rechazo ?? req.body.motivoRechazo);
-    if (!motivoRechazo) {
-      return res.status(400).json({ error: 'Tenés que indicar un motivo para rechazar la devolución.' });
-    }
-    const errorMotivo = errorLongitud(motivoRechazo, 'El motivo de rechazo', LIMITES.MOTIVO, 10);
-    if (errorMotivo) return res.status(400).json({ error: errorMotivo });
-  }
-
-  // Al salir del estado 'rechazada' (ej. se reabre como 'pendiente') el
-  // motivo se limpia: dejarlo colgado mostraría un rechazo que ya no existe.
-  const { rows } = await pool.query(
-    'UPDATE devoluciones SET estado=$1, motivo_rechazo=$2 WHERE id=$3 RETURNING *',
-    [estado, motivoRechazo, req.params.id]
-  );
+  const { rows } = await pool.query('UPDATE devoluciones SET estado=$1 WHERE id=$2 RETURNING *', [estado, req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Devolución no encontrada' });
 
  
@@ -4462,17 +2988,10 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
 r.use('/devoluciones', devRouter);
 
 
-// vaso_id se mantiene en la respuesta (alias de vaso_insumo_id) por
-// compatibilidad con cualquier cliente que todavía lo lea con ese nombre;
-// vaso_insumo_id/cantidad_vaso/lleva_pitillo/pitillo_insumo_id/
-// cantidad_pitillo son los campos nuevos (requisito 3, esta ronda). Vaso y
-// pitillo son insumos NORMALES — nunca un tipo especial ni "empaques".
 const FICHA_COLS = `
   SELECT f.id, f.producto_id AS id_producto, p.nombre AS producto_nombre,
     f.categoria_prep, f.porciones, f.tiempo_prep, f.costo_estimado, f.estado,
-    f.notas, f.resumen_prep, f.preparacion,
-    f.vaso_insumo_id AS vaso_id, f.vaso_insumo_id, f.cantidad_vaso,
-    f.lleva_pitillo, f.pitillo_insumo_id, f.cantidad_pitillo,
+    f.notas, f.resumen_prep, f.preparacion, f.vaso_id,
     f.ingredientes AS insumos, f.toppings_ficha AS toppings, f.created_at AS fecha_registro
   FROM fichas_tecnicas f LEFT JOIN productos p ON f.producto_id = p.id
 `;
@@ -4564,24 +3083,13 @@ const validarLineasInsumo = async (lista, contexto, { obligatoria }) => {
     // existan, y de paso trae la unidad real registrada para cada insumo
     // (la ficha nunca debe guardar una unidad distinta a la del insumo).
     const ids = filas.map(f => f.id_insumo);
-    const { rows } = await pool.query('SELECT id, nombre, unidad FROM insumos WHERE id = ANY($1::int[])', [ids]);
+    const { rows } = await pool.query('SELECT id, unidad FROM insumos WHERE id = ANY($1::int[])', [ids]);
     const unidadPorId = new Map(rows.map(r => [r.id, r.unidad]));
-    const nombrePorId = new Map(rows.map(r => [r.id, r.nombre]));
     const faltantes = ids.filter(id => !unidadPorId.has(id));
     if (faltantes.length) {
       return { error: `En ${contexto} hay insumos que ya no existen en el inventario (id: ${faltantes.join(', ')}).` };
     }
     for (const f of filas) f.unidad = unidadPorId.get(f.id_insumo) || f.unidad;
-    // Requisito 5 (esta ronda): la cantidad respeta la unidad REAL de ESE
-    // insumo — entero si es "unidad" (no hay "3.5 pitillos"), decimales
-    // para el resto (g/mL/kg/L/oz). Antes esto solo se exigía al ajustar
-    // stock/comprar; en la ficha técnica (insumos Y toppings) se aceptaba
-    // cualquier decimal sin importar la unidad.
-    for (const f of filas) {
-      const etiqueta = `La cantidad de "${nombrePorId.get(f.id_insumo) || `#${f.id_insumo}`}" en ${contexto}`;
-      const errorCantidad = errorCantidadPorUnidad(f.cantidad, etiqueta, f.unidad);
-      if (errorCantidad) return { error: errorCantidad };
-    }
   }
   return { filas };
 };
@@ -4643,48 +3151,15 @@ const validarFichaTecnica = async (body, excluirId) => {
   const resToppings = await validarLineasInsumo(listaToppings, 'los toppings', { obligatoria: false });
   if (resToppings.error) return { error: resToppings.error };
 
-  // 6. Vaso y pitillo (requisito 3, esta ronda): son insumos NORMALES del
-  //    módulo de Insumos (cada uno con su propia unidad — vaso típicamente
-  //    'oz', pitillo típicamente 'unidad'), nunca un tipo especial. A
-  //    diferencia de antes, el vaso ya NO es obligatorio (no todo producto
-  //    usa uno del inventario) — pero si se elige, tiene que ser un insumo
-  //    real y traer su cantidad (en la unidad real de ESE insumo).
-  //    Acepta tanto "vaso_insumo_id" (nombre nuevo) como "vaso_id" (nombre
-  //    viejo) por compatibilidad con cualquier cliente que aún lo mande así.
-  const vasoIdRaw = body.vaso_insumo_id ?? body.vaso_id;
-  const vasoProvisto = vasoIdRaw !== undefined && vasoIdRaw !== null && vasoIdRaw !== '';
-  let vasoInsumoId = null;
-  let cantidadVaso = null;
-  if (vasoProvisto) {
-    vasoInsumoId = Number(vasoIdRaw);
-    if (!Number.isInteger(vasoInsumoId) || vasoInsumoId <= 0) {
-      return { error: 'El vaso seleccionado no es válido.' };
-    }
-    const { rows: vaso } = await pool.query('SELECT id, unidad FROM insumos WHERE id=$1', [vasoInsumoId]);
-    if (!vaso[0]) return { error: 'El vaso seleccionado no existe en el inventario de insumos.' };
-    const errorCantVaso = errorCantidadPorUnidad(body.cantidad_vaso, 'La cantidad de vaso', vaso[0].unidad);
-    if (errorCantVaso) return { error: errorCantVaso };
-    cantidadVaso = Number(body.cantidad_vaso);
+  // 6. Vaso: obligatorio y tiene que ser un insumo real. El formulario ya lo
+  //    exigía; el servidor lo aceptaba vacío, y sin vaso el descuento de
+  //    inventario por venta se queda corto (ver descontarInventarioPorVenta).
+  const vasoId = Number(body.vaso_id);
+  if (!Number.isInteger(vasoId) || vasoId <= 0) {
+    return { error: 'Debes seleccionar el vaso utilizado para este producto.' };
   }
-
-  // Pitillo: opcional (lleva_pitillo=false por defecto). Si lleva_pitillo
-  // es true, pitillo_insumo_id y su cantidad son obligatorios; si es
-  // false, los dos quedan en NULL sin importar qué haya mandado el body
-  // (nunca queda un pitillo "fantasma" asociado a una ficha que no lo usa).
-  const llevaPitillo = body.lleva_pitillo === true || body.lleva_pitillo === 'true' || body.lleva_pitillo === 1 || body.lleva_pitillo === '1';
-  let pitilloInsumoId = null;
-  let cantidadPitillo = null;
-  if (llevaPitillo) {
-    pitilloInsumoId = Number(body.pitillo_insumo_id);
-    if (!Number.isInteger(pitilloInsumoId) || pitilloInsumoId <= 0) {
-      return { error: 'Si el producto lleva pitillo, debes seleccionar cuál.' };
-    }
-    const { rows: pitillo } = await pool.query('SELECT id, unidad FROM insumos WHERE id=$1', [pitilloInsumoId]);
-    if (!pitillo[0]) return { error: 'El pitillo seleccionado no existe en el inventario de insumos.' };
-    const errorCantPitillo = errorCantidadPorUnidad(body.cantidad_pitillo, 'La cantidad de pitillo', pitillo[0].unidad);
-    if (errorCantPitillo) return { error: errorCantPitillo };
-    cantidadPitillo = Number(body.cantidad_pitillo);
-  }
+  const { rows: vaso } = await pool.query('SELECT id FROM insumos WHERE id=$1', [vasoId]);
+  if (!vaso[0]) return { error: 'El vaso seleccionado no existe en el inventario de insumos.' };
 
   // 7. Tipo de preparación: se deduce de la categoría del producto siempre
   //    que se pueda (es lo mismo que muestra el formulario, bloqueado), y
@@ -4709,11 +3184,7 @@ const validarFichaTecnica = async (body, excluirId) => {
       notas: textoLimpio(body.notas) || null,
       resumen_prep: textoLimpio(body.resumen_prep) || null,
       preparacion,
-      vaso_insumo_id: vasoInsumoId,
-      cantidad_vaso: cantidadVaso,
-      lleva_pitillo: llevaPitillo,
-      pitillo_insumo_id: pitilloInsumoId,
-      cantidad_pitillo: cantidadPitillo,
+      vaso_id: vasoId,
       insumos: resInsumos.filas,
       toppings: resToppings.filas,
     },
@@ -4752,14 +3223,12 @@ fichaRouter.post('/', auth, async (req, res) => {
 
     const { rows } = await pool.query(
       `INSERT INTO fichas_tecnicas
-         (producto_id,categoria_prep,porciones,tiempo_prep,costo_estimado,estado,notas,resumen_prep,preparacion,
-          vaso_insumo_id,cantidad_vaso,lleva_pitillo,pitillo_insumo_id,cantidad_pitillo,ingredientes,toppings_ficha)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING id`,
+         (producto_id,categoria_prep,porciones,tiempo_prep,costo_estimado,estado,notas,resumen_prep,preparacion,vaso_id,ingredientes,toppings_ficha)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
       [
         datos.producto_id, datos.categoria_prep, datos.porciones, datos.tiempo_prep,
         datos.costo_estimado, datos.estado, datos.notas,
-        datos.resumen_prep, datos.preparacion,
-        datos.vaso_insumo_id, datos.cantidad_vaso, datos.lleva_pitillo, datos.pitillo_insumo_id, datos.cantidad_pitillo,
+        datos.resumen_prep, datos.preparacion, datos.vaso_id,
         JSON.stringify(datos.insumos), JSON.stringify(datos.toppings),
       ]
     );
@@ -4784,15 +3253,12 @@ fichaRouter.put('/:id', auth, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE fichas_tecnicas SET
          producto_id=$1, categoria_prep=$2, porciones=$3, tiempo_prep=$4, costo_estimado=$5,
-         estado=$6, notas=$7, resumen_prep=$8, preparacion=$9,
-         vaso_insumo_id=$10, cantidad_vaso=$11, lleva_pitillo=$12, pitillo_insumo_id=$13, cantidad_pitillo=$14,
-         ingredientes=$15, toppings_ficha=$16
-       WHERE id=$17 RETURNING id`,
+         estado=$6, notas=$7, resumen_prep=$8, preparacion=$9, vaso_id=$10, ingredientes=$11, toppings_ficha=$12
+       WHERE id=$13 RETURNING id`,
       [
         datos.producto_id, datos.categoria_prep, datos.porciones, datos.tiempo_prep,
         datos.costo_estimado, datos.estado, datos.notas,
-        datos.resumen_prep, datos.preparacion,
-        datos.vaso_insumo_id, datos.cantidad_vaso, datos.lleva_pitillo, datos.pitillo_insumo_id, datos.cantidad_pitillo,
+        datos.resumen_prep, datos.preparacion, datos.vaso_id,
         JSON.stringify(datos.insumos), JSON.stringify(datos.toppings),
         req.params.id,
       ]
@@ -4871,12 +3337,7 @@ dispRouter.get('/', async (req, res) => {
       `SELECT producto_id, ingredientes FROM fichas_tecnicas WHERE estado = true`
     );
    
-    // El stock ya no vive en "insumos" (ver insumo_local): se suma el
-    // stock de TODOS los locales — mismo límite de siempre (este cálculo
-    // nunca filtró por local), ahora explícito vía SUM/GROUP BY.
-    const { rows: insumos } = await pool.query(
-      `SELECT insumo_id AS id, SUM(stock) AS stock FROM insumo_local GROUP BY insumo_id`
-    );
+    const { rows: insumos } = await pool.query(`SELECT id, stock FROM insumos`);
     const stockPorInsumo = new Map(insumos.map(i => [String(i.id), Number(i.stock) || 0]));
 
     const disponibilidad = [];
@@ -4911,130 +3372,55 @@ r.use('/disponibilidad', dispRouter);
 // mostrar en un selector (nombre/dirección) — nunca "estado" ni nada más.
 const localRouter = require('express').Router();
 localRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
-// Nombres de locales obsoletos que NUNCA deben aparecer en ningún endpoint
-// (ver limpieza en config/db.js): se borran si no tienen registros, y si
-// los tienen quedan ocultos aquí de todos modos.
-const LOCALES_OBSOLETOS = ['Local 1', 'Local 2', 'Local Principal'];
-// BUG CORREGIDO (reportado con evidencia — ver CAMBIOS.md): esta ruta
-// llegó a filtrar además "direccion <> <placeholder>", pensado solo para
-// el checkout público, pero GET /locales es el ÚNICO endpoint de "locales
-// activos" — también lo consumen los selectores de Compras e Insumos. Eso
-// hacía desaparecer de esos selectores cualquier local real sin dirección
-// completa (les pasó a Villa Liliam y 3 Esquinas). La dirección
-// obligatoria se sigue exigiendo al CREAR/EDITAR (ver POST/PUT más abajo)
-// — nunca debe ocultar un registro ya existente ni bloquear una
-// operación. Este endpoint vuelve a devolver TODOS los locales activos,
-// tengan o no la dirección completa, con "direccionPendiente" calculado
-// (nunca un texto de interfaz metido en el dato) para que el front decida
-// cómo mostrarlo si hace falta.
 localRouter.get('/', async (req, res) => {
   try {
   const { rows } = await pool.query(
-    `SELECT id, nombre, direccion FROM locales
-      WHERE estado='Activo' AND nombre <> ALL($1) ORDER BY id`,
-    [LOCALES_OBSOLETOS]
+    `SELECT id, nombre, direccion FROM locales WHERE estado='Activo' ORDER BY id`
   );
-  res.json(rows.map(r => ({ ...r, direccionPendiente: r.direccion === null })));
+  res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Administración de locales — solo Administrador, a diferencia del resto
 // de este módulo (público). "/todos" antes de cualquier ruta con :id para
 // que Express no intente interpretarlo como un id.
-// Requisito 6: además de nombre/dirección/estado, el módulo de Empleados
-// necesita teléfono, cuántos empleados tiene asignados y cuántos insumos
-// tienen stock registrado ahí (insumo_local, sin importar si ese stock es
-// 0 o no — "con stock registrado" = tiene una fila, ver requisito 6) para
-// poder mostrarlo en su vista de locales. "direccionPendiente" calculado
-// igual que en GET / (nunca se guarda, se deriva de "direccion IS NULL").
 localRouter.get('/todos', auth, permitirRoles('Administrador'), async (req, res) => {
   try {
-  const { rows } = await pool.query(
-    `SELECT l.*,
-            (SELECT COUNT(*) FROM empleados WHERE local_id = l.id)   AS "empleadosAsignados",
-            (SELECT COUNT(*) FROM insumo_local WHERE local_id = l.id) AS "insumosConStock"
-       FROM locales l WHERE l.nombre <> ALL($1) ORDER BY l.id`,
-    [LOCALES_OBSOLETOS]
-  );
-  res.json(rows.map(r => ({
-    ...r,
-    direccionPendiente: r.direccion === null,
-    empleadosAsignados: Number(r.empleadosAsignados),
-    insumosConStock: Number(r.insumosConStock),
-  })));
+  const { rows } = await pool.query(`SELECT * FROM locales ORDER BY id`);
+  res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // La tabla "locales" no tiene UNIQUE sobre el nombre (la semilla inicial se
 // apoya en eso), así que sin esta comprobación se podían crear dos sedes
 // llamadas exactamente igual, y el selector del checkout quedaba con dos
 // opciones idénticas e indistinguibles.
-// Dirección/teléfono de un local (requisito 2, esta ronda):
-//   • direccion: OBLIGATORIA (antes aceptaba vacío — por eso el listado
-//     mostraba "—" en los dos locales sembrados). Mismo criterio que
-//     errorNombre: ni vacía ni solo espacios.
-//   • telefono: OPCIONAL, pero si viene se valida el FORMATO (ver
-//     errorTelefono en config/validaciones.js) — acepta +57 y separadores
-//     comunes, exige 7-10 dígitos reales.
-const validarDireccionYTelefono = (body) => {
-  const errorDir = errorNombre(body.direccion, 'La dirección del local', LIMITES.DESCRIPCION);
-  if (errorDir) return errorDir;
-  const errorTel = errorTelefono(body.telefono, 'El teléfono del local');
-  if (errorTel) return errorTel;
-  return null;
-};
 localRouter.post('/', auth, permitirRoles('Administrador'), async (req, res) => {
   try {
-  const { telefono } = req.body;
+  const { direccion } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del local', LIMITES.NOMBRE_CORTO);
   if (errorNom) return res.status(400).json({ error: errorNom });
-  const errorDirTel = validarDireccionYTelefono(req.body);
-  if (errorDirTel) return res.status(400).json({ error: errorDirTel });
   const nombre = nombreNormalizado(req.body.nombre);
-  const direccion = nombreNormalizado(req.body.direccion);
   if (await nombreDuplicado(pool, 'locales', nombre, null)) {
     return res.status(400).json({ error: 'Ya existe un local con ese nombre.' });
   }
   const { rows } = await pool.query(
-    `INSERT INTO locales(nombre, direccion, telefono) VALUES($1,$2,$3) RETURNING *`,
-    [nombre, direccion, telefono || null]
+    `INSERT INTO locales(nombre, direccion) VALUES($1,$2) RETURNING *`,
+    [nombre, direccion || null]
   );
-
-  // Requisito 2 (esta ronda): un local nuevo queda disponible en Insumos
-  // sin configuración adicional — se le crea, YA, su fila de insumo_local
-  // (stock_actual=0) para CADA insumo que ya existe, así ninguno aparece
-  // "ausente" ni da error en este local recién creado. El stock_minimo por
-  // defecto se hereda del insumo: el mayor stock_minimo que ya tenga
-  // configurado en cualquier OTRO local (0 si nunca tuvo ninguno) — una
-  // base razonable en vez de arrancar siempre en cero un mínimo que en
-  // otros locales sí está configurado.
-  const { rows: insumosExistentes } = await pool.query(
-    `SELECT i.id, COALESCE((SELECT MAX(il.stock_minimo) FROM insumo_local il WHERE il.insumo_id = i.id), 0) AS "minimoDefecto"
-       FROM insumos i`
-  );
-  for (const ins of insumosExistentes) {
-    await pool.query(
-      `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,0,$3,true)
-         ON CONFLICT (insumo_id, local_id) DO NOTHING`,
-      [ins.id, rows[0].id, ins.minimoDefecto]
-    );
-  }
   res.status(201).json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 localRouter.put('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
   try {
-  const { telefono } = req.body;
+  const { direccion } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del local', LIMITES.NOMBRE_CORTO);
   if (errorNom) return res.status(400).json({ error: errorNom });
-  const errorDirTel = validarDireccionYTelefono(req.body);
-  if (errorDirTel) return res.status(400).json({ error: errorDirTel });
   const nombre = nombreNormalizado(req.body.nombre);
-  const direccion = nombreNormalizado(req.body.direccion);
   if (await nombreDuplicado(pool, 'locales', nombre, req.params.id)) {
     return res.status(400).json({ error: 'Ya existe un local con ese nombre.' });
   }
   const { rows } = await pool.query(
-    `UPDATE locales SET nombre=$1, direccion=$2, telefono=$3 WHERE id=$4 RETURNING *`,
-    [nombre, direccion, telefono || null, req.params.id]
+    `UPDATE locales SET nombre=$1, direccion=$2 WHERE id=$3 RETURNING *`,
+    [nombre, direccion || null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Local no encontrado' });
   res.json(rows[0]);
@@ -5048,53 +3434,6 @@ localRouter.patch('/:id/estado', auth, permitirRoles('Administrador'), async (re
   );
   if (!rows[0]) return res.status(404).json({ error: 'Local no encontrado' });
   res.json(rows[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-// Un local solo se puede eliminar si NO tiene ningún registro asociado.
-// Antes no había ruta DELETE (el frontend recibía un 404/500 genérico —
-// "Error en la solicitud"); y aunque la hubiera, algunas FK a locales
-// borran en cascada suave (pedidos_local_id_fkey es ON DELETE SET NULL, así
-// que un borrado "exitoso" habría dejado pedidos huérfanos sin local). Este
-// chequeo explícito responde 409 diciendo exactamente qué hay asociado y
-// cuántos, y solo deja borrar el local si está completamente libre.
-localRouter.delete('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
-  try {
-  const { rows: existe } = await pool.query('SELECT id FROM locales WHERE id=$1', [req.params.id]);
-  if (!existe[0]) return res.status(404).json({ error: 'Local no encontrado' });
-
-  const { rows: [n] } = await pool.query(
-    `SELECT
-       (SELECT COUNT(*) FROM compras       WHERE local_id = $1)                                   AS compras,
-       (SELECT COUNT(*) FROM pedidos       WHERE local_id = $1)                                   AS pedidos,
-       (SELECT COUNT(*) FROM ventas v JOIN pedidos p ON p.id = v.pedido_id WHERE p.local_id = $1) AS ventas,
-       (SELECT COUNT(*) FROM insumo_local  WHERE local_id = $1)                                   AS insumos,
-       (SELECT COUNT(*) FROM empaque_local WHERE local_id = $1)                                   AS empaques,
-       (SELECT COUNT(*) FROM empleados     WHERE local_id = $1)                                   AS empleados,
-       (SELECT COUNT(*) FROM usuarios      WHERE local_id = $1)                                   AS usuarios`,
-    [req.params.id]
-  );
-  const cats = [
-    [Number(n.compras),   'compra',   'compras'],
-    [Number(n.pedidos),   'pedido',   'pedidos'],
-    [Number(n.ventas),    'venta',    'ventas'],
-    [Number(n.insumos),   'insumo con stock registrado',   'insumos con stock registrado'],
-    [Number(n.empaques),  'empaque con stock registrado',  'empaques con stock registrado'],
-    [Number(n.empleados), 'empleado', 'empleados'],
-    [Number(n.usuarios),  'usuario',  'usuarios'],
-  ];
-  const partes = cats.filter(([c]) => c > 0).map(([c, s, p]) => `${c} ${c === 1 ? s : p}`);
-  if (partes.length) {
-    const total = cats.reduce((a, [c]) => a + c, 0);
-    const listado = partes.length === 1
-      ? partes[0]
-      : `${partes.slice(0, -1).join(', ')} y ${partes[partes.length - 1]}`;
-    return res.status(409).json({
-      error: `No se puede eliminar: este local tiene ${listado} asociado${total === 1 ? '' : 's'}. Elimina o reasigna esos registros primero.`,
-    });
-  }
-
-  await pool.query('DELETE FROM locales WHERE id=$1', [req.params.id]);
-  res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/locales', localRouter);

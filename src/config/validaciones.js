@@ -77,40 +77,6 @@ const errorLongitud = (valor, etiqueta, max, minimo = 0) => {
   return null;
 };
 
-// ── Validador de número de documento ───────────────────────────────────────
-// El número de documento (cédula colombiana y equivalentes) es OPCIONAL, pero
-// si viene tiene que ser SOLO dígitos y como MÁXIMO 10 — una cédula colombiana
-// nunca pasa de 10 dígitos, así que un valor más largo es siempre un error de
-// tipeo o un intento de meter basura. Devuelve el mensaje de error o null.
-const errorDocumento = (valor, etiqueta = 'El número de documento') => {
-  const limpio = textoLimpio(valor);
-  if (!limpio) return null; // opcional
-  if (!/^\d+$/.test(limpio)) return `${etiqueta} solo puede contener números.`;
-  if (limpio.length > 10) return `${etiqueta} no puede tener más de 10 dígitos (tiene ${limpio.length}).`;
-  return null;
-};
-
-// ── Validador de teléfono ────────────────────────────────────────────────
-// OPCIONAL (el que llama decide si además lo hace obligatorio con
-// errorNombre/errorLongitud aparte); si viene, valida el FORMATO: acepta el
-// prefijo internacional colombiano (+57) y separadores comunes (espacios,
-// guiones, paréntesis) — un cajero puede escribir "300 123 4567" o
-// "(604) 123-4567" igual de válido que "3001234567" — pero, quitados esos
-// separadores, solo deben quedar dígitos, y entre 7 (fijo local) y 10
-// (celular) de ellos — ni un texto suelto ni un número a medio escribir.
-const errorTelefono = (valor, etiqueta = 'El teléfono') => {
-  const limpio = textoLimpio(valor);
-  if (!limpio) return null; // opcional
-  const soloDigitos = limpio.replace(/^\+?57\s*/, '').replace(/[\s\-()]/g, '');
-  if (!/^\d+$/.test(soloDigitos)) {
-    return `${etiqueta} solo puede contener números (y opcionalmente el prefijo +57, espacios, guiones o paréntesis).`;
-  }
-  if (soloDigitos.length < 7 || soloDigitos.length > 10) {
-    return `${etiqueta} debe tener entre 7 y 10 dígitos.`;
-  }
-  return null;
-};
-
 // ── Detector de nombres duplicados ──────────────────────────────────────────
 // Compara ignorando mayúsculas/minúsculas Y espacios sobrantes, tanto del
 // valor nuevo como de los que ya están guardados. Esto último importa: aunque
@@ -148,7 +114,5 @@ module.exports = {
   LIMITES,
   errorNombre,
   errorLongitud,
-  errorDocumento,
-  errorTelefono,
   nombreDuplicado,
 };

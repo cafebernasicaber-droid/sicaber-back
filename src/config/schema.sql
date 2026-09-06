@@ -34,12 +34,6 @@ ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS es_superadmin BOOLEAN NOT NULL DEF
 ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS sede VARCHAR(20) NOT NULL DEFAULT 'Local 1';
 UPDATE usuarios SET sede = 'Ambos' WHERE rol = 'Administrador' AND sede = 'Local 1';
 
--- Multi-local (Insumos/Compras): local de trabajo del usuario interno, como
--- referencia real a locales.id. Lo usa POST /insumos para asignar
--- automáticamente el local del insumo. NULL para el Administrador ('Ambos').
--- La FK se agrega en config/db.js (después de crear la tabla "locales").
-ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS local_id INTEGER;
-
 CREATE TABLE IF NOT EXISTS clientes (
   id          SERIAL PRIMARY KEY,
   nombre      VARCHAR(150) NOT NULL,
@@ -110,10 +104,6 @@ CREATE TABLE IF NOT EXISTS toppings (
   -- "toppings"), y la FK real se agrega aparte una vez que existe — ver el
   -- mismo patrón para fichas_tecnicas.vaso_id en config/db.js.
   insumo_id   INTEGER,
-  -- Igual que insumo_id, pero para descontar de un EMPAQUE (ej. "Pitillo
-  -- extra") en vez de un insumo — mutuamente excluyente en la práctica.
-  -- "empaques" se crea más abajo; FK real agregada aparte en config/db.js.
-  empaque_id  INTEGER,
   cantidad    NUMERIC(10,3) DEFAULT 0,
   estado      VARCHAR(20)  NOT NULL DEFAULT 'Activo',
   created_at  TIMESTAMP DEFAULT NOW()
@@ -137,7 +127,6 @@ CREATE TABLE IF NOT EXISTS adiciones (
   -- toppings.insumo_id: "insumos" se crea más abajo en este archivo, la FK
   -- real se agrega aparte en config/db.js una vez que existe.
   insumo_id   INTEGER,
-  empaque_id  INTEGER, -- igual que toppings.empaque_id
   cantidad    NUMERIC(10,3) DEFAULT 0,
   estado      VARCHAR(20)  NOT NULL DEFAULT 'Activo',
   created_at  TIMESTAMP DEFAULT NOW()
@@ -165,12 +154,6 @@ CREATE TABLE IF NOT EXISTS proveedores (
   created_at  TIMESTAMP DEFAULT NOW()
 );
 
--- Insumo: catálogo GLOBAL (un solo registro, sin importar en cuántos
--- locales tenga stock). El stock por local vive en insumo_local, la tabla
--- puente justo debajo — NO en columnas de esta tabla (antes "stock"/
--- "stock_minimo"/"local_id" vivían acá, y un mismo insumo se duplicaba en
--- una fila completa por cada local; ver migrarInsumoLocalYEmpaques en
--- config/db.js para la consolidación de instalaciones existentes).
 CREATE TABLE IF NOT EXISTS insumos (
   id              SERIAL PRIMARY KEY,
   nombre          VARCHAR(150) NOT NULL,
@@ -180,83 +163,16 @@ CREATE TABLE IF NOT EXISTS insumos (
   -- (ver PUT /insumos/:id): cambiarla después dejaría el stock histórico
   -- expresado en una unidad distinta a la actual, sin ninguna conversión.
   unidad          VARCHAR(50) CHECK (unidad IN ('kg','g','lb','oz','L','mL','unidad')),
+  stock           NUMERIC(10,2) DEFAULT 0,
+  stock_minimo    NUMERIC(10,2) DEFAULT 0,
   precio_unitario NUMERIC(10,2) DEFAULT 0,
+  proveedor_id    INTEGER REFERENCES proveedores(id) ON DELETE SET NULL,
   estado          VARCHAR(20) NOT NULL DEFAULT 'Activo',
-  -- categoria_id/descripcion: agregadas por ALTER en config/db.js (junto
-  -- con la tabla "categorias_insumos", que se crea ahí, no acá) — no se
-  -- duplican en este CREATE TABLE para no adelantarse a esa migración.
-  -- Tipo de uso del insumo — un insumo puede ser uno, dos o los tres a la
-  -- vez, pero AL MENOS uno debe quedar en true (ver insumos_tipo_uso_check
-  -- más abajo). "Empaques" (vasos/pitillos/desechables) NUNCA se crean acá:
-  -- ver categoria_id bloqueado a la categoría "Empaques" en POST/PUT
-  -- /insumos (routes/index.js) y la tabla "empaques" más abajo.
-  -- Definiciones (ver auditoría en CAMBIOS.md): "topping" = adición
-  -- GRATUITA y opcional dentro de la ficha técnica (la tabla "toppings"
-  -- nunca tiene columna de precio); "adición" = extra que el cliente
-  -- agrega y que SÍ tiene costo (la tabla "adiciones" sí tiene "precio").
-  -- Esta columna se llamó "es_adicion_sin_costo" hasta que se corrigió el
-  -- nombre (contradecía la definición real de "adición").
-  es_insumo   BOOLEAN NOT NULL DEFAULT TRUE,  -- ingrediente normal de receta
-  es_adicion  BOOLEAN NOT NULL DEFAULT FALSE, -- candidato a ingrediente de una Adición (con costo)
-  es_topping  BOOLEAN NOT NULL DEFAULT FALSE, -- candidato a ingrediente de un Topping (gratuito)
-  created_at      TIMESTAMP DEFAULT NOW()
-);
-ALTER TABLE insumos ADD CONSTRAINT insumos_tipo_uso_check
-  CHECK (es_insumo OR es_adicion OR es_topping);
--- Nombre de insumo único GLOBALMENTE (un solo registro de catálogo, sin
--- importar en cuántos locales tenga stock — ver insumo_local).
-CREATE UNIQUE INDEX IF NOT EXISTS insumos_nombre_uidx ON insumos (lower(btrim(nombre)));
-
--- Stock/mínimo de UN insumo en UN local — la tabla puente del requisito 1.
--- Reemplaza el modelo anterior (una fila de "insumos" completa por local).
-CREATE TABLE IF NOT EXISTS insumo_local (
-  id           SERIAL PRIMARY KEY,
-  insumo_id    INTEGER NOT NULL REFERENCES insumos(id) ON DELETE CASCADE,
-  local_id     INTEGER NOT NULL, -- REFERENCES locales(id): "locales" se crea más abajo; FK real en config/db.js
-  stock        NUMERIC(10,2) NOT NULL DEFAULT 0,
-  stock_minimo NUMERIC(10,2) NOT NULL DEFAULT 0,
-  activo       BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at   TIMESTAMP DEFAULT NOW(),
-  UNIQUE(insumo_id, local_id)
-);
-
--- Empaques (vasos, pitillos, desechables) — separados de "insumos"
--- (requisito 4): no son perecederos, no llevan receta y se descuentan por
--- PRODUCTO/TAMAÑO (ver producto_empaque más abajo), no por ficha técnica.
--- Mismo patrón exacto que insumos/insumo_local.
-CREATE TABLE IF NOT EXISTS empaques (
-  id              SERIAL PRIMARY KEY,
-  nombre          VARCHAR(150) NOT NULL UNIQUE,
-  descripcion     TEXT,
-  unidad          VARCHAR(50) NOT NULL DEFAULT 'unidad'
-                    CHECK (unidad IN ('kg','g','lb','oz','L','mL','unidad')),
-  precio_unitario NUMERIC(10,2) DEFAULT 0,
-  estado          VARCHAR(20) NOT NULL DEFAULT 'Activo',
-  created_at      TIMESTAMP DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS empaque_local (
-  id           SERIAL PRIMARY KEY,
-  empaque_id   INTEGER NOT NULL REFERENCES empaques(id) ON DELETE CASCADE,
-  local_id     INTEGER NOT NULL, -- REFERENCES locales(id): FK real en config/db.js
-  stock        NUMERIC(10,2) NOT NULL DEFAULT 0,
-  stock_minimo NUMERIC(10,2) NOT NULL DEFAULT 0,
-  activo       BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at   TIMESTAMP DEFAULT NOW(),
-  UNIQUE(empaque_id, local_id)
-);
-
--- Movimientos de inventario: kardex/auditoría de cada ajuste de stock
--- (compra, anulación de compra, venta) con su local — puramente aditivo,
--- el stock vigente sigue viviendo en insumo_local/empaque_local.
-CREATE TABLE IF NOT EXISTS movimientos_inventario (
-  id              SERIAL PRIMARY KEY,
-  tipo            VARCHAR(30) NOT NULL, -- 'compra' | 'anulacion_compra' | 'venta' | 'ajuste'
-  insumo_id       INTEGER REFERENCES insumos(id) ON DELETE SET NULL,
-  empaque_id      INTEGER REFERENCES empaques(id) ON DELETE SET NULL,
-  local_id        INTEGER NOT NULL, -- REFERENCES locales(id): FK real en config/db.js
-  cantidad        NUMERIC(10,2) NOT NULL, -- delta aplicado (+ suma, - resta)
-  referencia_tipo VARCHAR(30), -- 'compra' | 'pedido'
-  referencia_id   INTEGER,
+  -- Puramente informativo/de filtro: NO condiciona nada del backend (un
+  -- insumo con es_topping=false igual se puede asociar a un topping vía
+  -- toppings.insumo_id, y viceversa). Solo le permite al frontend sugerir
+  -- o filtrar insumos que típicamente se usan como toppings al crear uno.
+  es_topping      BOOLEAN NOT NULL DEFAULT FALSE,
   created_at      TIMESTAMP DEFAULT NOW()
 );
 
@@ -276,10 +192,6 @@ CREATE TABLE IF NOT EXISTS compras (
   total        NUMERIC(12,2) DEFAULT 0,
   estado       VARCHAR(20) NOT NULL DEFAULT 'Activa',
   motivo_anulacion TEXT,
-  -- Multi-local: local elegido explícitamente en el formulario de compra.
-  -- Obligatorio en POST /compras; el incremento de stock se aplica solo a
-  -- los insumos de ESTE local. FK agregada en config/db.js.
-  local_id     INTEGER,
   items        JSONB DEFAULT '[]',
   created_at   TIMESTAMP DEFAULT NOW()
 );
@@ -290,16 +202,10 @@ CREATE TABLE IF NOT EXISTS compras (
 -- 'Ambos'): "sede" es la asignación operativa interna de qué cajero/
 -- bartender atiende el pedido; "locales" es la lista pública, con nombre y
 -- dirección reales, que ve el cliente en el checkout.
--- "direccion" se crea nullable acá a propósito (la siembra de abajo no
--- conoce la dirección real de los dos locales) — config/db.js backfillea
--- un placeholder explícito y recién ahí aplica NOT NULL, en un solo lugar
--- que corre igual en una instalación nueva o en una ya existente (ver esa
--- migración para el porqué de la estrategia y su rollback).
 CREATE TABLE IF NOT EXISTS locales (
   id        SERIAL PRIMARY KEY,
   nombre    VARCHAR(100) NOT NULL,
   direccion TEXT,
-  telefono  VARCHAR(30),
   estado    VARCHAR(20) NOT NULL DEFAULT 'Activo'
 );
 INSERT INTO locales (nombre, direccion)
@@ -308,27 +214,6 @@ INSERT INTO locales (nombre, direccion)
     ('Local 3 Esquinas',   NULL::text)
   ) AS v(nombre, direccion)
   WHERE NOT EXISTS (SELECT 1 FROM locales WHERE locales.nombre = v.nombre);
-
--- FK reales de insumo_local/empaque_local/movimientos_inventario.local_id
--- (declaradas sin REFERENCES en línea más arriba porque "locales" se crea
--- recién acá).
-ALTER TABLE insumo_local          ADD CONSTRAINT insumo_local_local_id_fkey          FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
-ALTER TABLE empaque_local         ADD CONSTRAINT empaque_local_local_id_fkey         FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
-ALTER TABLE movimientos_inventario ADD CONSTRAINT movimientos_inventario_local_id_fkey FOREIGN KEY (local_id) REFERENCES locales(id);
-
--- Qué vaso usa cada producto/tamaño y si lleva pitillo (y cuál) —
--- requisito 4. "tamano" es opcional: NULL representa la configuración por
--- defecto del producto cuando no maneja tamaños.
-CREATE TABLE IF NOT EXISTS producto_empaque (
-  id                 SERIAL PRIMARY KEY,
-  producto_id        INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,
-  tamano             VARCHAR(50),
-  vaso_empaque_id    INTEGER REFERENCES empaques(id) ON DELETE SET NULL,
-  lleva_pitillo      BOOLEAN NOT NULL DEFAULT FALSE,
-  pitillo_empaque_id INTEGER REFERENCES empaques(id) ON DELETE SET NULL,
-  created_at         TIMESTAMP DEFAULT NOW(),
-  UNIQUE(producto_id, tamano)
-);
 
 CREATE TABLE IF NOT EXISTS pedidos (
   id                   SERIAL PRIMARY KEY,
@@ -354,22 +239,11 @@ CREATE TABLE IF NOT EXISTS pedidos (
   comprobante          TEXT,
   comprobante_img      TEXT,
   comprobante_hash     VARCHAR(64),
-  -- Resultado del OCR que el frontend le corre al comprobante del cliente.
-  -- Puramente informativo: NUNCA condiciona si el comprobante se puede
-  -- subir. La aprobación/rechazo del pago es manual (Cajero/Admin).
-  comprobante_ocr      JSONB,
   origen               VARCHAR(30) DEFAULT 'admin',
-  -- Dirección específica para ESTE pedido a domicilio, distinta a la del
-  -- perfil del cliente. Opcional (si viene NULL se usa la del perfil).
   direccion_alternativa TEXT,
   hora                 VARCHAR(20),
-  -- Quién atiende el pedido en el estado de espera previo a la entrega
-  -- (estado 'en_camino'): cajero/bartender autenticado que hizo la
-  -- transición (automático) → usuarios.id. Reemplaza a la columna de
-  -- texto "barista" (eliminada en config/db.js). El sistema NO maneja
-  -- domiciliarios (requisito 1, esta ronda) — no hay columna equivalente
-  -- para "quién entrega"; el tipo de entrega 'domicilio' se mantiene.
-  atendido_por         INTEGER REFERENCES usuarios(id) ON DELETE SET NULL,
+  barista              VARCHAR(150),
+  domiciliario         VARCHAR(150),
   -- El cobro debe quedar confirmado ANTES de que el pedido pueda pasar a
   -- 'en_proceso' (preparación) — ver PATCH /pedidos/:id/estado,
   -- /comprobante/aprobar y /confirmar-pago en routes/index.js. Con
@@ -382,10 +256,11 @@ CREATE TABLE IF NOT EXISTS pedidos (
   comprobante_motivo_rechazo TEXT,
   created_at           TIMESTAMP DEFAULT NOW()
 );
--- "Atendido por" por id (reemplaza a la vieja columna de texto "barista",
--- que config/db.js elimina). Se agrega por ALTER para bases creadas antes
--- de que estuviera en el CREATE TABLE.
-ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS atendido_por INTEGER REFERENCES usuarios(id) ON DELETE SET NULL;
+-- Migración segura: estas dos columnas se agregaron después de que el
+-- módulo de Pedidos ya guardaba "atendido por" y "domiciliario" en el
+-- formulario, pero nunca se persistían porque no existían en la tabla.
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS barista      VARCHAR(150);
+ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS domiciliario VARCHAR(150);
 
 -- Migración: local al que pertenece el pedido ('Local 1' / 'Local 2').
 -- Sin NOT NULL ni DEFAULT: sede = NULL representa un pedido de cliente que
@@ -426,13 +301,10 @@ CREATE TABLE IF NOT EXISTS fichas_tecnicas (
   descripcion TEXT,
   -- Activa/inactiva. El resto de columnas del formulario (categoria_prep,
   -- porciones, tiempo_prep, costo_estimado, notas, resumen_prep,
-  -- preparacion, vaso_insumo_id/cantidad_vaso, lleva_pitillo/
-  -- pitillo_insumo_id/cantidad_pitillo) se agregan vía migración en
-  -- config/db.js para no reescribir un CREATE TABLE que ya corrió en
-  -- instalaciones existentes; "estado" se trae aquí porque el índice único
-  -- de abajo la necesita desde la creación de la tabla. Vaso y pitillo son
-  -- insumos NORMALES (con su propia unidad — vaso típicamente 'oz', pitillo
-  -- típicamente 'unidad'), nunca un tipo especial.
+  -- preparacion, vaso_id) se agregan vía migración en config/db.js para
+  -- no reescribir un CREATE TABLE que ya corrió en instalaciones
+  -- existentes; "estado" se trae aquí porque el índice único de abajo la
+  -- necesita desde la creación de la tabla.
   estado      BOOLEAN NOT NULL DEFAULT TRUE,
   created_at  TIMESTAMP DEFAULT NOW()
 );
