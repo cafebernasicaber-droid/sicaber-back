@@ -16,6 +16,9 @@ const {
 // Vocabulario y derivación del "tipo de preparación" de una ficha técnica a
 // partir de la categoría del producto. Ver config/tiposPreparacion.js.
 const { resolverTipoPreparacion } = require('../config/tiposPreparacion');
+// Asignación automática de local (sede) para pedidos a domicilio, según la
+// comuna de la dirección de entrega. Ver src/services/geocoding.js.
+const { determinarSedePorDireccion, extraerNumeroComuna } = require('../services/geocoding');
 
 const r = express.Router();
 
@@ -2422,6 +2425,44 @@ pedRouter.post('/', async (req, res) => {
     }
     const estadoInicial = comprobanteImgFinal ? 'pendiente_verificacion' : (estadoSolicitado || 'pendiente');
 
+    // Asignación de sede por dirección — solo aplica a domicilio (tipo
+    // distinto de 'local'; ver arriba). No se ejecuta si el body ya trae
+    // una sede explícita (ej. el cajero/admin la está fijando a mano).
+    let sedeAsignadaAuto = null;
+    const direccionAlternativaFinal = direccion_alternativa || meta.direccionAlternativa || null;
+    if (tipoFinal !== 'local' && !(sede || meta.sede)) {
+      let comunaDirecta = null;
+      let direccionParaGeocodificar = direccionAlternativaFinal;
+
+      if (!direccionParaGeocodificar && cliente_id) {
+        const { rows: clienteRows } = await pool.query(
+          `SELECT comuna, direccion FROM clientes WHERE id=$1`, [cliente_id]
+        );
+        if (clienteRows[0]) {
+          comunaDirecta = extraerNumeroComuna(clienteRows[0].comuna);
+          if (comunaDirecta == null) direccionParaGeocodificar = clienteRows[0].direccion || null;
+        }
+      }
+
+      if (comunaDirecta != null) {
+        const COBERTURA_POR_COMUNA = { 8: 'Local 2', 9: 'Local 1' };
+        sedeAsignadaAuto = COBERTURA_POR_COMUNA[comunaDirecta] || null;
+        if (!sedeAsignadaAuto) {
+          return res.status(400).json({ error: `Tu comuna (${comunaDirecta}) no está cubierta por ningún local para domicilio.` });
+        }
+      } else if (direccionParaGeocodificar) {
+        const resultado = await determinarSedePorDireccion(direccionParaGeocodificar);
+        if (!resultado.cubierto) {
+          return res.status(400).json({ error: 'La dirección de entrega está fuera de la zona de cobertura para domicilio.' });
+        }
+        sedeAsignadaAuto = resultado.sede;
+      }
+      // Si no hay ninguna dirección disponible (ni direccion_alternativa ni
+      // dirección/comuna del cliente), no se bloquea el pedido acá: sigue
+      // el comportamiento previo (queda sin sede, sin reclamar) — ver el
+      // comentario en el bloque de sede más abajo.
+    }
+
     const { rows } = await pool.query(
       `INSERT INTO pedidos(cliente_id,numero,cliente,tipo,pago,mesa,total,items,comprobante,comprobante_img,comprobante_hash,origen,direccion_alternativa,hora,estado,barista,domiciliario,sede,local_id)
        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
@@ -2454,7 +2495,7 @@ pedRouter.post('/', async (req, res) => {
         // /pedidos/:id/tomar). Si no llega ninguno y el origen NO es
         // 'landing' (caso raro), se mantiene 'Local 1' como fallback.
         (() => {
-          const sedeFinal = sede || meta.sede || null;
+          const sedeFinal = sede || meta.sede || sedeAsignadaAuto || null;
           if (sedeFinal) return sedeFinal;
           const origenFinal = origen || meta.origen || 'landing';
           return origenFinal === 'landing' ? null : 'Local 1';
