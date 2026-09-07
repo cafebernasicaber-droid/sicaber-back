@@ -232,6 +232,22 @@ const migrar = async () => {
        created_at TIMESTAMP DEFAULT NOW()
      )`,
     `INSERT INTO tipos_presentacion (nombre) VALUES ('Caja'), ('Paquete'), ('Bolsa') ON CONFLICT (nombre) DO NOTHING`,
+    // Catálogo de ciudades para Proveedores — pensado para escalabilidad
+    // (hoy los proveedores son todos de Medellín, pero el negocio ya
+    // prevé necesitar registrar proveedores de otras ciudades a futuro).
+    // Mismo patrón que tipos_presentacion: sin DELETE, solo desactivar.
+    `CREATE TABLE IF NOT EXISTS ciudades (
+       id         SERIAL PRIMARY KEY,
+       nombre     VARCHAR(100) NOT NULL UNIQUE,
+       estado     VARCHAR(20)  NOT NULL DEFAULT 'Activo',
+       created_at TIMESTAMP DEFAULT NOW()
+     )`,
+    `INSERT INTO ciudades (nombre) VALUES
+       ('Medellín'), ('Bogotá'), ('Cali'), ('Barranquilla'), ('Cartagena'),
+       ('Cúcuta'), ('Bucaramanga'), ('Pereira'), ('Santa Marta'), ('Ibagué'),
+       ('Pasto'), ('Manizales'), ('Neiva'), ('Villavicencio'), ('Armenia'),
+       ('Valledupar')
+     ON CONFLICT (nombre) DO NOTHING`,
     // Compras: el formulario siempre mandó observaciones y los datos del
     // comprobante (url, si quedó verificado, el total leído por OCR), pero
     // esas columnas nunca existieron, así que se perdían silenciosamente
@@ -367,6 +383,23 @@ const migrar = async () => {
     // devoluciones más arriba — si necesitas que puedan quedar reactivados
     // de forma permanente, avísame y lo cambio para que corra una sola vez.
     `UPDATE locales SET estado='Inactivo' WHERE nombre IN ('Local Principal', 'Local 2') AND estado <> 'Inactivo'`,
+    // Aislamiento real por local para Insumos y Compras (confirmado con el
+    // negocio: cada insumo pertenece a UN local específico —su propio
+    // stock, no un pool global— y cada compra abastece a un local
+    // específico). Antes esta relación no existía en absoluto en estas 2
+    // tablas; el frontend la asumía sin que el backend la respaldara.
+    //
+    // Se agrega nullable primero, se backfillea TODO lo existente a
+    // "Local 3 Esquinas" (decisión explícita del negocio: reasignar a
+    // mano después lo que en realidad sea de Villa Liliam) y recién
+    // entonces se exige NOT NULL — así el ALTER no falla contra filas ya
+    // existentes sin valor.
+    `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS local_id INTEGER`,
+    `UPDATE insumos SET local_id = (SELECT id FROM locales WHERE nombre = 'Local 3 Esquinas') WHERE local_id IS NULL`,
+    `ALTER TABLE insumos ALTER COLUMN local_id SET NOT NULL`,
+    `ALTER TABLE compras ADD COLUMN IF NOT EXISTS local_id INTEGER`,
+    `UPDATE compras SET local_id = (SELECT id FROM locales WHERE nombre = 'Local 3 Esquinas') WHERE local_id IS NULL`,
+    `ALTER TABLE compras ALTER COLUMN local_id SET NOT NULL`,
     // Pedidos: qué local eligió el cliente para recoger su pedido — solo
     // aplica cuando tipo = 'local' (no aplica a domicilio). Sin REFERENCES
     // en línea por el mismo motivo que toppings.insumo_id: la FK real se
@@ -428,6 +461,40 @@ const migrar = async () => {
     }
   } catch (e) {
     console.error('⚠️  No se pudo crear la FK toppings_insumo_id_fkey (la columna insumo_id sigue utilizable sin ella):', e.message);
+  }
+
+  // Mismo tratamiento para insumos.local_id y compras.local_id — el
+  // aislamiento por local ya se exige a nivel de NOT NULL arriba; esta FK
+  // es la garantía adicional de que ese local_id siempre apunte a un local
+  // real existente.
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'insumos_local_id_fkey'`
+    );
+    if (rows.length === 0) {
+      await pool.query(
+        `ALTER TABLE insumos ADD CONSTRAINT insumos_local_id_fkey
+           FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE RESTRICT`
+      );
+    }
+  } catch (e) {
+    console.error('⚠️  No se pudo crear la FK insumos_local_id_fkey (la columna local_id sigue utilizable sin ella):', e.message);
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'compras_local_id_fkey'`
+    );
+    if (rows.length === 0) {
+      await pool.query(
+        `ALTER TABLE compras ADD CONSTRAINT compras_local_id_fkey
+           FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE RESTRICT`
+      );
+    }
+  } catch (e) {
+    console.error('⚠️  No se pudo crear la FK compras_local_id_fkey (la columna local_id sigue utilizable sin ella):', e.message);
   }
 
   // Mismo tratamiento para adiciones.insumo_id.

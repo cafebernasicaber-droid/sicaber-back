@@ -1413,6 +1413,61 @@ tiposPresentacionRouter.patch('/:id/estado', auth, async (req, res) => {
 });
 r.use('/tipos-presentacion', tiposPresentacionRouter);
 
+// ── CIUDADES (catálogo para Proveedores) ────────────────────────────────
+// Mismo patrón exacto que tipos_presentacion: catálogo gestionable, sin
+// DELETE — desactivar es suficiente, ya que una ciudad puede seguir
+// referenciada por proveedores ya existentes.
+const ciudadesRouter = require('express').Router();
+ciudadesRouter.param('id', validateId);
+ciudadesRouter.get('/', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT * FROM ciudades ORDER BY id ASC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+ciudadesRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'ciudades', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    }
+    const { rows } = await pool.query(`INSERT INTO ciudades(nombre) VALUES($1) RETURNING *`, [nombre]);
+    res.status(201).json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+ciudadesRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la ciudad', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'ciudades', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    }
+    const { rows } = await pool.query(`UPDATE ciudades SET nombre=$1 WHERE id=$2 RETURNING *`, [nombre, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una ciudad con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+ciudadesRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE ciudades SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING *`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/ciudades', ciudadesRouter);
+
 // ── INSUMOS ────────────────────────────────────────────────
 // Alias camelCase → exactamente los nombres que ya usa el frontend
 // (InsumoForm, InsumosPage, VerInsumoPage): antes el backend devolvía
@@ -1427,12 +1482,14 @@ const INSUMO_COLS = `
   i.proveedor_id AS "proveedorId", p.nombre AS proveedor,
   i.categoria_id AS "categoriaId", ci.nombre AS categoria,
   i.es_topping AS "esTopping",
+  i.local_id AS "localId", l.nombre AS "localNombre",
   i.created_at AS "fechaCreacion"
 `;
 const INSUMO_JOINS = `
   FROM insumos i
   LEFT JOIN proveedores p ON i.proveedor_id = p.id
   LEFT JOIN categorias_insumos ci ON i.categoria_id = ci.id
+  LEFT JOIN locales l ON i.local_id = l.id
 `;
 // Unidad de medida REAL del insumo — nunca una presentación de compra
 // (caja, paquete, bolsa, docena). Esas se manejan por ítem al registrar la
@@ -1456,12 +1513,16 @@ insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 // columna. Combinables entre sí y con ?estado=, igual que antes.
 insRouter.get('/', auth, async (req, res) => {
   try {
-  const { estado, q, esTopping } = req.query;
+  const { estado, q, esTopping, local_id } = req.query;
   const condiciones = [];
   const params = [];
   if (estado)    { params.push(estado); condiciones.push(`i.estado = $${params.length}`); }
   if (q)         { params.push(`%${q}%`); condiciones.push(`i.nombre ILIKE $${params.length}`); }
   if (esTopping !== undefined) { params.push(esTopping === 'true'); condiciones.push(`i.es_topping = $${params.length}`); }
+  // Aislamiento por local: cada insumo pertenece a un único local, así que
+  // el frontend siempre debería mandar este filtro al pedir el catálogo
+  // para configurar una compra o para el listado de Gestión de Insumos.
+  if (local_id)  { params.push(Number(local_id)); condiciones.push(`i.local_id = $${params.length}`); }
   const where = condiciones.length ? `WHERE ${condiciones.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} ${where} ORDER BY i.id DESC`, params);
   res.json(rows);
@@ -1476,17 +1537,24 @@ insRouter.get('/:id', auth, async (req, res) => {
 });
 // El nombre de un insumo debe ser único dentro de un mismo proveedor (dos
 // proveedores distintos sí pueden vender un insumo con el mismo nombre).
-const insumoNombreDuplicado = async (nombre, proveedorId, excluirId) => {
+const insumoNombreDuplicado = async (nombre, proveedorId, localId, excluirId) => {
   if (!nombre || !proveedorId) return false;
-  const params = excluirId ? [nombre, proveedorId, excluirId] : [nombre, proveedorId];
-  const cond = excluirId ? 'lower(nombre)=lower($1) AND proveedor_id=$2 AND id<>$3' : 'lower(nombre)=lower($1) AND proveedor_id=$2';
+  const params = excluirId ? [nombre, proveedorId, localId, excluirId] : [nombre, proveedorId, localId];
+  const cond = excluirId
+    ? 'lower(nombre)=lower($1) AND proveedor_id=$2 AND local_id=$3 AND id<>$4'
+    : 'lower(nombre)=lower($1) AND proveedor_id=$2 AND local_id=$3';
   const { rows } = await pool.query(`SELECT id FROM insumos WHERE ${cond} LIMIT 1`, params);
   return !!rows[0];
 };
 
 insRouter.post('/', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping, localId } = req.body;
+  // Aislamiento por local: obligatorio desde la creación, un insumo no
+  // puede existir sin pertenecer a un local (columna NOT NULL en la BD).
+  if (!localId) return res.status(400).json({ error: 'Selecciona el local al que pertenece este insumo.' });
+  const { rows: localValido } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
+  if (!localValido[0]) return res.status(400).json({ error: 'El local seleccionado no existe o no está activo.' });
   // Antes el nombre se insertaba directo: si era solo espacios, ni siquiera
   // llegaba a insumoNombreDuplicado (que sale temprano con !nombre... pero
   // "   " es truthy, así que comparaba espacios contra espacios y guardaba).
@@ -1508,13 +1576,13 @@ insRouter.post('/', auth, async (req, res) => {
   if (activos.length === 0) {
     return res.status(400).json({ error: 'No hay proveedores disponibles. Registra o activa un proveedor antes de crear un insumo.' });
   }
-  if (await insumoNombreDuplicado(nombre, proveedorId, null)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor.' });
+  if (await insumoNombreDuplicado(nombre, proveedorId, localId, null)) {
+    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor en este local.' });
   }
   const { rows } = await pool.query(
-    `INSERT INTO insumos(nombre,categoria_id,unidad,stock,stock_minimo,precio_unitario,proveedor_id,descripcion,estado,es_topping)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
-    [nombre, categoriaId || null, unidadMedida || null, stockActual || 0, stockMinimo || 0, precioUnitario || 0, proveedorId || null, descripcion || null, estado || 'Activo', !!esTopping]
+    `INSERT INTO insumos(nombre,categoria_id,unidad,stock,stock_minimo,precio_unitario,proveedor_id,descripcion,estado,es_topping,local_id)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+    [nombre, categoriaId || null, unidadMedida || null, stockActual || 0, stockMinimo || 0, precioUnitario || 0, proveedorId || null, descripcion || null, estado || 'Activo', !!esTopping, localId]
   );
   const { rows: full } = await pool.query(`SELECT ${INSUMO_COLS} ${INSUMO_JOINS} WHERE i.id=$1`, [rows[0].id]);
   res.status(201).json(full[0]);
@@ -1522,7 +1590,7 @@ insRouter.post('/', auth, async (req, res) => {
 });
 insRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping } = req.body;
+  const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, proveedorId, descripcion, estado, esTopping, localId } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del insumo', LIMITES.NOMBRE);
   if (errorNom) return res.status(400).json({ error: errorNom });
   const errorDesc = errorLongitud(descripcion, 'La descripción del insumo', LIMITES.DESCRIPCION);
@@ -1534,15 +1602,22 @@ insRouter.put('/:id', auth, async (req, res) => {
   // unidad distinta a la actual, sin ninguna conversión. Se rechaza
   // cualquier intento de mandar un valor distinto al que ya tiene guardado
   // (incluso si el nuevo valor es, por sí solo, una unidad válida).
-  const { rows: actual } = await pool.query('SELECT unidad FROM insumos WHERE id=$1', [req.params.id]);
+  const { rows: actual } = await pool.query('SELECT unidad, local_id FROM insumos WHERE id=$1', [req.params.id]);
   if (!actual[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const unidadEnviada = unidadMedida || null;
   if (unidadEnviada !== actual[0].unidad) {
     return res.status(400).json({ error: 'La unidad de medida no se puede modificar después de creado el insumo.' });
   }
+  // El local también es inmutable, por el mismo motivo de fondo: el stock
+  // ya acumulado y el historial de compras de este insumo pertenecen a un
+  // local específico — "mover" un insumo de local dejaría ese historial
+  // apuntando al local equivocado.
+  if (localId && Number(localId) !== Number(actual[0].local_id)) {
+    return res.status(400).json({ error: 'El local de un insumo no se puede modificar después de creado. Crea un insumo nuevo en el local correcto.' });
+  }
 
-  if (await insumoNombreDuplicado(nombre, proveedorId, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor.' });
+  if (await insumoNombreDuplicado(nombre, proveedorId, actual[0].local_id, req.params.id)) {
+    return res.status(400).json({ error: 'Ya existe un insumo con este nombre para este proveedor en este local.' });
   }
   const { rows } = await pool.query(
     `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,stock_minimo=$4,precio_unitario=$5,proveedor_id=$6,descripcion=$7,estado=$8,es_topping=$9
@@ -1591,29 +1666,30 @@ r.use('/insumos', insRouter);
 // proveedor y las fechas se veían vacíos en toda la sección de Compras.
 const COMPRA_COLS = `
   c.id, c.codigo, c.proveedor_id AS "proveedorId", p.nombre AS "proveedorNombre",
+  c.local_id AS "localId", l.nombre AS "localNombre",
   c.fecha, c.descuento, c.total, c.estado, c.observaciones, c.items,
   c.comprobante_url, c.comprobante_verificado, c.comprobante_total_ocr,
   c.ocr_resultado AS "ocrResultado",
   c.motivo_anulacion AS "motivoAnulacion",
   c.created_at AS "fechaCreacion", c.fecha_anulacion AS "fechaAnulacion"
 `;
-const COMPRA_JOINS = `FROM compras c LEFT JOIN proveedores p ON c.proveedor_id = p.id`;
+const COMPRA_JOINS = `FROM compras c LEFT JOIN proveedores p ON c.proveedor_id = p.id LEFT JOIN locales l ON c.local_id = l.id`;
 
 // Ajusta el stock de un insumo buscándolo por nombre (el formulario de
 // Compras solo guarda el nombre del insumo en cada ítem, no su id).
 // delta > 0 suma stock (al registrar la compra), delta < 0 lo resta (al
 // anularla) sin dejarlo nunca negativo.
-const ajustarStockInsumo = async (nombreInsumo, delta) => {
-  if (!nombreInsumo) return;
+const ajustarStockInsumo = async (nombreInsumo, delta, localId) => {
+  if (!nombreInsumo || !localId) return;
   if (delta >= 0) {
     await pool.query(
-      `UPDATE insumos SET stock = COALESCE(stock,0) + $1 WHERE lower(nombre) = lower($2)`,
-      [delta, nombreInsumo]
+      `UPDATE insumos SET stock = COALESCE(stock,0) + $1 WHERE lower(nombre) = lower($2) AND local_id = $3`,
+      [delta, nombreInsumo, localId]
     );
   } else {
     await pool.query(
-      `UPDATE insumos SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE lower(nombre) = lower($2)`,
-      [delta, nombreInsumo]
+      `UPDATE insumos SET stock = GREATEST(COALESCE(stock,0) + $1, 0) WHERE lower(nombre) = lower($2) AND local_id = $3`,
+      [delta, nombreInsumo, localId]
     );
   }
 };
@@ -1929,7 +2005,11 @@ const generarCodigoCompra = async () => {
 const compRouter = require('express').Router();
 compRouter.get('/', auth, async (req, res) => {
   try {
-  const { rows } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE c.estado='activa' ORDER BY c.id DESC`);
+  const { local_id } = req.query;
+  const params = [];
+  let cond = `c.estado='activa'`;
+  if (local_id) { params.push(Number(local_id)); cond += ` AND c.local_id = $${params.length}`; }
+  const { rows } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE ${cond} ORDER BY c.id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1943,11 +2023,15 @@ compRouter.get('/historial', auth, async (req, res) => {
   try {
   const diasParam = Number(req.query.dias);
   const dias = Number.isFinite(diasParam) && diasParam > 0 ? diasParam : 30;
+  const { local_id } = req.query;
+  const params = [dias];
+  let cond = `(c.fecha < (CURRENT_DATE - $1::int) OR c.estado = 'anulada')`;
+  if (local_id) { params.push(Number(local_id)); cond += ` AND c.local_id = $${params.length}`; }
   const { rows } = await pool.query(
     `SELECT ${COMPRA_COLS} ${COMPRA_JOINS}
-     WHERE c.fecha < (CURRENT_DATE - $1::int) OR c.estado = 'anulada'
+     WHERE ${cond}
      ORDER BY c.id DESC`,
-    [dias]
+    params
   );
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1964,9 +2048,16 @@ compRouter.post('/', auth, async (req, res) => {
   // El formulario manda proveedorId en camelCase (no proveedor_id): antes
   // esto se leía mal y el proveedor de la compra quedaba siempre en NULL.
   const {
-    proveedorId, fecha, total, descuento, items, observaciones,
+    proveedorId, fecha, total, descuento, items, observaciones, localId,
     comprobante_url, comprobante_verificado, comprobante_total_ocr, ocr_resultado,
   } = req.body;
+
+  // Aislamiento por local: toda compra abastece a un local específico, y
+  // solo puede sumar stock a insumos de ESE mismo local (columna NOT NULL
+  // en la BD, ver migración de db.js).
+  if (!localId) return res.status(400).json({ error: 'Selecciona el local que recibe esta compra.' });
+  const { rows: localValido } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
+  if (!localValido[0]) return res.status(400).json({ error: 'El local seleccionado no existe o no está activo.' });
 
   // Una compra es un hecho ya ocurrido: no se puede registrar con una
   // fecha posterior al día de hoy. El frontend ya bloquea esto en el
@@ -2010,6 +2101,19 @@ compRouter.post('/', auth, async (req, res) => {
     if (errorItem) return res.status(400).json({ error: `Ítem inválido: ${errorItem}` });
   }
 
+  // Ningún ítem puede referirse a un insumo que pertenezca a OTRO local —
+  // si no, la compra sumaría stock a un insumo que en realidad vive en el
+  // inventario del local equivocado.
+  for (const it of (items || [])) {
+    const { rows: insumoLocal } = await pool.query(
+      `SELECT id FROM insumos WHERE lower(nombre) = lower($1) AND local_id = $2`,
+      [it.insumo, localId]
+    );
+    if (!insumoLocal[0]) {
+      return res.status(400).json({ error: `"${it.insumo}" no es un insumo registrado en el local seleccionado.` });
+    }
+  }
+
   // El código legible (ej. "CMP-2026-0001") lo genera siempre el backend,
   // nunca lo manda el cliente. Se reintenta unas pocas veces por si dos
   // compras casi simultáneas llegan a calcular el mismo consecutivo
@@ -2021,13 +2125,13 @@ compRouter.post('/', auth, async (req, res) => {
     const codigo = await generarCodigoCompra();
     try {
       const { rows } = await pool.query(
-        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,ocr_resultado,estado)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'activa') RETURNING id`,
+        `INSERT INTO compras(codigo,proveedor_id,fecha,descuento,total,items,observaciones,comprobante_url,comprobante_verificado,comprobante_total_ocr,ocr_resultado,estado,local_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'activa',$12) RETURNING id`,
         [
           codigo, proveedorId || null, fecha || new Date(), descuentoNum, totalFinal,
           JSON.stringify(items || []), observaciones || null, comprobante_url || null,
           comprobante_verificado || false, comprobante_total_ocr ?? null,
-          ocr_resultado ? JSON.stringify(ocr_resultado) : null,
+          ocr_resultado ? JSON.stringify(ocr_resultado) : null, localId,
         ]
       );
       compraId = rows[0].id;
@@ -2043,7 +2147,7 @@ compRouter.post('/', auth, async (req, res) => {
   // Sumar al stock de cada insumo comprado — convertido a su unidad real
   // si el ítem vino en modo "presentacion" (ver calcularCantidadStock).
   for (const it of (items || [])) {
-    await ajustarStockInsumo(it.insumo, calcularCantidadStock(it));
+    await ajustarStockInsumo(it.insumo, calcularCantidadStock(it), localId);
   }
   const { rows: full } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE c.id=$1`, [compraId]);
   res.status(201).json(full[0]);
@@ -2060,16 +2164,17 @@ compRouter.patch('/:id/anular', auth, async (req, res) => {
   const errorMotivo = errorLongitud(motivo, 'El motivo de anulación', LIMITES.MOTIVO);
   if (errorMotivo) return res.status(400).json({ error: errorMotivo });
 
-  const { rows: actual } = await pool.query('SELECT estado, items FROM compras WHERE id=$1', [req.params.id]);
+  const { rows: actual } = await pool.query('SELECT estado, items, local_id FROM compras WHERE id=$1', [req.params.id]);
   if (!actual[0]) return res.status(404).json({ error: 'Compra no encontrada' });
   if (actual[0].estado === 'anulada') return res.status(400).json({ error: 'Esta compra ya está anulada.' });
 
   // Revertir el stock que esta compra había sumado — con la misma cuenta
   // que se usó al crearla (los ítems guardados ya traen modo/
   // tipo_presentacion/etc., así que un ítem en cajas se revierte en la
-  // unidad real del insumo, no en cajas).
+  // unidad real del insumo, no en cajas), en el mismo local al que
+  // perteneció la compra.
   for (const it of (actual[0].items || [])) {
-    await ajustarStockInsumo(it.insumo, -calcularCantidadStock(it));
+    await ajustarStockInsumo(it.insumo, -calcularCantidadStock(it), actual[0].local_id);
   }
 
   await pool.query(
