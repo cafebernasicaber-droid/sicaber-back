@@ -4,42 +4,53 @@ const cors    = require('cors');
 
 const app = express();
 
-// Orígenes fijos de desarrollo local + los dos patrones que cubren
-// localhost (cualquier puerto) y los túneles de VS Code Ports/Codespaces
-// (dominio "https://<id-aleatorio>-<puerto>.app.github.dev", donde el
-// <id-aleatorio> cambia cada vez que se reinicia el túnel).
-const CORS_ORIGENES_ESTATICOS = ['http://localhost:3000', 'http://localhost:5000', 'https://sicaber-front.onrender.com'];
+// Orígenes fijos de desarrollo local y de los frontends desplegados, más
+// los patrones que cubren localhost (cualquier puerto), los túneles de VS
+// Code Ports/Codespaces (dominio "https://<id>-<puerto>.app.github.dev",
+// donde el <id> cambia al reiniciar el túnel) y los dominios de Vercel.
+const CORS_ORIGENES_ESTATICOS = [
+  'http://localhost:3000',
+  'http://localhost:5000',
+  'https://sicaber-front.onrender.com',
+];
+
+// Orígenes adicionales definidos por entorno, separados por comas. Permite
+// autorizar un dominio nuevo desde el panel de Render sin volver a
+// desplegar el código. Ejemplo:
+//   CORS_ORIGENES_EXTRA=https://sicaber.vercel.app,https://midominio.com
+const CORS_ORIGENES_EXTRA = (process.env.CORS_ORIGENES_EXTRA || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
 const CORS_REGEX_LOCALHOST = /^http:\/\/localhost:\d+$/;
 const CORS_REGEX_TUNNEL = /^https:\/\/[a-z0-9-]+\.app\.github\.dev$/;
+// Vercel genera un dominio distinto por cada despliegue de vista previa
+// (por rama, por pull request), no solo el de producción. Sin este patrón
+// solo funcionaría la URL principal y cualquier preview quedaría bloqueada.
+const CORS_REGEX_VERCEL = /^https:\/\/[a-z0-9-]+\.vercel\.app$/;
 
 app.use(cors({
-  // Antes `origin` era un array estático: la librería `cors` compara el
-  // Origin recibido contra esa lista/esos regex internamente, pero eso
-  // pasaba "a ciegas" — no había forma de ver en la terminal cuál era el
-  // Origin exacto que mandaba el túnel ni si el regex lo estaba cubriendo.
-  // Con una función se ejecuta código propio en cada petición, así que se
-  // puede loguear el origin recibido y el resultado antes de decidir.
+  // `origin` es una función y no un array para poder registrar los
+  // rechazos: con el array, la librería `cors` decide internamente y no
+  // queda rastro de qué dominio fue bloqueado ni por qué.
   origin(origin, callback) {
     // Peticiones sin header Origin (curl/Postman, llamadas server-to-server,
-    // o el propio navegador en same-origin) no traen nada que validar — se
-    // dejan pasar igual que con el array de antes.
-    if (!origin) {
-      console.log('🌐 CORS: petición sin header Origin (permitida)');
-      return callback(null, true);
-    }
+    // o el propio navegador en same-origin) no traen nada que validar.
+    if (!origin) return callback(null, true);
 
     const permitido =
       CORS_ORIGENES_ESTATICOS.includes(origin) ||
+      CORS_ORIGENES_EXTRA.includes(origin) ||
       CORS_REGEX_LOCALHOST.test(origin) ||
-      CORS_REGEX_TUNNEL.test(origin);
+      CORS_REGEX_TUNNEL.test(origin) ||
+      CORS_REGEX_VERCEL.test(origin);
 
-    // 🔍 DEBUG TEMPORAL: imprime cada Origin que llega y si fue aceptado o
-    // rechazado, para confirmar en la terminal del backend el dominio EXACTO
-    // que manda el túnel y si CORS_REGEX_TUNNEL lo cubre. Bórralo una vez
-    // confirmes que el origen correcto está pasando.
-    console.log(`🌐 CORS origin recibido: "${origin}" → ${permitido ? 'ACEPTADO ✅' : 'RECHAZADO ❌'}`);
-
+    // Solo se registran los RECHAZOS: el log de cada petición aceptada
+    // llenaba los registros de Render con decenas de líneas idénticas sin
+    // aportar nada. Un rechazo sí hay que poder verlo para diagnosticar.
     if (permitido) return callback(null, true);
+    console.warn(`CORS: origen rechazado → "${origin}"`);
     return callback(new Error(`Origen no permitido por CORS: ${origin}`));
   },
   credentials: true
