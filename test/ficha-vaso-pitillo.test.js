@@ -157,16 +157,23 @@ test('una venta descuenta el vaso y el pitillo del stock del local correcto', as
   const stockAntesPitillo = Number(filaDelLocal(antesPitillo, localA).stock);
   const stockAntesIngrediente = Number(filaDelLocal(antesIngrediente, localA).stock);
 
+  // pago: 'nequi' (no 'efectivo') — efectivo ya no aplica a tipo='local'
+  // (ver pedidos-metodo-pago.test.js); se aprueba el comprobante antes de
+  // avanzar de estado para no chocar con el gate de pago.
   const pedido = await api('/pedidos', {
     method: 'POST',
     body: {
-      cliente: 'Cliente test vaso-pitillo', tipo: 'local', pago: 'efectivo', total: 12000,
+      cliente: 'Cliente test vaso-pitillo', alias: `alias-vaso-pitillo-${Date.now()}`, tipo: 'local', pago: 'nequi',
+      comprobante_img: `data:text/plain;base64,vaso-pitillo-${Date.now()}`, total: 12000,
       items: [{ id: productoId, nombre: productoNombre, cantidad: 1, precio: 12000 }],
       origen: 'admin', local_id: localA,
     },
   });
   assert.equal(pedido.status, 201, JSON.stringify(pedido.data));
   const pedidoId = pedido.data.id;
+
+  const aprobar = await api(`/pedidos/${pedidoId}/comprobante/aprobar`, { method: 'PATCH' });
+  assert.equal(aprobar.status, 200, JSON.stringify(aprobar.data));
 
   for (const estado of ['en_proceso', 'en_camino', 'entregado']) {
     const r = await api(`/pedidos/${pedidoId}/estado`, { method: 'PATCH', body: { estado } });

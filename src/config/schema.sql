@@ -9,6 +9,10 @@ CREATE TABLE IF NOT EXISTS roles (
   descripcion TEXT,
   permisos    JSONB DEFAULT '[]',
   color       VARCHAR(10),
+  -- Activo/Inactivo — desactivar un rol desactiva en cascada a todos los
+  -- usuarios que lo tengan asignado (ver PATCH /roles/:id/estado). No
+  -- existía ningún concepto de "rol inactivo" antes de esto.
+  estado      VARCHAR(20) NOT NULL DEFAULT 'Activo',
   created_at  TIMESTAMP DEFAULT NOW()
 );
 
@@ -40,6 +44,11 @@ UPDATE usuarios SET sede = 'Ambos' WHERE rol = 'Administrador' AND sede = 'Local
 -- La FK se agrega en config/db.js (después de crear la tabla "locales").
 ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS local_id INTEGER;
 
+-- El cliente NO maneja dirección de registro (retirado: direccion, comuna,
+-- departamento, municipio — ver la migración de baja en config/db.js). La
+-- dirección de ENTREGA de un pedido a domicilio es un campo propio del
+-- pedido (pedidos.direccion_alternativa), capturado en el momento, nunca
+-- derivado de este registro.
 CREATE TABLE IF NOT EXISTS clientes (
   id          SERIAL PRIMARY KEY,
   nombre      VARCHAR(150) NOT NULL,
@@ -48,13 +57,33 @@ CREATE TABLE IF NOT EXISTS clientes (
   telefono    VARCHAR(30),
   tipo_doc    VARCHAR(60),
   numero_doc  VARCHAR(30),
-  departamento VARCHAR(80),
-  municipio   VARCHAR(80),
-  comuna      VARCHAR(80),
-  direccion   VARCHAR(200),
   estado      VARCHAR(20)  NOT NULL DEFAULT 'Activo',
+  -- username/verificado: los usa routes/auth.js (registro/verificar/login
+  -- de cliente) — antes solo existían en la base real, agregadas a mano
+  -- fuera de todo control de versiones; ver la migración equivalente en
+  -- db.js para bases que ya existían sin ellas.
+  username    VARCHAR(100) UNIQUE,
+  verificado  BOOLEAN NOT NULL DEFAULT false,
   created_at  TIMESTAMP DEFAULT NOW()
 );
+
+-- Códigos de un solo uso para verificar el registro de un cliente y para
+-- recuperación de contraseña (routes/auth.js: /cliente/registro,
+-- /cliente/verificar, /cliente/recuperar, /cliente/reset-password). Igual
+-- que username/verificado de clientes: existía en la base real (agregada a
+-- mano) pero nunca quedó definida acá — en cualquier base nueva, TODO el
+-- flujo de registro/recuperación de clientes fallaba con un 500 crudo
+-- ("no existe la relación «tokens_verificacion»").
+CREATE TABLE IF NOT EXISTS tokens_verificacion (
+  id          SERIAL PRIMARY KEY,
+  correo      VARCHAR(120) NOT NULL,
+  token       VARCHAR(6) NOT NULL,
+  tipo        VARCHAR(20) NOT NULL CHECK (tipo IN ('registro', 'recuperacion')),
+  usado       BOOLEAN DEFAULT false,
+  expires_at  TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '15 minutes'),
+  created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_tokens_correo ON tokens_verificacion(correo);
 
 CREATE TABLE IF NOT EXISTS empleados (
   id          SERIAL PRIMARY KEY,
@@ -81,6 +110,13 @@ CREATE TABLE IF NOT EXISTS categorias (
   id          SERIAL PRIMARY KEY,
   nombre      VARCHAR(100) NOT NULL UNIQUE,
   descripcion TEXT,
+  -- URL de imagen (mismo criterio que productos.imagen/combos.imagen: el
+  -- backend no procesa el archivo, solo guarda la URL que ya subió el
+  -- frontend a donde suba productos/combos). Se muestra junto al nombre de
+  -- la categoría en la vista del cliente (GET /categorias, y como
+  -- "categoriaImagen" en GET /productos — productos.categoria guarda el
+  -- NOMBRE de la categoría, no su id, así que ese es el único join posible).
+  imagen      TEXT,
   estado      VARCHAR(20)  NOT NULL DEFAULT 'Activo',
   created_at  TIMESTAMP DEFAULT NOW()
 );
@@ -182,27 +218,24 @@ CREATE TABLE IF NOT EXISTS insumos (
   unidad          VARCHAR(50) CHECK (unidad IN ('kg','g','lb','oz','L','mL','unidad')),
   precio_unitario NUMERIC(10,2) DEFAULT 0,
   estado          VARCHAR(20) NOT NULL DEFAULT 'Activo',
-  -- categoria_id/descripcion: agregadas por ALTER en config/db.js (junto
-  -- con la tabla "categorias_insumos", que se crea ahí, no acá) — no se
-  -- duplican en este CREATE TABLE para no adelantarse a esa migración.
-  -- Tipo de uso del insumo — un insumo puede ser uno, dos o los tres a la
-  -- vez, pero AL MENOS uno debe quedar en true (ver insumos_tipo_uso_check
-  -- más abajo). "Empaques" (vasos/pitillos/desechables) NUNCA se crean acá:
-  -- ver categoria_id bloqueado a la categoría "Empaques" en POST/PUT
-  -- /insumos (routes/index.js) y la tabla "empaques" más abajo.
-  -- Definiciones (ver auditoría en CAMBIOS.md): "topping" = adición
-  -- GRATUITA y opcional dentro de la ficha técnica (la tabla "toppings"
-  -- nunca tiene columna de precio); "adición" = extra que el cliente
-  -- agrega y que SÍ tiene costo (la tabla "adiciones" sí tiene "precio").
-  -- Esta columna se llamó "es_adicion_sin_costo" hasta que se corrigió el
-  -- nombre (contradecía la definición real de "adición").
-  es_insumo   BOOLEAN NOT NULL DEFAULT TRUE,  -- ingrediente normal de receta
-  es_adicion  BOOLEAN NOT NULL DEFAULT FALSE, -- candidato a ingrediente de una Adición (con costo)
-  es_topping  BOOLEAN NOT NULL DEFAULT FALSE, -- candidato a ingrediente de un Topping (gratuito)
+  -- categoria_id/descripcion/observaciones: agregadas por ALTER en
+  -- config/db.js (junto con la tabla "categorias_insumos", que se crea ahí,
+  -- no acá) — no se duplican en este CREATE TABLE para no adelantarse a esa
+  -- migración. "observaciones" es texto libre editable (ej. deja constancia
+  -- del stock inicial con que se creó el insumo — ver POST /insumos).
+  -- "Empaques" (vasos/pitillos/desechables) NUNCA se crean acá: ver
+  -- categoria_id bloqueado a la categoría "Empaques" en POST/PUT /insumos
+  -- (routes/index.js) y la tabla "empaques" más abajo.
+  --
+  -- Ya NO existen es_insumo/es_adicion/es_topping (ni el CHECK
+  -- insumos_tipo_uso_check que los amarraba): eran flags puramente
+  -- informativos/de filtro que NUNCA condicionaron el descuento de stock —
+  -- la decisión real de qué insumo usa un topping o una adición siempre
+  -- vivió (y sigue viviendo) en toppings.insumo_id / adiciones.insumo_id.
+  -- Cualquier insumo Activo es candidato para cualquier cosa; ver la
+  -- migración de baja en config/db.js.
   created_at      TIMESTAMP DEFAULT NOW()
 );
-ALTER TABLE insumos ADD CONSTRAINT insumos_tipo_uso_check
-  CHECK (es_insumo OR es_adicion OR es_topping);
 -- Nombre de insumo único GLOBALMENTE (un solo registro de catálogo, sin
 -- importar en cuántos locales tenga stock — ver insumo_local).
 CREATE UNIQUE INDEX IF NOT EXISTS insumos_nombre_uidx ON insumos (lower(btrim(nombre)));
@@ -309,12 +342,45 @@ INSERT INTO locales (nombre, direccion)
   ) AS v(nombre, direccion)
   WHERE NOT EXISTS (SELECT 1 FROM locales WHERE locales.nombre = v.nombre);
 
+-- Métodos de pago dinámicos que ofrece el checkout de la Landing — ver
+-- metodoPagoRouter en routes/index.js. Independiente del identificador
+-- interno fijo de pedidos.pago (efectivo/nequi/transferencia): esto es
+-- solo el catálogo administrable de QUÉ se muestra (nombre + descripción
+-- + QR opcional), no reemplaza ni valida ese CHECK existente.
+CREATE TABLE IF NOT EXISTS metodos_pago (
+  id                  SERIAL PRIMARY KEY,
+  nombre              VARCHAR(100) NOT NULL UNIQUE,
+  descripcion         TEXT,
+  -- URL del QR (subido por el frontend directo a Cloudinary, mismo
+  -- mecanismo que ya usa un comprobante de compra) — texto simple, opcional.
+  url_qr              TEXT,
+  activo              BOOLEAN NOT NULL DEFAULT true,
+  fecha_actualizacion TIMESTAMP DEFAULT NOW(),
+  created_at          TIMESTAMP DEFAULT NOW()
+);
+
 -- FK reales de insumo_local/empaque_local/movimientos_inventario.local_id
 -- (declaradas sin REFERENCES en línea más arriba porque "locales" se crea
--- recién acá).
-ALTER TABLE insumo_local          ADD CONSTRAINT insumo_local_local_id_fkey          FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
-ALTER TABLE empaque_local         ADD CONSTRAINT empaque_local_local_id_fkey         FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
-ALTER TABLE movimientos_inventario ADD CONSTRAINT movimientos_inventario_local_id_fkey FOREIGN KEY (local_id) REFERENCES locales(id);
+-- recién acá). Postgres no tiene "ADD CONSTRAINT IF NOT EXISTS" — se envuelve
+-- en un bloque DO que ignora el error "ya existe" (duplicate_object), para
+-- que este archivo se pueda ejecutar más de una vez sin fallar (ver
+-- config/db.js: migrar() lo corre en CADA arranque, no solo en una
+-- instalación nueva).
+DO $$ BEGIN
+  ALTER TABLE insumo_local ADD CONSTRAINT insumo_local_local_id_fkey
+    FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE empaque_local ADD CONSTRAINT empaque_local_local_id_fkey
+    FOREIGN KEY (local_id) REFERENCES locales(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+DO $$ BEGIN
+  ALTER TABLE movimientos_inventario ADD CONSTRAINT movimientos_inventario_local_id_fkey
+    FOREIGN KEY (local_id) REFERENCES locales(id);
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 -- Qué vaso usa cada producto/tamaño y si lleva pitillo (y cuál) —
 -- requisito 4. "tamano" es opcional: NULL representa la configuración por
@@ -335,6 +401,12 @@ CREATE TABLE IF NOT EXISTS pedidos (
   cliente_id           INTEGER REFERENCES clientes(id) ON DELETE SET NULL,
   numero               VARCHAR(30),
   cliente              VARCHAR(150),
+  -- Alias único (mientras el pedido siga activo) para pedidos SIN
+  -- cliente_id (mostrador/mesa) — distingue a dos clientes con el mismo
+  -- nombre que tienen un pedido abierto a la vez (ej. "Juan - mesa 3").
+  -- Ver aliasEnUso en routes/index.js. NULL para pedidos de un cliente
+  -- registrado (cliente_id), que ya tienen un identificador real.
+  alias                VARCHAR(100),
   tipo                 VARCHAR(30),
   -- Qué local eligió el cliente para recoger su pedido — solo aplica
   -- cuando tipo = 'local' (no aplica a domicilio). Ver GET /api/locales y
@@ -347,6 +419,14 @@ CREATE TABLE IF NOT EXISTS pedidos (
   -- pedidos previos que puedan violar este CHECK, así que acá no hace
   -- falta el NOT VALID que sí usa la migración de config/db.js.
   pago                 VARCHAR(30) CHECK (pago IS NULL OR pago IN ('efectivo','nequi','transferencia')),
+  -- Método de pago que el cliente indica que usará AL RECOGER en el local
+  -- (texto libre, o el nombre de uno de los metodos_pago ya configurados —
+  -- sin FK a propósito, igual de independiente que "pago" lo es de esa
+  -- tabla). Solo aplica a tipo='local' — ver POST/PUT /pedidos en
+  -- routes/index.js, que lo rechaza para domicilio y lo deja en NULL si
+  -- el tipo resultante es 'domicilio'. No reemplaza a "pago" (que sigue
+  -- su propio flujo de comprobante/verificación sin cambios).
+  metodo_pago_local    VARCHAR(150),
   mesa                 VARCHAR(100),
   estado               VARCHAR(40) NOT NULL DEFAULT 'pendiente',
   total                NUMERIC(12,2) DEFAULT 0,
@@ -464,10 +544,22 @@ ON CONFLICT (username) DO NOTHING;
 -- siempre devolvía false, así que el login fallaba con 401 incluso usando
 -- las credenciales correctas. Esto corrige el admin ya existente en bases
 -- de datos donde el INSERT de arriba no hizo nada por el ON CONFLICT.
+--
+-- IMPORTANTE (bug real, corregido acá): esto ANTES era un UPDATE sin
+-- condición sobre la contraseña — inofensivo mientras schema.sql nunca se
+-- ejecutaba (ver config/db.js), pero desde que sí corre en cada arranque
+-- (para poder levantar una base de datos de test desde cero), un UPDATE
+-- sin condición habría PISADO la contraseña del admin en cada reinicio del
+-- servidor, aunque alguien ya la hubiera cambiado legítimamente desde la
+-- app. Se agrega la misma condición que ya usa la migración equivalente
+-- en config/db.js: solo corrige si la contraseña sigue siendo,
+-- exactamente, ese hash roto original — nunca pisa una ya cambiada.
 UPDATE usuarios SET password = '$2a$10$WiPwsGfRH1tkyKk7qCf8vO5dsdHzXM.V6.36qSgSD7bONrH.A8Wri'
-WHERE username = 'Admin_Sicaber';
+WHERE username = 'Admin_Sicaber'
+  AND password = '$2a$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi';
 
 -- Si la base de datos ya existía de antes (con el admin ya creado pero sin
 -- la columna es_superadmin), marcamos aquí ese mismo usuario como
--- Superadministrador. No crea un usuario nuevo, solo actualiza el flag.
-UPDATE usuarios SET es_superadmin = TRUE WHERE username = 'Admin_Sicaber';
+-- Superadministrador. No crea un usuario nuevo, solo actualiza el flag —
+-- y solo si hiciera falta (evita un UPDATE de no-op en cada arranque).
+UPDATE usuarios SET es_superadmin = TRUE WHERE username = 'Admin_Sicaber' AND es_superadmin IS NOT TRUE;

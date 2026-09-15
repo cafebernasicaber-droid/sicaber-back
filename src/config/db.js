@@ -1,5 +1,7 @@
 require('dotenv').config();
 const { Pool, types } = require('pg');
+const fs = require('fs');
+const path = require('path');
 
 // node-postgres, por defecto, devuelve toda columna NUMERIC/DECIMAL como
 // STRING (OID 1700) — es un comportamiento documentado de la librería para
@@ -14,17 +16,9 @@ const { Pool, types } = require('pg');
 // (productos.precio, adiciones.precio, toppings.cantidad, compras.total,
 // insumos.stock, fichas_tecnicas.costo_estimado, etc.), en vez de andar
 // convirtiéndolo a mano ruta por ruta.
-types.setTypeParser(1700, (val) => (val === null ? null : parseFloat(val)));
-
 const pool = new Pool({
-  host:     process.env.DB_HOST,
-  port:     Number(process.env.DB_PORT),
-  database: process.env.DB_NAME,
-  user:     process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  // Evita que una conexión inactiva se quede colgada indefinidamente si el
-  // servidor de Postgres la cierra por su lado (frecuente en redes
-  // inestables o en instancias remotas que duermen por inactividad).
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
 });
@@ -39,6 +33,41 @@ pool.on('error', (err) => {
   console.error('⚠️  Error en una conexión inactiva del pool (no se detiene el servidor):', err.message);
 });
 
+// ── BASE del esquema (schema.sql) ────────────────────────────────────────
+// BUG REAL encontrado al armar una base de datos de test dedicada
+// (requisito 1, ver CAMBIOS.md): schema.sql NUNCA se ejecutaba desde
+// ningún lado — era solo un archivo de referencia que los comentarios de
+// este mismo archivo citaban ("ver schema.sql") sin que nada lo corriera.
+// db.js (este archivo) crea con CREATE TABLE IF NOT EXISTS unas pocas
+// tablas nuevas de cada ronda, pero NUNCA definió las ~10 tablas base
+// (usuarios, clientes, productos, pedidos, ventas, compras, locales,
+// etc.) — esas solo existían en schema.sql. Resultado: esta app NUNCA
+// pudo arrancar sola contra una base de datos realmente vacía; dependía
+// de que alguien hubiera corrido schema.sql a mano, una vez, hace tiempo,
+// contra la base de "sicaber" — y de que nadie más volviera a necesitar
+// arrancar de cero (como sí hace falta para una base de test dedicada).
+//
+// Se corrige ejecutando este archivo acá, en CADA arranque, antes de
+// "migrar()". Es seguro repetirlo contra una base YA POBLADA (como la de
+// desarrollo): todas las sentencias son idempotentes a propósito
+// (CREATE TABLE IF NOT EXISTS, ADD COLUMN IF NOT EXISTS, INSERT ...
+// ON CONFLICT/WHERE NOT EXISTS, y los ADD CONSTRAINT de FK envueltos en
+// un bloque DO que ignora "ya existe" — ver el propio schema.sql). Contra
+// una base vacía (sicaber_test, scripts/preparar-base-test.js) esto
+// construye TODO desde cero; contra la de desarrollo, no cambia nada.
+const ejecutarSchemaBase = async () => {
+  const ruta = path.join(__dirname, 'schema.sql');
+  const sql = fs.readFileSync(ruta, 'utf8');
+  try {
+    // node-postgres permite varias sentencias separadas por ";" en un solo
+    // query() de texto plano (protocolo simple) — Postgres las corre como
+    // una única transacción implícita. Como CADA sentencia de schema.sql es
+    // idempotente por sí sola, esto es seguro de repetir siempre.
+    await pool.query(sql);
+  } catch (e) {
+    console.error('⚠️  No se pudo aplicar schema.sql por completo (puede ser normal si la base ya tenía datos que difieren de un fresh-install):', e.message);
+  }
+};
 
 const migrar = async () => {
   const alters = [
@@ -53,6 +82,11 @@ const migrar = async () => {
     // (rolesService.getColor -> COLORES[5]) sin importar qué color se
     // hubiera elegido al crearlo.
     `ALTER TABLE roles ADD COLUMN IF NOT EXISTS color VARCHAR(10)`,
+    // categorias (de PRODUCTO — no confundir con categorias_insumos): URL de
+    // imagen, mismo criterio que productos.imagen/combos.imagen (el
+    // backend nunca procesa el archivo, solo guarda la URL). Se muestra
+    // junto al nombre de la categoría en la vista del cliente.
+    `ALTER TABLE categorias ADD COLUMN IF NOT EXISTS imagen TEXT`,
     // usuarios (login con correo o usuario)
     `ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS correo VARCHAR(150)`,
     // usuarios: marca del Superadministrador único e inmodificable
@@ -207,10 +241,12 @@ const migrar = async () => {
     // del topping) — ver toppingsRouter/fichaRouter y
     // descontarInventarioPorVenta en routes/index.js.
     `ALTER TABLE fichas_tecnicas ADD COLUMN IF NOT EXISTS toppings_ficha JSONB DEFAULT '[]'`,
-    // Insumos: marca puramente informativa/de filtro (no condiciona nada
-    // del backend) para que el frontend pueda sugerir/filtrar insumos que
-    // típicamente se usan como toppings al crear uno nuevo.
-    `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS es_topping BOOLEAN NOT NULL DEFAULT FALSE`,
+    // RETIRADO (ronda de desacople Insumo↔Topping/Adición): "insumos" ya no
+    // tiene es_topping/es_adicion/es_insumo — ver el DROP guardado más abajo
+    // (sección "TIPO DE USO DEL INSUMO — RETIRADO"). Si este ADD COLUMN
+    // siguiera acá, resucitaría la columna en cada arranque después de que
+    // el DROP la elimina (mismo patrón de "columna zombi" ya visto con
+    // es_adicion_sin_costo).
     // Insumos: la tabla nunca tuvo categoría ni descripción, aunque el
     // formulario del frontend siempre las pedía y las mostraba — por eso
     // se perdían al guardar y "Gestionar categorías" no tenía dónde
@@ -224,6 +260,12 @@ const migrar = async () => {
      )`,
     `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS categoria_id INTEGER REFERENCES categorias_insumos(id) ON DELETE SET NULL`,
     `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS descripcion TEXT`,
+    // Nullable, sin default de columna (el default real — "Comenzó con
+    // cantidad existente" — lo decide POST /insumos solo cuando se crea CON
+    // stock inicial y nadie escribió su propio texto; un insumo creado sin
+    // cantidad inicial, o editado después, se queda con lo que el usuario
+    // haya puesto, incluso vacío).
+    `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS observaciones TEXT`,
     // RETIRADO (esta ronda): "insumos.local_id" (cada insumo pertenecía a UN
     // local, una fila completa duplicada por local) ya NO se agrega acá —
     // ver migrarInsumoLocalYEmpaques más abajo, que consolida ese modelo en
@@ -499,28 +541,17 @@ const migrar = async () => {
        UNIQUE(insumo_id, local_id)
      )`,
 
-    // ── TIPO DE USO DEL INSUMO ───────────────────────────────────────────
-    // Un insumo puede servir de más de una forma a la vez: como ingrediente
-    // normal de receta (es_insumo), como candidato de una Adición CON costo
-    // (es_adicion) o como candidato de Topping GRATUITO (es_topping, ya
-    // existía como flag puramente informativo — ahora además filtra de
-    // verdad en GET /insumos?tipo=topping). DEFAULT TRUE en es_insumo para
-    // que los insumos ya existentes (todos usados como ingrediente hasta
-    // hoy) sigan cumpliendo el CHECK "al menos uno en true" sin necesitar
-    // backfill aparte.
+    // ── TIPO DE USO DEL INSUMO — RETIRADO ────────────────────────────────
+    // Este insumo YA NO se marca como "candidato" a ingrediente normal
+    // (es_insumo), Adición con costo (es_adicion) o Topping gratuito
+    // (es_topping): esos tres flags nunca condicionaron el descuento de
+    // stock (siempre lo decidió toppings.insumo_id/adiciones.insumo_id) —
+    // eran puramente un filtro para poblar selectores. Se eliminan las tres
+    // columnas y el CHECK que las acompañaba (ver el DROP guardado más
+    // abajo, junto a la migración de insumo_local): la decisión de qué
+    // insumo usa un topping/adición vive ahora exclusivamente en la propia
+    // configuración del topping/adición.
     //
-    // ⚠️ "es_adicion" se llamó "es_adicion_sin_costo" hasta que se corrigió
-    // el nombre (contradecía la definición real de "Adición": SIEMPRE tiene
-    // costo — ver la auditoría completa en CAMBIOS.md). El paso de creación
-    // de la columna YA NO agrega "es_adicion_sin_costo" (a propósito: si
-    // siguiera acá, cada arranque la resucitaría después de que el paso de
-    // renombrado de más abajo la elimina, dejando dos columnas — una viva
-    // y una zombi siempre en false). Instalaciones que TODAVÍA no pasaron
-    // por el renombrado (nunca tuvieron ninguna de las dos) reciben
-    // "es_adicion" directo, sin pasar por el nombre viejo.
-    `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS es_insumo BOOLEAN NOT NULL DEFAULT TRUE`,
-    `ALTER TABLE insumos ADD COLUMN IF NOT EXISTS es_adicion BOOLEAN NOT NULL DEFAULT FALSE`,
-
     // ── EMPAQUES (vasos, pitillos, desechables) ──────────────────────────
     // Se separan de "insumos" porque no son perecederos, no llevan receta y
     // se descuentan por PRODUCTO/TAMAÑO (producto_empaque), no por ficha
@@ -1003,33 +1034,62 @@ const migrar = async () => {
   // quedan MUERTOS (ver arriba: todo insumo activo o migrado ya tiene su
   // insumo_local). Se sueltan para que no quede una segunda fuente de
   // verdad del stock. Guardado y NO destructivo si algo quedó sin resolver:
-  // solo se ejecuta cuando NINGÚN insumo retiene local_id (ninguno quedó
-  // "colgado" del modelo viejo) — si migrarInsumoLocalYEmpaques dejó algo
-  // pendiente (ver su propio log), esto se salta entero y lo reintenta en
-  // el próximo arranque, sin perder ningún dato.
-  try {
-    const { rows: colInfo } = await pool.query(
-      `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name='local_id'`
-    );
-    if (colInfo.length) {
-      const { rows: pendientes } = await pool.query(
-        `SELECT id, nombre FROM insumos WHERE local_id IS NOT NULL OR COALESCE(stock,0) <> 0`
+  // solo se ejecuta cuando NINGÚN insumo retiene local_id/stock del modelo
+  // viejo — si migrarInsumoLocalYEmpaques dejó algo pendiente (ver su
+  // propio log), esto se salta entero y lo reintenta en el próximo
+  // arranque, sin perder ningún dato.
+  //
+  // BUG REAL encontrado y corregido acá: esta guardia asumía que
+  // "stock"/"stock_minimo"/"local_id" siempre se sueltan LAS TRES juntas,
+  // en el mismo pase — pero en algún momento (fuera de este código: nada
+  // en este repo vuelve a crear "local_id") la columna "local_id"
+  // reapareció en la base real DESPUÉS de que "stock"/"stock_minimo" ya
+  // se habían soltado con éxito. Como el WHERE de abajo mezclaba
+  // "local_id IS NOT NULL" con "COALESCE(stock,0) <> 0" en LA MISMA
+  // consulta, y "stock" ya no existía, esa consulta fallaba en CADA
+  // arranque ("no existe la columna «stock»") — el catch de abajo lo
+  // silenciaba, así que nadie lo notó hasta que "local_id" volvió a
+  // quedar NOT NULL sin ningún código que le mande un valor: **eso
+  // rompía POST /insumos por completo (500 en cada intento de crear un
+  // insumo)**. Ahora cada columna se revisa por separado, sin asumir que
+  // las tres siguen vivas juntas.
+  for (const columna of ['stock', 'stock_minimo', 'local_id']) {
+    try {
+      const { rows: existe } = await pool.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name=$1`,
+        [columna]
       );
+      if (!existe.length) continue; // ya se soltó antes, nada que hacer
+
+      // "local_id": a esta altura NINGÚN código de este repo la lee ni la
+      // escribe (verificado explícitamente al diagnosticar este bug) — a
+      // diferencia de "stock"/"stock_minimo" (que si tienen un valor
+      // real, hay que esperar a que migrarInsumoLocalYEmpaques los
+      // traslade a insumo_local antes de soltar la columna), no hay NADA
+      // que "local_id" pueda seguir representando de forma útil: se
+      // suelta directo, sin condición, para no quedar bloqueada para
+      // siempre por un NOT NULL que ningún INSERT/UPDATE actual sabe
+      // llenar (eso es justo lo que rompía POST /insumos).
+      if (columna === 'local_id') {
+        await pool.query(`ALTER TABLE insumos DROP COLUMN local_id`);
+        console.log('🔧 insumos.local_id eliminada (columna resucitada fuera de este código, sin ningún uso vigente — rompía POST /insumos con un NOT NULL que nadie llenaba).');
+        continue;
+      }
+
+      const { rows: pendientes } = await pool.query(`SELECT id, nombre FROM insumos WHERE COALESCE(${columna},0) <> 0`);
       if (pendientes.length === 0) {
-        await pool.query(`ALTER TABLE insumos DROP COLUMN IF EXISTS stock`);
-        await pool.query(`ALTER TABLE insumos DROP COLUMN IF EXISTS stock_minimo`);
-        await pool.query(`ALTER TABLE insumos DROP COLUMN IF EXISTS local_id`);
-        console.log('🔧 insumos.stock/stock_minimo/local_id eliminadas: el stock por local ahora vive en insumo_local.');
+        await pool.query(`ALTER TABLE insumos DROP COLUMN IF EXISTS ${columna}`);
+        console.log(`🔧 insumos.${columna} eliminada (dato muerto: el stock por local vive en insumo_local).`);
       } else {
         console.error(
-          '⚠️  insumos.stock/local_id NO se eliminan todavía: quedan', pendientes.length,
-          'insumo(s) sin consolidar en insumo_local (revisa el aviso de migrarInsumoLocalYEmpaques) —',
+          `⚠️  insumos.${columna} NO se elimina todavía: quedan`, pendientes.length,
+          'insumo(s) con un valor real ahí (revisa el aviso de migrarInsumoLocalYEmpaques) —',
           pendientes.map(p => `#${p.id} "${p.nombre}"`).join(', ')
         );
       }
+    } catch (e) {
+      console.error(`⚠️  No se pudo verificar/soltar insumos.${columna}:`, e.message);
     }
-  } catch (e) {
-    console.error('⚠️  No se pudo verificar/soltar insumos.stock/stock_minimo/local_id:', e.message);
   }
 
   // Unicidad del nombre de insumo GLOBAL (reemplaza el índice viejo "por
@@ -1047,77 +1107,35 @@ const migrar = async () => {
     console.error('⚠️  No se pudo crear el índice único insumos_nombre_uidx (probablemente hay dos insumos con el mismo nombre sin consolidar — corrígelos y el servidor lo reintentará):', e.message);
   }
 
-  // ── CORRECCIÓN "TIPO DE USO": es_adicion_sin_costo → es_adicion ─────────
-  // Auditoría (ver el reporte completo en CAMBIOS.md, hecho ANTES de tocar
-  // nada): "es_adicion_sin_costo" era un nombre contradictorio — una
-  // "Adición", por definición del negocio, SIEMPRE tiene costo (la tabla
-  // "adiciones" ya lo refleja: sus 11 filas reales tienen precio > 0); lo
-  // GRATUITO y opcional es el "Topping" (la tabla "toppings" nunca tuvo
-  // columna de precio). No se encontró ningún insumo con los booleanos
-  // de es_topping/es_adicion_sin_costo REALMENTE invertidos entre sí (se
-  // verificó cruzando contra toppings.insumo_id/adiciones.insumo_id reales:
-  // ningún insumo usado por un topping real tenía es_adicion_sin_costo=true,
-  // y viceversa) — el problema era solo el NOMBRE de la columna, así que
-  // esto es un RENAME (conserva los valores tal cual, sin swap) + un
-  // backfill puntual de un dato incompleto (ver abajo), no una inversión
-  // de datos. Guardado como RENAME COLUMN no tiene "IF EXISTS" en Postgres,
-  // así que se verifica el estado de las columnas a mano antes de correrlo.
+  // ── DESACOPLE Insumo↔Topping/Adición: se sueltan es_insumo/es_adicion/
+  // es_topping ────────────────────────────────────────────────────────────
+  // Auditoría (hecha ANTES de tocar nada, ver CAMBIOS.md): estos tres flags
+  // NUNCA condicionaron el descuento de stock ni ninguna otra regla real —
+  // eran puramente un filtro informativo para sugerir/restringir candidatos
+  // en los selectores de Toppings/Adiciones/Ficha Técnica. La fuente de
+  // verdad real de "qué insumo usa este topping/esta adición" siempre fue
+  // (y sigue siendo) toppings.insumo_id / adiciones.insumo_id — nada que
+  // migrar ahí, esas columnas no cambian. Se sueltan primero el CHECK que
+  // las amarraba entre sí y luego las tres columnas; cada paso revisa que
+  // exista antes de intentar nada, para poder correr muchas veces sin error
+  // (ej. instalaciones que ya pasaron por esto en un arranque anterior).
   try {
-    const { rows: viejo } = await pool.query(
-      `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name='es_adicion_sin_costo'`
-    );
-    const { rows: nuevo } = await pool.query(
-      `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name='es_adicion'`
-    );
-    if (viejo.length && !nuevo.length) {
-      // Caso normal: todavía no se había renombrado.
-      await pool.query(`ALTER TABLE insumos RENAME COLUMN es_adicion_sin_costo TO es_adicion`);
-      console.log('🔧 insumos.es_adicion_sin_costo renombrada a es_adicion (mismos valores, sin invertir nada) — ver auditoría en CAMBIOS.md.');
-    } else if (viejo.length && nuevo.length) {
-      // Las dos existen: "es_adicion" ya tiene los valores reales (viene de
-      // un renombrado anterior); "es_adicion_sin_costo" es una columna
-      // ZOMBI (el paso de "alters" de arriba la re-creaba en cada arranque,
-      // antes de que se corrigiera para dejar de hacerlo) — siempre en
-      // false, sin dato real que conservar. Se descarta.
-      await pool.query(`ALTER TABLE insumos DROP COLUMN es_adicion_sin_costo`);
-      console.log('🔧 insumos.es_adicion_sin_costo (columna zombi, siempre en false) eliminada — insumos.es_adicion ya tenía los valores reales.');
-    }
+    await pool.query(`ALTER TABLE insumos DROP CONSTRAINT IF EXISTS insumos_tipo_uso_check`);
   } catch (e) {
-    console.error('⚠️  No se pudo corregir insumos.es_adicion_sin_costo/es_adicion:', e.message);
+    console.error('⚠️  No se pudo soltar el CHECK insumos_tipo_uso_check:', e.message);
   }
-  // Backfill: 2 insumos (Crema chantilly, Hielo) SÍ están usados por un
-  // topping real (toppings.insumo_id) pero nunca quedaron marcados
-  // es_topping=true (la marca es informativa/de filtro, nunca condicionó
-  // el descuento de stock — por eso pasó desapercibido). Se corrige acá,
-  // no es una inversión: se ENCIENDE lo que faltaba, nunca se apaga nada.
-  try {
-    await pool.query(
-      `UPDATE insumos SET es_topping = true
-        WHERE es_topping = false
-          AND id IN (SELECT insumo_id FROM toppings WHERE insumo_id IS NOT NULL)`
-    );
-  } catch (e) {
-    console.error('⚠️  No se pudo completar es_topping para insumos ya usados por un topping real:', e.message);
-  }
-
-  // Tipo de uso del insumo: debe servir para AL MENOS una de las tres cosas
-  // (ingrediente normal / adición con costo / topping gratuito). DEFAULT
-  // TRUE de es_insumo (arriba, en "alters") ya deja a todo insumo existente
-  // cumpliendo esto, así que el CHECK se puede agregar directo (sin
-  // NOT VALID: no hay filas que puedan violarlo a esta altura).
-  try {
-    const { rows } = await pool.query(
-      `SELECT 1 FROM information_schema.table_constraints
-        WHERE constraint_name = 'insumos_tipo_uso_check'`
-    );
-    if (rows.length === 0) {
-      await pool.query(
-        `ALTER TABLE insumos ADD CONSTRAINT insumos_tipo_uso_check
-           CHECK (es_insumo OR es_adicion OR es_topping)`
+  for (const columna of ['es_topping', 'es_adicion', 'es_insumo', 'es_adicion_sin_costo']) {
+    try {
+      const { rows: existe } = await pool.query(
+        `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name=$1`,
+        [columna]
       );
+      if (!existe.length) continue; // ya se soltó antes (o nunca existió, ej. instalación nueva)
+      await pool.query(`ALTER TABLE insumos DROP COLUMN ${columna}`);
+      console.log(`🔧 insumos.${columna} eliminada (flag informativo que nunca condicionó el descuento de stock — ver auditoría en CAMBIOS.md).`);
+    } catch (e) {
+      console.error(`⚠️  No se pudo soltar insumos.${columna}:`, e.message);
     }
-  } catch (e) {
-    console.error('⚠️  No se pudo crear el CHECK insumos_tipo_uso_check (probablemente hay un insumo con las tres marcas en false — corrígelo y el servidor lo reintentará):', e.message);
   }
 
   // FK de toppings.empaque_id / adiciones.empaque_id — mismo tratamiento
@@ -1246,6 +1264,127 @@ const migrar = async () => {
   } catch (e) {
     console.error('⚠️  No se pudo recrear el CHECK pedidos_estado_check (probablemente quedó algún pedido con un estado fuera de lista) :', e.message);
   }
+
+  // ── CLIENTE: se retira dirección de registro (dirección/comuna/
+  // departamento/municipio) ───────────────────────────────────────────────
+  // El cliente ya no maneja dirección de registro. Verificado ANTES de
+  // tocar nada que ningún otro flujo dependiera de estas columnas:
+  //   • Domicilios: pedidos.direccion_alternativa es la dirección de
+  //     ENTREGA de cada pedido — una columna propia, independiente,
+  //     capturada en el momento del pedido; NUNCA se leyó de
+  //     clientes.direccion. Los domicilios siguen funcionando igual.
+  //   • Facturas: este proyecto no tiene ningún concepto de factura.
+  //   • Reportes: ninguna consulta de reportes/estadísticas referencia
+  //     clientes.direccion/comuna/departamento/municipio.
+  // Decisión (DROP, no deprecar): se eliminan las columnas — no hay ningún
+  // flujo que las siga necesitando y el dato ya no se pide ni se muestra
+  // en ningún formulario. Antes de soltarlas, se guarda un respaldo en
+  // disco (JSON, fuera del control de versiones) de cualquier cliente que
+  // ya tuviera algo cargado ahí, para no perder el dato de forma
+  // irrecuperable aunque no vaya a usarse en el producto.
+  try {
+    const { rows: cols } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_name='clientes' AND column_name IN ('direccion','comuna','departamento','municipio')`
+    );
+    if (cols.length) {
+      const { rows: conDatos } = await pool.query(
+        `SELECT id, nombre, correo, direccion, comuna, departamento, municipio FROM clientes
+          WHERE direccion IS NOT NULL OR comuna IS NOT NULL OR departamento IS NOT NULL OR municipio IS NOT NULL`
+      );
+      if (conDatos.length) {
+        const fs = require('fs');
+        const path = require('path');
+        const dir = path.join(__dirname, '..', '..', 'respaldo-migraciones');
+        fs.mkdirSync(dir, { recursive: true });
+        const archivo = path.join(dir, `clientes-direccion-${Date.now()}.json`);
+        fs.writeFileSync(archivo, JSON.stringify(conDatos, null, 2));
+        console.log(`🔧 Respaldo de ${conDatos.length} cliente(s) con dirección/comuna/departamento/municipio guardado en ${archivo} antes de eliminar esas columnas.`);
+      }
+      for (const columna of ['direccion', 'comuna', 'departamento', 'municipio']) {
+        await pool.query(`ALTER TABLE clientes DROP COLUMN IF EXISTS ${columna}`);
+      }
+      console.log('🔧 clientes.direccion/comuna/departamento/municipio eliminadas (el cliente ya no maneja dirección de registro — ver respaldo si había datos).');
+    }
+  } catch (e) {
+    console.error('⚠️  No se pudo eliminar clientes.direccion/comuna/departamento/municipio:', e.message);
+  }
+
+  // ── CLIENTE: username/verificado — columnas que YA usa routes/auth.js
+  // (registro/verificar/login de cliente) pero que nunca quedaron
+  // definidas acá ni en schema.sql: la base real ("sicaber") las tiene
+  // porque se agregaron a mano en algún momento, fuera de todo control de
+  // versiones — pero CUALQUIER base levantada desde cero (un deploy nuevo,
+  // o la base dedicada de tests, sicaber_test) nunca las tuvo, así que
+  // POST /auth/cliente/registro fallaba ahí con un 500 crudo ("no existe
+  // la columna «username»"), dejando el registro de clientes totalmente
+  // roto en cualquier instalación nueva. Mismo patrón que ya se usó para
+  // "categorias.imagen": ADD COLUMN idempotente + índice único aparte
+  // (ADD COLUMN no trae UNIQUE solo).
+  await pool.query(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS username VARCHAR(100)`);
+  await pool.query(`ALTER TABLE clientes ADD COLUMN IF NOT EXISTS verificado BOOLEAN NOT NULL DEFAULT false`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS clientes_username_key ON clientes(username)`);
+
+  // Mismo caso que username/verificado de arriba, pero es una TABLA
+  // completa (no una columna): tokens_verificacion nunca quedó definida
+  // acá ni en schema.sql — existía en la base real, agregada a mano. Sin
+  // esto, en cualquier base nueva TODO el flujo de registro/verificación/
+  // recuperación de contraseña de cliente (routes/auth.js) fallaba con un
+  // 500 crudo ("no existe la relación «tokens_verificacion»").
+  // CREATE TABLE IF NOT EXISTS ya es idempotente por sí solo.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tokens_verificacion (
+      id          SERIAL PRIMARY KEY,
+      correo      VARCHAR(120) NOT NULL,
+      token       VARCHAR(6) NOT NULL,
+      tipo        VARCHAR(20) NOT NULL CHECK (tipo IN ('registro', 'recuperacion')),
+      usado       BOOLEAN DEFAULT false,
+      expires_at  TIMESTAMPTZ DEFAULT (NOW() + INTERVAL '15 minutes'),
+      created_at  TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tokens_correo ON tokens_verificacion(correo)`);
+
+  // roles.estado — no existía ningún concepto de "rol inactivo" (ver
+  // PATCH /roles/:id/estado en routes/index.js, que desactiva en cascada
+  // a los usuarios que tengan ese rol asignado).
+  await pool.query(`ALTER TABLE roles ADD COLUMN IF NOT EXISTS estado VARCHAR(20) NOT NULL DEFAULT 'Activo'`);
+
+  // pedidos.alias — alias único (mientras el pedido siga activo) para
+  // pedidos sin cliente_id, ver aliasEnUso en routes/index.js.
+  await pool.query(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS alias VARCHAR(100)`);
+
+  // compras.estado ahora también puede ser 'anulada_parcial' (ver PATCH
+  // /compras/:id/anular con "items") — no hay CHECK que actualizar (la
+  // columna es un VARCHAR libre, sin restricción de valores), y cada
+  // ítem de compras.items puede traer "cantidad_anulada" (no es una
+  // columna nueva: vive dentro del JSONB ya existente).
+
+  // metodos_pago — catálogo administrable del checkout (ver
+  // metodoPagoRouter en routes/index.js). CREATE TABLE IF NOT EXISTS ya
+  // es idempotente por sí solo; no toca nada si la tabla ya existe.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS metodos_pago (
+      id                  SERIAL PRIMARY KEY,
+      nombre              VARCHAR(100) NOT NULL UNIQUE,
+      descripcion         TEXT,
+      url_qr              TEXT,
+      activo              BOOLEAN NOT NULL DEFAULT true,
+      fecha_actualizacion TIMESTAMP DEFAULT NOW(),
+      created_at          TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  // pedidos.metodo_pago_local — método de pago que el cliente indica que
+  // usará AL RECOGER en el local (texto libre, o el nombre de uno de los
+  // metodos_pago ya configurados — sin FK a propósito: es solo
+  // informativo/de auditoría, igual de independiente de esa tabla que ya
+  // lo es pedidos.pago, ver metodoPagoRouter). Distinto de "pago" (que
+  // sigue su propio flujo de comprobante/verificación sin cambios): esto
+  // es SOLO para tipo='local' — POST/PUT /pedidos en routes/index.js
+  // rechaza mandarlo en un pedido a domicilio, y lo deja en NULL si el
+  // tipo resultante es 'domicilio'.
+  await pool.query(`ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS metodo_pago_local VARCHAR(150)`);
 };
 
 // ── Conversión de unidades (solo dentro de la MISMA dimensión) ──────────────
@@ -1290,12 +1429,21 @@ const convertirUnidad = (cantidad, unidadOrigen, unidadDestino) => {
 //     manual: mejor un insumo pendiente de fusionar a mano que un número de
 //     stock inventado.
 const migrarInsumoLocalYEmpaques = async () => {
-  // Si insumos.local_id ya no existe, esta instalación ya consolidó todo
-  // en una vuelta anterior — nada que hacer.
+  // Esta función lee "stock"/"stock_minimo"/"local_id" de "insumos" —
+  // deben existir LAS TRES para que la consulta de abajo tenga sentido.
+  // BUG REAL corregido acá: antes solo se revisaba "local_id" (la
+  // columna que esta función necesita para AGRUPAR), pero "local_id"
+  // puede seguir existiendo aunque "stock"/"stock_minimo" ya se hayan
+  // soltado en una vuelta anterior (pasó de verdad: algo fuera de este
+  // código volvió a crear "local_id" sola, sin las otras dos, rompiendo
+  // esta consulta con "no existe la columna «stock»" en CADA arranque —
+  // sin try/catch acá arriba, eso tumbaba el arranque completo). Ahora se
+  // exigen las tres antes de intentar nada.
   const { rows: colInfo } = await pool.query(
-    `SELECT 1 FROM information_schema.columns WHERE table_name='insumos' AND column_name='local_id'`
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_name='insumos' AND column_name IN ('local_id','stock','stock_minimo')`
   );
-  if (!colInfo.length) return;
+  if (colInfo.length < 3) return; // falta alguna: ya se consolidó, o la limpieza de columnas la retirará sola
 
   const { rows: catEmpaques } = await pool.query(
     `SELECT id FROM categorias_insumos WHERE lower(btrim(nombre)) = 'empaques' LIMIT 1`
@@ -1662,7 +1810,7 @@ const repararSecuenciasId = async () => {
 pool.connect()
   .then(async (client) => {
     client.release();
-    console.log('✅ Conectado a PostgreSQL - sicaber');
+console.log(`✅ Conectado a PostgreSQL (Neon)`);    await ejecutarSchemaBase();
     await migrar();
     await repararSecuenciasId();
     console.log('✅ Migraciones verificadas');

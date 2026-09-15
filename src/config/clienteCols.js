@@ -5,12 +5,16 @@
 // verdad para que web y móvil reciban siempre el mismo perfil, con los
 // mismos nombres de campo — antes cada endpoint traía su propio subconjunto
 // de columnas (algunos con solo id/nombre/correo/telefono), así que campos
-// como dirección, comuna, tipo/número de documento, departamento,
-// municipio y fecha de registro "desaparecían" según por dónde hubiera
-// entrado el cliente.
+// como tipo/número de documento y fecha de registro "desaparecían" según
+// por dónde hubiera entrado el cliente.
+//
+// RETIRADO: departamento/municipio/comuna/direccion — el cliente ya no
+// maneja dirección de registro (ver la migración de baja en config/db.js).
+// La dirección de ENTREGA de un pedido a domicilio sigue viva y sin
+// cambios: es pedidos.direccion_alternativa, un campo propio del pedido,
+// nunca derivado de este perfil.
 const CLIENTE_COLS = `id, nombre, correo, telefono,
-  tipo_doc AS "tipoDoc", numero_doc AS "numeroDoc",
-  departamento, municipio, comuna, direccion, estado,
+  tipo_doc AS "tipoDoc", numero_doc AS "numeroDoc", estado,
   created_at AS "fechaRegistro"`;
 
 module.exports = { CLIENTE_COLS };

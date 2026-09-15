@@ -2,24 +2,25 @@
 //  Tests de integración: aislamiento de stock por local (requisito 3)
 // ─────────────────────────────────────────────────────────────────────────
 // "Ninguna operación de un local puede modificar el stock de otro" — estos
-// tests lo verifican contra la API REAL, corriendo en vivo (no hay una base
-// de datos de prueba separada en este proyecto; usan la misma que .env).
+// tests lo verifican contra la API REAL, corriendo en vivo.
 //
-// Requisito para correrlos:
-//   1) El servidor debe estar corriendo (`npm run dev` o `npm start`) en
-//      otra terminal — por defecto contra http://localhost:4000/api
-//      (configurable con TEST_BASE_URL).
-//   2) Debe existir el usuario admin sembrado (Admin_Sicaber/admin2024#,
-//      o pasar TEST_ADMIN_USER/TEST_ADMIN_PASS) y al menos 2 locales
-//      Activos (ver módulo de Empleados > Locales).
+// "npm test" ya no corre esto contra la base de desarrollo: arranca un
+// servidor y una base de datos DEDICADOS y DESECHABLES (sicaber_test, ver
+// scripts/run-tests.js y test/README.md) — se recrean desde cero en cada
+// corrida, así que este archivo NO puede asumir que ya exista nada (ni
+// locales, ni proveedores, ni el admin con datos reales): todo lo que
+// necesita lo crea él mismo en `before()`.
 //
-// Ejecutar: npm test
+// Ejecutar: npm test (arranca todo solo). Para correr manualmente contra
+// un servidor ya levantado aparte, pasar TEST_BASE_URL/TEST_ADMIN_USER/
+// TEST_ADMIN_PASS — ver test/README.md.
 //
-// Los datos que crean (insumo/producto/ficha técnica/pedido de prueba,
-// todos con el prefijo "test aislamiento") se limpian al final en la medida
-// en que las reglas de negocio lo permiten (un producto con una venta real
-// no se puede borrar — solo desactivar; eso es correcto, no un fallo del
-// test).
+// Los datos que crean (insumo/producto/ficha técnica/pedido/proveedor de
+// prueba, todos con el prefijo "test aislamiento") se limpian al final en
+// la medida en que las reglas de negocio lo permiten (un producto con una
+// venta real no se puede borrar — solo desactivar; eso es correcto, no un
+// fallo del test) — y de todas formas desaparecen enteros al recrearse
+// sicaber_test en la próxima corrida.
 'use strict';
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
@@ -36,6 +37,7 @@ let productoId, productoNombre;
 let fichaId;
 let pedidoId;
 let compraIdParaAnular;
+let proveedorId; // creado por el propio test (ver antes: no se puede asumir que ya exista uno en la base — sicaber_test arranca vacía)
 
 const api = async (path, { method = 'GET', body } = {}) => {
   const res = await fetch(`${BASE}${path}`, {
@@ -74,6 +76,16 @@ before(async () => {
   });
   assert.equal(ins.status, 201, JSON.stringify(ins.data));
   insumoId = ins.data.id;
+
+  // Un proveedor propio de este test (antes se asumía que YA existía uno
+  // Activo en la base — cierto contra la base de desarrollo compartida,
+  // falso contra sicaber_test, que arranca completamente vacía).
+  const prov = await api('/proveedores', {
+    method: 'POST',
+    body: { nombre: `Proveedor test aislamiento ${Date.now()}`, tipoPersona: 'Juridica' },
+  });
+  assert.equal(prov.status, 201, JSON.stringify(prov.data));
+  proveedorId = prov.data.id;
 });
 
 after(async () => {
@@ -107,6 +119,15 @@ after(async () => {
           body: { nombre: insumoNombre, unidadMedida: 'kg', estado: 'Inactivo' },
         });
       }
+    }
+  } catch {}
+  try {
+    if (proveedorId) {
+      // Mismo caso: la compra de la prueba (anulada, no borrada) sigue
+      // asociada a este proveedor, así que DELETE lo rechaza — se
+      // desactiva en su lugar.
+      const del = await api(`/proveedores/${proveedorId}`, { method: 'DELETE' });
+      if (del.status !== 200) await api(`/proveedores/${proveedorId}/estado`, { method: 'PATCH' });
     }
   } catch {}
 });
@@ -151,14 +172,10 @@ test('una compra en el local A solo sube el stock_actual de A (B queda intacto)'
   const stockAntesA = Number(filaDelLocal(antes, localA).stock);
   const stockAntesB = Number(filaDelLocal(antes, localB).stock);
 
-  const proveedores = await api('/proveedores');
-  const proveedorActivo = proveedores.data.find((p) => p.estado === 'Activo');
-  assert.ok(proveedorActivo, 'se necesita al menos un proveedor Activo para registrar la compra de prueba');
-
   const compra = await api('/compras', {
     method: 'POST',
     body: {
-      proveedorId: proveedorActivo.id, local_id: localA,
+      proveedorId, local_id: localA,
       fecha: new Date().toISOString().slice(0, 10), total: 40000, descuento: 0,
       items: [{ insumo: insumoNombre, cantidad: 4, precioUnitario: 10000 }],
     },
@@ -209,10 +226,14 @@ test('una venta (pedido entregado) en el local A solo descuenta el stock de A (B
   const stockAntesB = Number(filaDelLocal(antes, localB).stock);
   assert.ok(stockAntesA >= CONSUMO_ESPERADO, 'el local A necesita stock suficiente para la venta de prueba');
 
+  // pago: 'nequi' (no 'efectivo') — efectivo ya no aplica a tipo='local'
+  // (ver pedidos-metodo-pago.test.js); se aprueba el comprobante antes de
+  // avanzar de estado para no chocar con el gate de pago.
   const pedido = await api('/pedidos', {
     method: 'POST',
     body: {
-      cliente: 'Cliente test aislamiento', tipo: 'local', pago: 'efectivo', total: 15000,
+      cliente: 'Cliente test aislamiento', alias: `alias-aislamiento-${Date.now()}`, tipo: 'local', pago: 'nequi',
+      comprobante_img: `data:text/plain;base64,aislamiento-${Date.now()}`, total: 15000,
       items: [{ id: productoId, nombre: productoNombre, cantidad: 1, precio: 15000 }],
       origen: 'admin', local_id: localA,
     },
@@ -220,8 +241,10 @@ test('una venta (pedido entregado) en el local A solo descuenta el stock de A (B
   assert.equal(pedido.status, 201, JSON.stringify(pedido.data));
   pedidoId = pedido.data.id;
 
-  // Camino completo del estado: pendiente → en_proceso → en_camino → entregado
-  // (en efectivo no hay comprobante que aprobar, así que no hay bloqueo de pago).
+  const aprobar = await api(`/pedidos/${pedidoId}/comprobante/aprobar`, { method: 'PATCH' });
+  assert.equal(aprobar.status, 200, JSON.stringify(aprobar.data));
+
+  // Camino completo del estado: pendiente_verificacion → en_proceso → en_camino → entregado
   for (const estado of ['en_proceso', 'en_camino', 'entregado']) {
     const r = await api(`/pedidos/${pedidoId}/estado`, { method: 'PATCH', body: { estado } });
     assert.equal(r.status, 200, `PATCH estado=${estado} → ${JSON.stringify(r.data)}`);

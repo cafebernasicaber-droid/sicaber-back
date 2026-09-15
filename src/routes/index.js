@@ -16,8 +16,56 @@ const {
 // Vocabulario y derivación del "tipo de preparación" de una ficha técnica a
 // partir de la categoría del producto. Ver config/tiposPreparacion.js.
 const { resolverTipoPreparacion } = require('../config/tiposPreparacion');
+const { determinarSedePorDireccion } = require('../services/geocoding');
 
 const r = express.Router();
+
+// ── Filtro de rango de fechas (?desde=&hasta=) ───────────────────────────
+// Compartido por todos los listados con reporte por fecha (requisito 4):
+// Usuarios, Empleados, Clientes, Combos, Ventas, Compras, Pedidos y Fichas
+// Técnicas. Formato esperado, SIEMPRE: "AAAA-MM-DD" (fecha simple, sin
+// hora — el mismo formato que ya usan compras.fecha y los rangos de
+// descuento de productos/combos, así que no se introduce un formato
+// nuevo). Rechaza con 400 y un mensaje claro tanto un formato inválido
+// como un rango invertido ("hasta" antes que "desde") — nunca se confía
+// en que el frontend ya lo haya validado (había reportes de filtros que
+// no filtraban bien; parte del problema real es que HASTA AHORA ningún
+// endpoint de listado aceptaba ?desde=/?hasta= en absoluto — el filtrado
+// por fecha vivía enteramente en el frontend, sin nada que lo respaldara
+// del lado del servidor).
+const RE_FECHA_SIMPLE = /^\d{4}-\d{2}-\d{2}$/;
+const errorRangoFechas = (desde, hasta) => {
+  if (desde !== undefined && desde !== '' && !RE_FECHA_SIMPLE.test(desde)) {
+    return 'El parámetro "desde" debe tener el formato AAAA-MM-DD (ej. 2026-01-31).';
+  }
+  if (hasta !== undefined && hasta !== '' && !RE_FECHA_SIMPLE.test(hasta)) {
+    return 'El parámetro "hasta" debe tener el formato AAAA-MM-DD (ej. 2026-01-31).';
+  }
+  if (desde && hasta && desde > hasta) {
+    return 'El rango de fechas es inválido: "hasta" no puede ser anterior a "desde".';
+  }
+  return null;
+};
+// Arma las condiciones SQL de un rango YA VALIDADO (usar siempre después
+// de errorRangoFechas) y empuja sus valores a `params` — el caller solo
+// tiene que unir el resultado a sus otras condiciones con ' AND '.
+// `columna` debe ser TIMESTAMP (created_at, el caso más común): "hasta" se
+// extiende hasta el FINAL de ese día (< hasta + 1 día), para que un
+// registro creado a mitad del día "hasta" no quede afuera por comparar
+// solo contra medianoche. Para una columna DATE pura y sin hora
+// (compras.fecha) usar condicionRangoFechasDate en su lugar.
+const condicionRangoFechas = (columna, desde, hasta, params) => {
+  const partes = [];
+  if (desde) { params.push(desde); partes.push(`${columna} >= $${params.length}`); }
+  if (hasta) { params.push(hasta); partes.push(`${columna} < ($${params.length}::date + INTERVAL '1 day')`); }
+  return partes;
+};
+const condicionRangoFechasDate = (columna, desde, hasta, params) => {
+  const partes = [];
+  if (desde) { params.push(desde); partes.push(`${columna} >= $${params.length}`); }
+  if (hasta) { params.push(hasta); partes.push(`${columna} <= $${params.length}`); }
+  return partes;
+};
 
 // Traduce el "local" que manda el formulario de usuarios/empleados a un
 // locales.id real, para guardar usuarios.local_id (lo que POST /insumos
@@ -173,6 +221,55 @@ rolRouter.put('/:id', auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// Activar/desactivar un rol. Desactivarlo desactiva EN CASCADA (una sola
+// vez, al momento de desactivar) a todos los usuarios que tengan ese rol
+// asignado (usuarios.estado: 'Activo' -> 'Inactivo') — pierden acceso de
+// inmediato. Nunca se toca nada más de esos usuarios: su historial
+// (pedidos atendidos, ventas, compras, etc.) queda intacto, esto es solo
+// sobre usuarios.estado.
+//
+// Reactivar el rol después NO reactiva a nadie de vuelta — la reactivación
+// de cada usuario queda a mano, uno por uno, del Administrador (a
+// propósito: reactivar en cascada podría devolverle acceso a alguien que
+// se desactivó por una razón propia, no solo por el rol).
+//
+// El rol "Administrador" nunca se puede desactivar: desactivarlo dejaría
+// el sistema sin ningún administrador activo para volver a activarlo (o
+// cualquier otra cosa) — bloqueo total, sin excepción, con criterio
+// conservador.
+rolRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows: actual } = await pool.query('SELECT id, nombre, estado FROM roles WHERE id=$1', [req.params.id]);
+    if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
+    const rol = actual[0];
+    const estadoNuevo = rol.estado === 'Activo' ? 'Inactivo' : 'Activo';
+
+    if (estadoNuevo === 'Inactivo' && rol.nombre.trim().toLowerCase() === 'administrador') {
+      return res.status(409).json({
+        error: 'No se puede desactivar el rol "Administrador": el sistema quedaría sin ningún administrador activo.',
+      });
+    }
+
+    const { rows } = await pool.query('UPDATE roles SET estado=$1 WHERE id=$2 RETURNING *', [estadoNuevo, req.params.id]);
+
+    let usuariosDesactivados = 0;
+    if (estadoNuevo === 'Inactivo') {
+      // Mismo criterio de comparación que contarUsuariosConRol (lower(rol)
+      // = lower(nombre)) — usuarios.rol guarda el nombre del rol como
+      // texto, no una FK. Solo se tocan los que hoy están 'Activo': no
+      // tiene sentido "reactivar sin querer" a uno que ya estaba inactivo
+      // por otra razón (haría que UPDATE ... RETURNING lo cuente como
+      // afectado sin que en realidad haya cambiado nada para él).
+      const { rowCount } = await pool.query(
+        `UPDATE usuarios SET estado='Inactivo' WHERE lower(rol)=lower($1) AND estado='Activo'`,
+        [rol.nombre]
+      );
+      usuariosDesactivados = rowCount;
+    }
+
+    res.json({ ...rows[0], usuariosDesactivados });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // No se puede eliminar un rol que todavía tiene usuarios asignados — mismo
 // mensaje que ya usa el frontend (RolesPage.jsx), para que coincida
 // exactamente sin importar si el bloqueo lo hizo el frontend o el backend.
@@ -197,13 +294,17 @@ usrRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 usrRouter.get('/', auth, async (req, res) => {
   try {
   // Filtro opcional por local (?local_id=), igual que en /empleados.
-  const { local_id } = req.query;
+  const { local_id, desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
-  let where = '';
+  const conds = [];
   if (local_id !== undefined && local_id !== '') {
     params.push(Number(local_id));
-    where = 'WHERE local_id = $1';
+    conds.push(`local_id = $${params.length}`);
   }
+  conds.push(...condicionRangoFechas('created_at', desde, hasta, params));
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(`SELECT id,nombre,username,correo,rol,sede,local_id,estado,es_superadmin,created_at FROM usuarios ${where} ORDER BY id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -343,7 +444,13 @@ const { CLIENTE_COLS } = require('../config/clienteCols');
 
 cliRouter.get('/', auth, async (req, res) => {
   try {
-  const { rows } = await pool.query(`SELECT ${CLIENTE_COLS} FROM clientes ORDER BY id DESC`);
+  const { desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
+  const params = [];
+  const conds = condicionRangoFechas('created_at', desde, hasta, params);
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const { rows } = await pool.query(`SELECT ${CLIENTE_COLS} FROM clientes ${where} ORDER BY id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -368,31 +475,50 @@ cliRouter.get('/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // PUT /clientes/me (+ /mi-perfil): el cliente edita su propio perfil
-// ("Editar mis datos" en la landing) — usa req.user.id (del token), nunca
-// un :id recibido por parámetro, para que un cliente no pueda editar el
-// perfil de otro. Acepta exactamente los mismos campos editables que
-// expone el PUT de admin (/:id) de abajo, con la misma validación de
-// tipoDoc==='Otros'. `correo` y `password` nunca se leen de req.body ni se
-// incluyen en el UPDATE a propósito — cambiar el correo o la contraseña
-// tiene su propio flujo (POST /auth/cliente/reset-password para la
-// contraseña; el correo no tiene endpoint de cambio todavía).
+// ("Editar mis datos" en la landing, "Editar perfil" en la app móvil) —
+// usa req.user.id (del token), nunca un :id recibido por parámetro, para
+// que un cliente no pueda editar el perfil de otro. Acepta exactamente los
+// mismos campos editables que expone el PUT de admin (/:id) de abajo, con
+// la misma validación de tipoDoc==='Otros'. `password` nunca se lee de
+// req.body a propósito — cambiar la contraseña tiene su propio flujo
+// (POST /auth/cliente/reset-password).
+//
+// `correo` SÍ se puede cambiar ahora (antes este endpoint lo ignoraba a
+// propósito porque no había forma de cambiarlo) — mismas reglas que el
+// registro (formato + duplicado), pero SIN pedir reconfirmación de cuenta:
+// ninguno de los otros campos de este mismo endpoint la pide tampoco, así
+// que no le exigimos un estándar más alto solo al correo. Si más adelante
+// se necesita reverificar la cuenta al cambiar el correo, es un flujo
+// nuevo (token + reenvío de verificación) — no está incluido acá.
 const actualizarMiPerfil = async (req, res) => {
   try {
-  const { nombre, telefono, direccion, comuna, tipoDoc, numeroDoc, departamento, municipio } = req.body;
+  const { nombre, telefono, tipoDoc, numeroDoc, correo } = req.body;
   if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es obligatorio.' });
   if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
   const errorDoc = errorDocumento(numeroDoc);
   if (errorDoc) return res.status(400).json({ error: errorDoc });
-  const { rows } = await pool.query(
-    `UPDATE clientes SET nombre=$1, telefono=$2, direccion=$3, comuna=$4,
-       tipo_doc=$5, numero_doc=$6, departamento=$7, municipio=$8
-     WHERE id=$9 RETURNING ${CLIENTE_COLS}`,
-    [
-      nombre, telefono || null, direccion || null, comuna || null,
-      tipoDoc || null, numeroDoc || null, departamento || null, municipio || null,
-      req.user.id,
-    ]
-  );
+
+  let correoNuevo = null;
+  if (correo !== undefined) {
+    correoNuevo = String(correo).trim().toLowerCase();
+    if (!correoNuevo) return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(correoNuevo)) {
+      return res.status(400).json({ error: 'El correo electrónico no tiene un formato válido.' });
+    }
+    const dup = await pool.query(
+      'SELECT id FROM clientes WHERE lower(correo)=lower($1) AND id<>$2', [correoNuevo, req.user.id]);
+    if (dup.rows[0]) return res.status(400).json({ error: 'Este correo ya está registrado por otra cuenta.' });
+  }
+
+  const { rows } = correoNuevo
+    ? await pool.query(
+        `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4, correo=$5
+         WHERE id=$6 RETURNING ${CLIENTE_COLS}`,
+        [nombre, telefono || null, tipoDoc || null, numeroDoc || null, correoNuevo, req.user.id])
+    : await pool.query(
+        `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4
+         WHERE id=$5 RETURNING ${CLIENTE_COLS}`,
+        [nombre, telefono || null, tipoDoc || null, numeroDoc || null, req.user.id]);
   res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 };
@@ -402,30 +528,15 @@ cliRouter.put('/mi-perfil', auth, actualizarMiPerfil);
 // nunca se toca aquí a propósito.
 cliRouter.put('/:id', auth, async (req, res) => {
   try {
-  // `comuna` se leía en el PUT del propio cliente (/me) pero NO aquí, así
-  // que al editar un cliente desde el panel de administración el campo se
-  // descartaba en silencio: la pantalla lo mostraba y lo enviaba, y el
-  // cliente se quedaba con la comuna que puso al registrarse.
-  //
-  // El CASE de abajo distingue dos situaciones que NO son lo mismo:
-  //   • el cliente HTTP no mandó "comuna"  → se conserva la que ya tenía
-  //     (así un consumidor antiguo de esta API no borra el dato sin querer);
-  //   • la mandó vacía                     → se limpia a propósito (es lo
-  //     que pasa cuando el cliente deja de vivir en Medellín, donde el
-  //     selector de comuna ni siquiera se muestra).
-  const { nombre, telefono, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion } = req.body;
+  const { nombre, telefono, tipoDoc, numeroDoc } = req.body;
   if (!nombre || !nombre.trim()) return res.status(400).json({ error: 'El nombre es obligatorio.' });
   if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
   const errorDoc = errorDocumento(numeroDoc);
   if (errorDoc) return res.status(400).json({ error: errorDoc });
-  const mandoComuna = comuna !== undefined;
   const { rows } = await pool.query(
-    `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4,
-       departamento=$5, municipio=$6, direccion=$7,
-       comuna = CASE WHEN $8::boolean THEN $9 ELSE comuna END
-     WHERE id=$10 RETURNING ${CLIENTE_COLS}`,
-    [nombre, telefono || null, tipoDoc || null, numeroDoc || null, departamento || null, municipio || null, direccion || null,
-     mandoComuna, mandoComuna ? (textoLimpio(comuna) || null) : null, req.params.id]
+    `UPDATE clientes SET nombre=$1, telefono=$2, tipo_doc=$3, numero_doc=$4
+     WHERE id=$5 RETURNING ${CLIENTE_COLS}`,
+    [nombre, telefono || null, tipoDoc || null, numeroDoc || null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Cliente no encontrado' });
   res.json(rows[0]);
@@ -482,13 +593,17 @@ empRouter.get('/', async (req, res) => {
     // puede mostrarse "por local". Sin el parámetro, devuelve todos (igual
     // que antes). local_id se guarda por el formulario de empleados y se
     // propaga a usuarios.local_id (JWT) para Cajero/Bartender.
-    const { local_id } = req.query;
+    const { local_id, desde, hasta } = req.query;
+    const errorRango = errorRangoFechas(desde, hasta);
+    if (errorRango) return res.status(400).json({ error: errorRango });
     const params = [];
-    let where = '';
+    const conds = [];
     if (local_id !== undefined && local_id !== '') {
       params.push(Number(local_id));
-      where = `WHERE local_id = $1`;
+      conds.push(`local_id = $${params.length}`);
     }
+    conds.push(...condicionRangoFechas('created_at', desde, hasta, params));
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     const { rows } = await pool.query(`SELECT * FROM empleados ${where} ORDER BY id DESC`, params);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -679,7 +794,12 @@ r.use('/empleados', empRouter);
 // espacios, y permitía crear "Bebidas" y "bebidas" como dos categorías
 // distintas (el UNIQUE de Postgres distingue mayúsculas, así que no lo
 // frenaba). Tampoco había tope para la descripción.
-r.use('/categorias', crud('categorias', ['nombre', 'descripcion', 'estado'], {
+// 'imagen': URL de imagen (requisito 4, esta ronda) — mismo flujo que
+// productos.imagen/combos.imagen (el frontend sube el archivo aparte y
+// manda acá solo la URL resultante). Es de la categoría de PRODUCTO
+// (este módulo); no aplica a categorias_insumos, que es un catálogo
+// distinto sin imagen.
+r.use('/categorias', crud('categorias', ['nombre', 'descripcion', 'estado', 'imagen'], {
   etiqueta:      'El nombre de la categoría',
   validarNombre: true,
   maxNombre:     LIMITES.NOMBRE_CORTO,
@@ -749,9 +869,18 @@ const DESCUENTO_VIGENTE_EXPR = `
 // alias de una columna que también viene de "*" produce dos columnas con
 // el mismo nombre en el resultado, y cuál de las dos "gana" en el objeto
 // final que arma node-postgres no es algo en lo que valga la pena confiar.
+// "categoriaImagen" (requisito 4, esta ronda): productos.categoria guarda
+// el NOMBRE de la categoría (no un id — ver el NOT EXISTS de más abajo,
+// mismo motivo), así que el único join posible con categorias.imagen es
+// por nombre normalizado. Subquery (no JOIN) para no duplicar filas de
+// producto si alguna vez hubiera dos categorías con nombres que
+// normalizan igual; NULL si la categoría no existe o no tiene imagen —
+// nunca bloquea que el producto se liste.
 const PRODUCTO_COLS_PUBLICO = `
   id, nombre, categoria, precio, ${DESCUENTO_VIGENTE_EXPR} AS descuento,
-  fecha_inicio_desc, fecha_fin_desc, descripcion, imagen, estado, created_at
+  fecha_inicio_desc, fecha_fin_desc, descripcion, imagen, estado, created_at,
+  (SELECT c.imagen FROM categorias c
+    WHERE lower(btrim(c.nombre)) = lower(btrim(p.categoria)) LIMIT 1) AS "categoriaImagen"
 `;
 
 // Nombre único de producto — la tabla ya tiene un UNIQUE real sobre
@@ -780,27 +909,30 @@ const fechasDescuentoInvalidas = (inicio, fin) => {
   return new Date(inicio).getTime() > new Date(fin).getTime();
 };
 
-// Filtro de precio por "prefijo en miles": el cliente busca un número
-// (ej. "3", "10", "15") y el Backend arma el rango completo de precios
-// que empiezan así — "3" → 3000-3999, "10" → 10000-10999, "15" →
-// 15000-15999 — en vez de que el Frontend tenga que mandar precioMin y
-// precioMax ya calculados a mano. precio es NUMERIC(10,2) en la base de
-// datos (ver schema.sql), así que la comparación se hace numéricamente
-// (>=/<=), sin convertir nada a texto.
+// Filtro de precio por COINCIDENCIA DE TEXTO: el cliente busca un número
+// (ej. "5") y encuentra cualquier precio cuyo texto lo CONTENGA en
+// cualquier posición — "5" encuentra 5000, 15000, 5500, 25010, etc. (no
+// solo los que EMPIEZAN por 5000-5999, que era el criterio de antes —
+// "prefijo en miles" — y por eso "15000" nunca aparecía buscando "5"
+// aunque a simple vista el precio "contiene" un 5).
+// precio es NUMERIC(10,2) (ver schema.sql), pero en esta app SIEMPRE se
+// maneja en pesos enteros (ver validarItemCompra: "el precio debe ser un
+// número entero... sin decimales") — se compara contra el texto del
+// precio SIN la parte decimal (FLOOR(precio)::text), para que buscar "5"
+// no dependa de si el precio guardó ".00" o no, ni haga que alguien
+// tenga que escribir el punto decimal para buscar por texto.
 //
 // Vacío/ausente ⇒ sin filtro (se devuelve null y la ruta no agrega
-// condición). Cualquier otra cosa que no sea un entero no negativo
-// (letras, negativos, decimales) ⇒ se devuelve el string 'invalido' para
-// que la ruta responda 400 en vez de dejar pasar un valor sin sentido.
-const RE_PRECIO_PREFIJO = /^\d+$/;
-const filtroPrecioDesdeQuery = (raw) => {
+// condición). Cualquier otra cosa que no sea dígitos (letras, negativos,
+// decimales) ⇒ se devuelve el string 'invalido' para que la ruta
+// responda 400 en vez de dejar pasar un valor sin sentido.
+const RE_PRECIO_TEXTO = /^\d+$/;
+const textoBusquedaPrecio = (raw) => {
   if (raw === undefined || raw === null) return null;
   const texto = String(raw).trim();
   if (texto === '') return null;
-  if (!RE_PRECIO_PREFIJO.test(texto)) return 'invalido';
-  const n = Number(texto);
-  if (!Number.isSafeInteger(n)) return 'invalido';
-  return { min: n * 1000, max: n * 1000 + 999 };
+  if (!RE_PRECIO_TEXTO.test(texto)) return 'invalido';
+  return texto;
 };
 
 const prodRouter = require('express').Router();
@@ -822,15 +954,15 @@ const prodRouter = require('express').Router();
 // esconden los que pertenecen a una categoría que existe Y está inactiva.
 prodRouter.get('/', async (req, res) => {
   try {
-  const filtroPrecio = filtroPrecioDesdeQuery(req.query.precio);
-  if (filtroPrecio === 'invalido') {
+  const textoPrecio = textoBusquedaPrecio(req.query.precio);
+  if (textoPrecio === 'invalido') {
     return res.status(400).json({ error: 'El precio de búsqueda debe ser un número entero (sin letras ni signos).' });
   }
   const params = [];
   let condicionPrecio = '';
-  if (filtroPrecio) {
-    params.push(filtroPrecio.min, filtroPrecio.max);
-    condicionPrecio = 'AND p.precio >= $1 AND p.precio <= $2';
+  if (textoPrecio) {
+    params.push(`%${textoPrecio}%`);
+    condicionPrecio = `AND FLOOR(p.precio)::text LIKE $${params.length}`;
   }
   const { rows } = await pool.query(
     `SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos p
@@ -871,7 +1003,7 @@ prodRouter.get('/:id', async (req, res) => {
     // criterio de "descuento vigente" que GET /productos, para que un
     // producto con descuento programado a futuro no vuelva a aparecer con
     // descuento>0 solo por consultarlo directo por id.
-    const { rows } = await pool.query(`SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos WHERE id=$1`, [identificador.id]);
+    const { rows } = await pool.query(`SELECT ${PRODUCTO_COLS_PUBLICO} FROM productos p WHERE p.id=$1`, [identificador.id]);
     if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
     res.json({ tipo: 'producto', ...rows[0] });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -974,41 +1106,276 @@ prodRouter.delete('/:id', auth, async (req, res) => {
 });
 r.use('/productos', prodRouter);
 
+// ── TOPPINGS / ADICIONES — consumo real de insumo ───────────────────────
+// Antes esto era un crud() genérico: aceptaba insumo_id/cantidad como
+// texto plano, SIN validar nada (ni que el insumo existiera, ni que la
+// cantidad respetara su unidad — un topping sobre un insumo en "unidad"
+// podía guardar cantidad=2.75 sin que nadie lo notara hasta la venta).
+// insumo_id/empaque_id son OPCIONALES y mutuamente excluyentes: una
+// adición puede ser solo un extra de precio sin consumo real; un
+// topping/adición con insumo_id descuenta de un INSUMO (ver
+// insumo_local), con empaque_id descuenta de un EMPAQUE (ver
+// empaque_local) — nunca ambos a la vez. La cantidad_por_uso se valida
+// SIEMPRE según la unidad real de ese insumo/empaque (entero si su unidad
+// es "unidad", decimal para kg/g/lb/oz/L/mL — mismo criterio que
+// errorCantidadPorUnidad ya usa en Insumos/Compras/Ficha Técnica). No hay
+// ningún UNIQUE sobre insumo_id/empaque_id: el mismo insumo puede ser la
+// base de varios toppings/adiciones distintos, cada uno con su propia
+// cantidad — y puede, a la vez, ser un topping en un producto y una
+// adición en otro, sin conflicto.
+const resolverConsumoToppingAdicion = async (body, etiqueta) => {
+  const insumoId  = (body.insumo_id !== undefined && body.insumo_id !== null && body.insumo_id !== '') ? Number(body.insumo_id) : null;
+  const empaqueId = (body.empaque_id !== undefined && body.empaque_id !== null && body.empaque_id !== '') ? Number(body.empaque_id) : null;
+  if (insumoId && empaqueId) {
+    return { error: `${etiqueta} no puede descontar de un insumo Y de un empaque a la vez: elige uno.` };
+  }
+  if (!insumoId && !empaqueId) {
+    // Sin consumo real (ej. una adición que es solo un extra de precio):
+    // la cantidad no aplica a nada, se guarda en 0 sin importar qué haya
+    // llegado en el body — nunca queda un número suelto sin unidad de
+    // referencia.
+    return { insumoId: null, empaqueId: null, cantidad: 0 };
+  }
+  let unidad;
+  if (insumoId) {
+    const { rows } = await pool.query('SELECT unidad FROM insumos WHERE id=$1', [insumoId]);
+    if (!rows[0]) return { error: `El insumo #${insumoId} no existe.` };
+    unidad = rows[0].unidad;
+  } else {
+    const { rows } = await pool.query('SELECT unidad FROM empaques WHERE id=$1', [empaqueId]);
+    if (!rows[0]) return { error: `El empaque #${empaqueId} no existe.` };
+    unidad = rows[0].unidad;
+  }
+  const errorCant = errorCantidadPorUnidad(body.cantidad, `${etiqueta}: la cantidad por uso`, unidad);
+  if (errorCant) return { error: errorCant };
+  return { insumoId, empaqueId, cantidad: Number(body.cantidad) };
+};
+
+// productos_ids: array de ids de producto a los que aplica el topping —
+// [] (o ausente) significa "todos los productos", el comportamiento que ya
+// traía el formulario. Se valida la FORMA acá (array de enteros positivos);
+// GET /toppings?producto_id= (más abajo) es quien realmente filtra.
+const errorProductosIds = (valor) => {
+  if (valor === undefined || valor === null) return null;
+  if (!Array.isArray(valor)) return 'productos_ids debe ser un arreglo de ids de producto.';
+  for (const id of valor) {
+    if (!Number.isInteger(Number(id)) || Number(id) <= 0) return 'productos_ids debe contener solo ids de producto válidos.';
+  }
+  return null;
+};
+// Siempre se guardan como NÚMEROS (nunca strings) — el filtro de
+// GET /toppings?producto_id= compara con containment jsonb (@>), que es
+// estricto de tipo: un producto_id llegado como string ("3") nunca haría
+// match contra el entero 3 guardado del otro lado.
+const normalizarProductosIds = (valor) => (Array.isArray(valor) ? valor.map(Number) : []);
+
+// SELECT con el insumo/empaque asociado YA resuelto (nombre + unidad) —
+// requisito 3 (esta ronda): antes el listado solo traía insumo_id/
+// empaque_id crudos, y el frontend no tenía cómo mostrar "de qué insumo"
+// ni "en qué unidad" sin una consulta aparte por fila. LEFT JOIN porque
+// ambos son opcionales (una adición de solo precio no tiene ninguno).
+const TOPPING_SELECT = `
+  SELECT t.*, i.nombre AS "insumoNombre", i.unidad AS "insumoUnidad",
+         e.nombre AS "empaqueNombre", e.unidad AS "empaqueUnidad"
+    FROM toppings t
+    LEFT JOIN insumos i ON t.insumo_id = i.id
+    LEFT JOIN empaques e ON t.empaque_id = e.id
+`;
+const ADICION_SELECT = `
+  SELECT a.*, i.nombre AS "insumoNombre", i.unidad AS "insumoUnidad",
+         e.nombre AS "empaqueNombre", e.unidad AS "empaqueUnidad"
+    FROM adiciones a
+    LEFT JOIN insumos i ON a.insumo_id = i.id
+    LEFT JOIN empaques e ON a.empaque_id = e.id
+`;
+
 // ── TOPPINGS ───────────────────────────────────────────────
 // Los toppings nunca tienen costo (sin campo precio). productos_ids
 // = [] significa que el topping aplica a todos los productos.
-// insumo_id/cantidad: de qué insumo y cuánto descuenta del stock vender
-// este topping (mismo mecanismo que los ingredientes de la ficha
-// técnica — ver descontarInventarioPorVenta más abajo).
 // Antes se podía crear "Chocolate" y "CHOCOLATE" como dos toppings
 // distintos, o guardar un nombre de puros espacios.
-r.use('/toppings',  crud('toppings',  ['nombre', 'productos_ids', 'estado', 'insumo_id', 'cantidad'], {
-  etiqueta:      'El nombre del topping',
-  validarNombre: true,
-  maxNombre:     LIMITES.NOMBRE_CORTO,
-  nombreUnico:   true,
-}));
+const toppingRouter = require('express').Router();
+toppingRouter.param('id', validateId);
+// ?producto_id= (requisito 3): solo los toppings válidos para ESE
+// producto — los que tienen productos_ids=[] (aplican a todos) MÁS los
+// que explícitamente lo incluyen. Sin el filtro, se devuelven todos (igual
+// que antes) para no romper la pantalla de administración de Toppings.
+toppingRouter.get('/', async (req, res) => {
+  try {
+    const { producto_id } = req.query;
+    if (producto_id !== undefined) {
+      const { rows } = await pool.query(
+        `${TOPPING_SELECT}
+          WHERE t.estado='Activo' AND (t.productos_ids = '[]'::jsonb OR t.productos_ids @> to_jsonb($1::int))
+          ORDER BY t.id DESC`,
+        [Number(producto_id)]
+      );
+      return res.json(rows);
+    }
+    const { rows } = await pool.query(`${TOPPING_SELECT} ORDER BY t.id DESC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+toppingRouter.get('/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`${TOPPING_SELECT} WHERE t.id=$1`, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+toppingRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del topping', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorIds = errorProductosIds(req.body.productos_ids);
+    if (errorIds) return res.status(400).json({ error: errorIds });
+    const consumo = await resolverConsumoToppingAdicion(req.body, 'El topping');
+    if (consumo.error) return res.status(400).json({ error: consumo.error });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'toppings', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un topping con ese nombre' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO toppings(nombre, productos_ids, estado, insumo_id, empaque_id, cantidad)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      [nombre, JSON.stringify(normalizarProductosIds(req.body.productos_ids)), req.body.estado || 'Activo', consumo.insumoId, consumo.empaqueId, consumo.cantidad]
+    );
+    const { rows: full } = await pool.query(`${TOPPING_SELECT} WHERE t.id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un topping con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+toppingRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del topping', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorIds = errorProductosIds(req.body.productos_ids);
+    if (errorIds) return res.status(400).json({ error: errorIds });
+    const consumo = await resolverConsumoToppingAdicion(req.body, 'El topping');
+    if (consumo.error) return res.status(400).json({ error: consumo.error });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'toppings', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe un topping con ese nombre' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE toppings SET nombre=$1, productos_ids=$2, estado=$3, insumo_id=$4, empaque_id=$5, cantidad=$6
+       WHERE id=$7 RETURNING id`,
+      [nombre, JSON.stringify(normalizarProductosIds(req.body.productos_ids)), req.body.estado || 'Activo', consumo.insumoId, consumo.empaqueId, consumo.cantidad, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`${TOPPING_SELECT} WHERE t.id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un topping con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+toppingRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE toppings SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`${TOPPING_SELECT} WHERE t.id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+toppingRouter.delete('/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM toppings WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/toppings', toppingRouter);
 
 // ── ADICIONES ──────────────────────────────────────────────
 // Las adiciones siguen siendo universales (aplican igual a todos los
 // productos, sin producto_id — a diferencia de toppings.productos_ids).
-// insumo_id/cantidad: de qué insumo y cuánto descuenta del stock vender
-// esta adición (mismo mecanismo que toppings.insumo_id/cantidad, pero sin
-// override por producto — ver calcularRecetaEfectiva más abajo).
-// 'descripcion': el whitelist de campos de este crud() no la incluía, así
-// que aunque el formulario del frontend la capturaba y la mandaba, el
-// helper genérico la descartaba antes del INSERT/UPDATE — nunca llegaba a
-// guardarse (columna agregada en config/db.js).
-// Mismo caso que toppings ("Leche" vs "LECHE"), más el tope de la
-// descripción — que hasta ahora solo existía como límite de 20 palabras en
-// la pantalla, saltable llamando la API directamente.
-r.use('/adiciones', crud('adiciones', ['nombre', 'precio', 'estado', 'insumo_id', 'cantidad', 'descripcion'], {
-  etiqueta:      'El nombre de la adición',
-  validarNombre: true,
-  maxNombre:     LIMITES.NOMBRE_CORTO,
-  nombreUnico:   true,
-  limites:       { descripcion: LIMITES.DESCRIPCION },
-}));
+const adicionRouter = require('express').Router();
+adicionRouter.param('id', validateId);
+adicionRouter.get('/', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`${ADICION_SELECT} ORDER BY a.id DESC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+adicionRouter.get('/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query(`${ADICION_SELECT} WHERE a.id=$1`, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+adicionRouter.post('/', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la adición', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorDesc = errorLongitud(req.body.descripcion, 'La descripción de la adición', LIMITES.DESCRIPCION);
+    if (errorDesc) return res.status(400).json({ error: errorDesc });
+    const consumo = await resolverConsumoToppingAdicion(req.body, 'La adición');
+    if (consumo.error) return res.status(400).json({ error: consumo.error });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'adiciones', nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe una adición con ese nombre' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO adiciones(nombre, precio, estado, insumo_id, empaque_id, cantidad, descripcion)
+       VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [nombre, Number(req.body.precio) || 0, req.body.estado || 'Activo', consumo.insumoId, consumo.empaqueId, consumo.cantidad, req.body.descripcion || null]
+    );
+    const { rows: full } = await pool.query(`${ADICION_SELECT} WHERE a.id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una adición con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+adicionRouter.put('/:id', auth, async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre de la adición', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorDesc = errorLongitud(req.body.descripcion, 'La descripción de la adición', LIMITES.DESCRIPCION);
+    if (errorDesc) return res.status(400).json({ error: errorDesc });
+    const consumo = await resolverConsumoToppingAdicion(req.body, 'La adición');
+    if (consumo.error) return res.status(400).json({ error: consumo.error });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await nombreDuplicado(pool, 'adiciones', nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe una adición con ese nombre' });
+    }
+    const { rows } = await pool.query(
+      `UPDATE adiciones SET nombre=$1, precio=$2, estado=$3, insumo_id=$4, empaque_id=$5, cantidad=$6, descripcion=$7
+       WHERE id=$8 RETURNING id`,
+      [nombre, Number(req.body.precio) || 0, req.body.estado || 'Activo', consumo.insumoId, consumo.empaqueId, consumo.cantidad, req.body.descripcion || null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`${ADICION_SELECT} WHERE a.id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe una adición con ese nombre' });
+    res.status(500).json({ error: e.message });
+  }
+});
+adicionRouter.patch('/:id/estado', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE adiciones SET estado = CASE WHEN estado='Activo' THEN 'Inactivo' ELSE 'Activo' END WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`${ADICION_SELECT} WHERE a.id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+adicionRouter.delete('/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM adiciones WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/adiciones', adicionRouter);
 
 // ── COMBOS ─────────────────────────────────────────────────
 const comboRouter = require('express').Router();
@@ -1036,7 +1403,13 @@ comboRouter.get('/', async (req, res) => {
 });
 comboRouter.get('/todos', auth, async (req, res) => {
   try {
-  const { rows } = await pool.query('SELECT * FROM combos ORDER BY id DESC');
+  const { desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
+  const params = [];
+  const conds = condicionRangoFechas('created_at', desde, hasta, params);
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const { rows } = await pool.query(`SELECT * FROM combos ${where} ORDER BY id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1139,6 +1512,16 @@ const PROVEEDOR_FIELD_MAP = [
 ];
 const PROVEEDOR_FIELDS = PROVEEDOR_FIELD_MAP.map(([col]) => col);
 
+// Validación de FORMATO del NIT — reemplaza al algoritmo de dígito de
+// verificación (Módulo 11) que validaba esto antes: ya no se calcula si
+// el último dígito es matemáticamente correcto contra los 9 anteriores,
+// solo que el valor tenga la FORMA de un NIT real: 9 dígitos, guion, 1
+// dígito de verificación (ej. 900123456-1). Sigue siendo OPCIONAL (mismo
+// criterio de antes: solo se valida si de verdad llega un valor) — esto
+// no vuelve el NIT obligatorio, solo le exige forma cuando se manda.
+const NIT_REGEX = /^\d{9}-\d{1}$/;
+const errorNit = (nit) => (NIT_REGEX.test(String(nit)) ? null : 'El NIT debe tener el formato 9 dígitos, guion, 1 dígito de verificación (ej: 900123456-1).');
+
 // Revisa nombre/correo/teléfono siempre; NIT solo si es Persona Jurídica,
 // número de documento solo si es Persona Natural (con el mismo tipo de
 // documento) — mismo alcance que ya usa el frontend en su verificación
@@ -1195,6 +1578,24 @@ const PROVEEDOR_SELECT = `
 const provRouter = require('express').Router();
 provRouter.get('/', auth, async (req, res) => {
   try {
+    const q = textoLimpio(req.query.q || '');
+    if (q) {
+      // Búsqueda para el selector de proveedor de Compras (requisito 4):
+      // el proveedor se elige de TODOS los proveedores, sin ninguna
+      // relación automática con el insumo — este buscador es independiente
+      // del de insumos. Busca por nombre, NIT o número de documento (los
+      // tres identificadores con los que un cajero suele reconocer a un
+      // proveedor), sin filtrar por estado (igual que ciudades: encontrar
+      // uno inactivo sigue siendo válido para ver/editar, aunque ya no se
+      // ofrezca en el selector de creación de insumo/compra nueva).
+      const { rows } = await pool.query(
+        `${PROVEEDOR_SELECT}
+          WHERE nombre ILIKE $1 OR nit ILIKE $1 OR numero_documento ILIKE $1
+          ORDER BY nombre ASC LIMIT 20`,
+        [`%${q}%`]
+      );
+      return res.json(rows);
+    }
     const { rows } = await pool.query(`${PROVEEDOR_SELECT} ORDER BY id DESC`);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1218,8 +1619,22 @@ provRouter.post('/', auth, async (req, res) => {
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
+    // NIT: el mismo valor "con forma de NIT" puede venir en dos campos según
+    // el tipo de persona — ver buscarDuplicadosProveedor un poco más abajo.
+    const nitParaValidar = req.body.tipoPersona === 'Natural'
+      ? (req.body.tipoDocumento === 'NIT' ? req.body.numeroDocumento : null)
+      : req.body.nit;
+    if (nitParaValidar) {
+      const errNit = errorNit(nitParaValidar);
+      if (errNit) return res.status(400).json({ error: errNit });
+    }
 
-    const body = { ...req.body, nombre: nombreNormalizado(req.body.nombre) };
+    // BUG real (mismo patrón que se corrigió en crud.js): "estado" es
+    // NOT NULL DEFAULT 'Activo' en la tabla, pero como el INSERT de abajo
+    // siempre incluye la columna, un caller que no manda "estado"
+    // (ej. un formulario simple, o esta misma API llamada directo) recibía
+    // NULL explícito en vez del default — violación de NOT NULL.
+    const body = { ...req.body, nombre: nombreNormalizado(req.body.nombre), estado: req.body.estado || 'Activo' };
     const dup = await buscarDuplicadosProveedor(body, null);
     if (dup.length) {
       return res.status(400).json({ error: 'Ya existe un proveedor con ese ' + dup.join(', ') + '.', duplicateFields: dup });
@@ -1243,6 +1658,13 @@ provRouter.put('/:id', auth, async (req, res) => {
     if (errorNom) return res.status(400).json({ error: errorNom });
     const errorObs = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
     if (errorObs) return res.status(400).json({ error: errorObs });
+    const nitParaValidar = req.body.tipoPersona === 'Natural'
+      ? (req.body.tipoDocumento === 'NIT' ? req.body.numeroDocumento : null)
+      : req.body.nit;
+    if (nitParaValidar) {
+      const errNit = errorNit(nitParaValidar);
+      if (errNit) return res.status(400).json({ error: errNit });
+    }
 
     const body = { ...req.body, nombre: nombreNormalizado(req.body.nombre) };
     const dup = await buscarDuplicadosProveedor(body, req.params.id);
@@ -1251,6 +1673,10 @@ provRouter.put('/:id', auth, async (req, res) => {
     }
     const { rows: actual } = await pool.query('SELECT estado FROM proveedores WHERE id=$1', [req.params.id]);
     if (!actual[0]) return res.status(404).json({ error: 'No encontrado' });
+    // Mismo bug que en POST: sin esto, un caller que no manda "estado"
+    // (columna NOT NULL) recibía NULL explícito en vez de conservar el
+    // que ya tenía.
+    body.estado = body.estado || actual[0].estado;
 
     const vals = [...PROVEEDOR_FIELD_MAP.map(([, key]) => body[key] ?? null), req.params.id];
     const { rows } = await pool.query(
@@ -1449,6 +1875,19 @@ const ciudadesRouter = require('express').Router();
 ciudadesRouter.param('id', validateId);
 ciudadesRouter.get('/', auth, async (req, res) => {
   try {
+    const q = textoLimpio(req.query.q || '');
+    if (q) {
+      // Búsqueda por nombre para el select buscable del frontend (Proveedores).
+      // No filtra por estado: igual que el select completo, el buscador
+      // también debe poder encontrar una ciudad desactivada si ya está en
+      // uso por un proveedor existente (solo se restringe la oferta a
+      // ciudades nuevas en la validación de creación, no en la búsqueda).
+      const { rows } = await pool.query(
+        `SELECT * FROM ciudades WHERE nombre ILIKE $1 ORDER BY nombre ASC LIMIT 20`,
+        [`%${q}%`]
+      );
+      return res.json(rows);
+    }
     const { rows } = await pool.query(`SELECT * FROM ciudades ORDER BY id ASC`);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1508,12 +1947,18 @@ r.use('/ciudades', ciudadesRouter);
 // stock/stock_minimo/local propios: esos viven en insumo_local, una fila
 // por insumo+local. GET /insumos añade esos campos según ?local_id= (ver
 // más abajo) — nunca vienen de esta constante.
+// Ya NO trae es_insumo/es_adicion/es_topping (columnas eliminadas — ver
+// migración en config/db.js): esos flags nunca condicionaron el descuento
+// de stock, eran solo un filtro informativo para poblar los selectores de
+// Toppings/Adiciones ("qué insumo ES candidato"). Ahora cualquier insumo
+// Activo es candidato para cualquier cosa — la decisión de qué insumo usa
+// un topping/adición vive SOLO en toppings.insumo_id/adiciones.insumo_id
+// (ver esas secciones más abajo), nunca en el insumo mismo.
 const INSUMO_COLS = `
   i.id, i.nombre, i.descripcion, i.estado,
   i.unidad AS "unidadMedida", i.precio_unitario AS "precioUnitario",
   i.categoria_id AS "categoriaId", ci.nombre AS categoria,
-  i.es_insumo AS "esInsumo", i.es_adicion AS "esAdicion",
-  i.es_topping AS "esTopping",
+  i.observaciones,
   i.created_at AS "fechaCreacion"
 `;
 const INSUMO_JOINS = `
@@ -1596,14 +2041,14 @@ insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 // ?q= filtra por nombre (ILIKE, insensible a mayúsculas/acentos exactos) —
 // lo usa el buscador con lupa del formulario de Ficha Técnica para no
 // tener que traer/filtrar en el navegador la lista completa de insumos
-// cada vez. ?esTopping=true/false filtra por el flag informativo de la
-// columna (se mantiene por compatibilidad); ?tipo=topping|adicion|insumo
-// hace lo mismo, con el nombre que usa Ficha Técnica para poblar sus
-// selectores por tipo de uso. "topping" = adición GRATUITA y opcional
-// dentro de la ficha técnica; "adicion" = extra que el cliente agrega y
-// que SÍ tiene costo (ver corrección de nombres/valores en config/db.js —
-// antes esta columna se llamaba "es_adicion_sin_costo", una contradicción
-// con la definición real de "adición").
+// cada vez.
+// RETIRADO (esta ronda): ?esTopping=/?tipo=topping|adicion|insumo — esos
+// filtros leían es_topping/es_adicion/es_insumo, columnas que ya no
+// existen (ver migración en config/db.js). Los módulos de Toppings y
+// Adiciones ahora buscan entre TODOS los insumos Activos sin ninguna
+// restricción previa (usa ?estado=Activo&q=; ya no hay un "candidato"
+// especial) — la decisión de qué insumo usa cada topping/adición vive
+// solo en su propia configuración (insumo_id), nunca en el insumo.
 //
 // ?local_id= decide la FORMA de la respuesta:
 //   • sin local_id, o local_id=all → CONSOLIDADO: un registro por insumo,
@@ -1626,14 +2071,12 @@ insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 // ── Diagnóstico del "buscador solo trae 2 resultados" (requisitos 1 y 2,
 // esta ronda) ────────────────────────────────────────────────────────────
 // Revisé esta ruta a fondo y la probé en vivo contra la base real con
-// varias combinaciones (estado=Activo, tipo=insumo, tipo=topping,
-// local_id=cada local activo, q= con término amplio): en NINGÚN caso
-// encontré un límite fijo, paginación implícita, filtro de local heredado,
-// filtro de categoría, ni un WHERE residual — la consulta base no tiene
-// LIMIT, y ni la rama "local_id puntual" ni la "consolidado" recortan el
-// arreglo salvo por los filtros que el propio caller pidió. Con la base
-// actual (41 insumos activos, 3 marcados topping) el endpoint devuelve el
-// conjunto completo en todos los casos. Mi conclusión: el límite de "2
+// varias combinaciones (estado=Activo, local_id=cada local activo, q= con
+// término amplio): en NINGÚN caso encontré un límite fijo, paginación
+// implícita, filtro de local heredado, filtro de categoría, ni un WHERE
+// residual — la consulta base no tiene LIMIT, y ni la rama "local_id
+// puntual" ni la "consolidado" recortan el arreglo salvo por los filtros
+// que el propio caller pidió. Mi conclusión: el límite de "2
 // resultados" no está en ESTA ruta tal como existe hoy — o venía de una
 // versión anterior del endpoint (antes de la reescritura de la Ronda 6,
 // que quitó justamente ese tipo de límite implícito) o es un límite del
@@ -1645,15 +2088,11 @@ insRouter.param('id', validateId); // valida :id (numérico) antes de las rutas 
 // coincide", como hasta ahora.
 insRouter.get('/', auth, async (req, res) => {
   try {
-  const { estado, q, esTopping, tipo, local_id, stockBajo, incluirInactivos, limit, offset, unidad } = req.query;
+  const { estado, q, local_id, stockBajo, incluirInactivos, limit, offset, unidad } = req.query;
   const condiciones = [];
   const params = [];
   if (estado) { params.push(estado); condiciones.push(`i.estado = $${params.length}`); }
   if (q)      { params.push(`%${q}%`); condiciones.push(`i.nombre ILIKE $${params.length}`); }
-  if (esTopping !== undefined) { params.push(esTopping === 'true'); condiciones.push(`i.es_topping = $${params.length}`); }
-  if (tipo === 'topping')       condiciones.push(`i.es_topping = true`);
-  else if (tipo === 'adicion')  condiciones.push(`i.es_adicion = true`);
-  else if (tipo === 'insumo')   condiciones.push(`i.es_insumo = true`);
   // ?unidad= alimenta los selectores dedicados de Vaso/Pitillo en Ficha
   // Técnica (requisito 3): NO es un tipo de insumo nuevo, es un filtro por
   // la unidad de medida real del insumo. "onzas" es el alias amigable de
@@ -1740,6 +2179,40 @@ insRouter.get('/', auth, async (req, res) => {
   res.json(resultado);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// GET /insumos/contadores?local_id= — Todos/Activos/Inactivos/StockBajo
+// PARA ESE LOCAL (requisito 1, esta ronda). Bug real que esto corrige: las
+// tarjetas de conteo del frontend mostraban siempre el mismo número sin
+// importar la pestaña de local elegida (56/39/17) — porque no existía
+// ningún endpoint que contara "por local": lo único disponible era el
+// propio `estado` GLOBAL del insumo (Activo/Inactivo del catálogo), que es
+// un concepto DISTINTO de `insumo_local.activo` (¿se ofrece este insumo EN
+// ESE LOCAL?, el que corresponde a la pestaña). Este endpoint cuenta
+// exclusivamente por `insumo_local.activo`, nunca por `insumos.estado` —
+// como cada insumo tiene una fila en TODOS los locales (ver POST
+// /insumos), "todos" es simplemente el total de filas insumo_local de ese
+// local. `local_id` es obligatorio a propósito: sin él, no hay "por local"
+// que calcular, y devolver un total global sería reproducir el mismo bug.
+// "stockBajo" usa el mismo calcularEstadoStock que ya usa el listado — así
+// nunca puede quedar desincronizado del checkbox "Ver solo stock bajo".
+insRouter.get('/contadores', auth, async (req, res) => {
+  try {
+    const { local_id } = req.query;
+    const idLocal = Number(local_id);
+    if (!local_id || !Number.isInteger(idLocal) || idLocal <= 0) {
+      return res.status(400).json({ error: 'Falta local_id (obligatorio): los contadores siempre son por local, nunca globales.' });
+    }
+    const { rows } = await pool.query(
+      `SELECT activo, stock, stock_minimo AS "stockMinimo" FROM insumo_local WHERE local_id=$1`,
+      [idLocal]
+    );
+    let activos = 0, inactivos = 0, stockBajo = 0;
+    for (const r of rows) {
+      if (r.activo) activos++; else inactivos++;
+      if (esEstadoStockBajo(calcularEstadoStock(r.stock, r.stockMinimo))) stockBajo++;
+    }
+    res.json({ todos: rows.length, activos, inactivos, stockBajo });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 // GET /insumos/alertas-stock — RETIRADO (requisito 8, esta ronda): era la
 // tarjeta "Insumos — stock bajo" del Dashboard, que el frontend deja de
 // mostrar. Nada más en este backend la consumía, así que se deja de
@@ -1780,13 +2253,45 @@ insRouter.get('/:id', auth, async (req, res) => {
 // catálogo, sin importar en cuántos locales tenga stock — ver
 // insumo_local). Antes la unicidad era "por local" (cuando cada local
 // duplicaba la fila completa); ahora que el insumo es un único registro,
-// dos insumos con el mismo nombre ya no tienen sentido en ningún caso.
-const insumoNombreDuplicado = async (nombre, excluirId) => {
-  if (!nombre) return false;
+// dos insumos con el mismo nombre ya no tienen sentido en ningún caso —
+// así que un choque de nombre NUNCA significa "otro insumo distinto que
+// compite por el mismo nombre": significa "este insumo YA existe, en algún
+// local", y lo que probablemente se quiso hacer es activarlo en un local
+// nuevo con PUT /insumos/:id/locales/:localId, no crear un registro
+// duplicado (eso además fallaría solo, contra la unicidad real de
+// "nombre"). Por eso esta función trae el insumo completo (id + en qué
+// locales está activo) en vez de un simple booleano: para que el 400 de
+// nombre duplicado le dé al front lo que necesita para ofrecer "activar
+// aquí" en vez de un error muerto.
+const insumoExistentePorNombre = async (nombre, excluirId) => {
+  if (!nombre) return null;
   const params = excluirId ? [nombre, excluirId] : [nombre];
   const cond = excluirId ? 'lower(nombre)=lower($1) AND id<>$2' : 'lower(nombre)=lower($1)';
-  const { rows } = await pool.query(`SELECT id FROM insumos WHERE ${cond} LIMIT 1`, params);
-  return !!rows[0];
+  const { rows } = await pool.query(`SELECT id, nombre FROM insumos WHERE ${cond} LIMIT 1`, params);
+  if (!rows[0]) return null;
+  const { rows: locs } = await pool.query(
+    `SELECT lo.id AS "localId", lo.nombre AS "localNombre"
+       FROM insumo_local il JOIN locales lo ON lo.id = il.local_id
+      WHERE il.insumo_id=$1 AND il.activo=true ORDER BY lo.id`,
+    [rows[0].id]
+  );
+  return { id: rows[0].id, nombre: rows[0].nombre, localesActivos: locs };
+};
+// Arma el mensaje + payload extra ("insumoExistente") que acompaña al 400
+// de nombre duplicado — mismo texto y misma forma sin importar si el choque
+// se detectó por adelantado (insumoExistentePorNombre) o llegó como 23505
+// desde una carrera entre dos peticiones simultáneas.
+const respuestaNombreDuplicado = (dup) => {
+  const dondeActivo = dup?.localesActivos?.length
+    ? ` (hoy activo en: ${dup.localesActivos.map(l => l.localNombre).join(', ')})`
+    : ' (hoy no está activo en ningún local)';
+  return {
+    campo: 'nombre',
+    error: dup
+      ? `Ya existe un insumo llamado "${dup.nombre}"${dondeActivo}. Para tenerlo en un local nuevo, actívalo ahí en vez de crear uno nuevo (PUT /insumos/${dup.id}/locales/:localId con { "activo": true }).`
+      : 'Ya existe un insumo con ese nombre.',
+    insumoExistente: dup ? { id: dup.id, nombre: dup.nombre, localesActivos: dup.localesActivos } : undefined,
+  };
 };
 
 // ¿La categoría elegida es "Empaques"? Se usa para bloquear (422) la
@@ -1798,90 +2303,112 @@ const categoriaEsEmpaques = async (categoriaId) => {
   return idEmp != null && Number(categoriaId) === idEmp;
 };
 
-// Tipo de uso del insumo: al menos uno de los tres debe quedar en true.
-// `actual` (solo en PUT) trae los valores YA guardados, para que no mandar
-// un campo en el body signifique "dejalo como está" (no "ponlo en false").
-// Definiciones correctas (ver auditoría en CAMBIOS.md antes de corregir el
-// nombre de esta columna): "topping" = adición GRATUITA y opcional dentro
-// de la ficha técnica; "adición" = extra que el cliente agrega y que SÍ
-// tiene costo. esAdicion (antes "esAdicionSinCosto") marca insumos
-// candidatos para construir una Adición con costo (tabla "adiciones").
-const ERROR_TIPO_USO_INSUMO =
-  'El insumo debe marcarse como al menos uno de: ingrediente normal (esInsumo), adición con costo (esAdicion) o topping gratuito (esTopping).';
-const resolverFlagsTipoUso = (body, actual = {}) => {
-  const esInsumo = body.esInsumo !== undefined ? !!body.esInsumo : (actual.esInsumo ?? true);
-  const esAdicion = body.esAdicion !== undefined ? !!body.esAdicion : (actual.esAdicion ?? false);
-  const esTopping = body.esTopping !== undefined ? !!body.esTopping : (actual.esTopping ?? false);
-  if (!esInsumo && !esAdicion && !esTopping) return { error: ERROR_TIPO_USO_INSUMO };
-  return { esInsumo, esAdicion, esTopping };
-};
+// RETIRADO (esta ronda): resolverFlagsTipoUso/ERROR_TIPO_USO_INSUMO — el
+// insumo ya no se marca como "candidato" a ingrediente normal/adición/
+// topping (columnas es_insumo/es_adicion/es_topping eliminadas, ver
+// migración en config/db.js). Esos flags nunca condicionaron el descuento
+// de stock; eran solo un filtro para poblar selectores. Ahora esa decisión
+// vive exclusivamente en toppings.insumo_id / adiciones.insumo_id.
 
-// ¿El usuario autenticado es el Superadministrador? (usuarios.es_superadmin —
-// hoy: solo 'Admin_Sicaber', el usuario raíz sembrado en schema.sql). Se lee
-// del JWT si viene (tokens nuevos) y, si no, de la BD — así funciona también
-// con sesiones abiertas antes de este cambio.
-const esSuperadmin = async (reqUser) => {
-  if (reqUser && typeof reqUser.es_superadmin === 'boolean') return reqUser.es_superadmin;
-  if (!reqUser?.id) return false;
-  const { rows } = await pool.query('SELECT es_superadmin FROM usuarios WHERE id=$1', [reqUser.id]);
-  return !!rows[0]?.es_superadmin;
-};
+// Administrador y Superadministrador pueden operar sobre CUALQUIER local
+// Activo — es una ATRIBUCIÓN del rol, no una carencia ("no tienen local
+// fijo" estaba planteado al revés). Cualquier otro rol (Cajero, Bartender,
+// o el que se agregue después) SIEMPRE opera sobre su propio local — el
+// backend lo fuerza y RECHAZA (403) cualquier intento de operar sobre uno
+// distinto, aunque el body lo mande explícito (antes ese valor distinto
+// simplemente se ignoraba en silencio; ahora se rechaza de verdad, para
+// que quien lo intentó lo sepa en vez de que su pedido/compra/insumo
+// termine silenciosamente en el local equivocado... o en el suyo cuando
+// pensaba que había elegido otro).
+const puedeElegirCualquierLocal = (reqUser) => reqUser?.rol === 'Administrador' || reqUser?.es_superadmin === true;
 
-// Local al que pertenece un insumo que se está registrando:
-//   • Superadministrador (o cualquier usuario SIN local_id fijo): NO se le
-//     asume ningún local — DEBE elegirlo explícitamente en el body
-//     (`local_id`). Es el comportamiento previo a "local automático".
-//   • Cajero/Bartender/Admin CON local_id: se usa el suyo, automático e
-//     inmutable — cualquier `local_id` distinto en el body se ignora.
-// Devuelve { localId } o { error, requiereSeleccionLocal } (para que el
-// frontend sepa que tiene que mostrar el selector de local).
-const resolverLocalDeTrabajo = async (req) => {
-  const superadmin = await esSuperadmin(req.user);
-  // El superadmin nunca "tiene" un local operativo aunque su fila lo tuviera.
-  const asignado = superadmin ? null : (Number(req.user?.local_id) || null);
-  let localId = asignado;
-  if (!localId) {
-    const explicito = Number(req.body?.local_id);
-    if (!Number.isInteger(explicito) || explicito <= 0) {
+// Local sobre el que se opera (insumos, empaques, compras, pedidos,
+// ventas, movimientos de inventario — cualquier endpoint que decida "a
+// qué local le pega esta operación"). Devuelve:
+//   • { localId }
+//   • { error, requiereSeleccionLocal: true } — falta elegir/asignar un
+//     local (400): el usuario libre no mandó ninguno y tampoco tiene uno
+//     propio; o el usuario con local fijo no tiene ninguno asignado.
+//   • { error, prohibido: true } — el usuario con local fijo mandó
+//     explícitamente uno DISTINTO al suyo (403): un intento real de
+//     operar fuera de su local, no una simple omisión.
+const resolverLocalOperativo = async (req) => {
+  const libre = puedeElegirCualquierLocal(req.user);
+  const propio = Number(req.user?.local_id) || null;
+  const explicitoRaw = req.body?.local_id;
+  const explicito = Number(explicitoRaw);
+  const explicitoValido = explicitoRaw !== undefined && explicitoRaw !== null && explicitoRaw !== ''
+    && Number.isInteger(explicito) && explicito > 0;
+
+  let localId;
+  if (libre) {
+    // Administrador/Superadministrador: el body manda si lo trae; sin
+    // body, se usa su propio local (si tiene) solo como conveniencia —
+    // nunca como límite.
+    localId = explicitoValido ? explicito : propio;
+    if (!localId) {
       return {
-        error: superadmin
-          ? 'Como Superadministrador no tenés un local fijo: elegí a qué local pertenece este insumo (campo "local_id").'
-          : 'Tu usuario no tiene un local de trabajo asignado: elegí el local ("local_id") o pedí a un administrador que te asigne uno.',
+        error: 'Elige a qué local corresponde esta operación: como Administrador puedes operar sobre cualquier local activo.',
         requiereSeleccionLocal: true,
       };
     }
-    localId = explicito;
+  } else {
+    // Rol operativo: siempre su propio local, nunca el que mande el body.
+    if (!propio) {
+      return {
+        error: 'Tu usuario no tiene un local de trabajo asignado: pide a un administrador que te asigne uno.',
+        requiereSeleccionLocal: true,
+      };
+    }
+    if (explicitoValido && explicito !== propio) {
+      return { error: 'No puedes operar sobre un local distinto al tuyo.', prohibido: true };
+    }
+    localId = propio;
   }
+
   const { rows } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
-  if (!rows[0]) return { error: 'El local indicado no existe o no está activo.', requiereSeleccionLocal: !asignado };
+  if (!rows[0]) return { error: 'El local indicado no existe o no está activo.', requiereSeleccionLocal: libre || !propio };
   return { localId };
 };
+// Traduce el resultado de resolverLocalOperativo a la respuesta HTTP —
+// 403 (no 400) específicamente para el caso "prohibido": es un problema
+// de PERMISOS (intentó operar fuera de su local), no de datos inválidos.
+const responderErrorLocal = (res, resultado) => res.status(resultado.prohibido ? 403 : 400).json({
+  error: resultado.error,
+  ...(resultado.requiereSeleccionLocal ? { requiereSeleccionLocal: true } : {}),
+});
+// Chequeo de acceso simple para endpoints que YA reciben un local_id
+// concreto (path param o body), en vez de tener que resolverlo —
+// Administrador/Superadministrador sin límite; cualquier otro rol (ajustar
+// stock, activar/desactivar, borrar una fila de insumo_local/empaque_local
+// de un local puntual) solo puede operar sobre el suyo.
+const sinAccesoALocal = (req, localId) =>
+  !puedeElegirCualquierLocal(req.user) && Number(localId) !== Number(req.user?.local_id);
 
 insRouter.post('/', auth, async (req, res) => {
   try {
   const { categoriaId, unidadMedida, stockActual, stockMinimo, precioUnitario, descripcion, estado } = req.body;
   // Antes el nombre se insertaba directo: si era solo espacios, ni siquiera
-  // llegaba a insumoNombreDuplicado (que sale temprano con !nombre... pero
-  // "   " es truthy, así que comparaba espacios contra espacios y guardaba).
+  // llegaba a insumoExistentePorNombre (que sale temprano con !nombre...
+  // pero "   " es truthy, así que comparaba espacios contra espacios y
+  // guardaba).
   const errorNom = errorNombre(req.body.nombre, 'El nombre del insumo', LIMITES.NOMBRE);
-  if (errorNom) return res.status(400).json({ error: errorNom });
+  if (errorNom) return res.status(400).json({ campo: 'nombre', error: errorNom });
   const errorDesc = errorLongitud(descripcion, 'La descripción del insumo', LIMITES.DESCRIPCION);
-  if (errorDesc) return res.status(400).json({ error: errorDesc });
+  if (errorDesc) return res.status(400).json({ campo: 'descripcion', error: errorDesc });
   const nombre = nombreNormalizado(req.body.nombre);
   // La unidad es opcional al crear (igual que antes), pero si llega tiene
   // que ser una de las 7 unidades reales — "caja", "paquete", "bolsa" y
   // "docena" ya no son unidades válidas del insumo: ahora se registran por
   // ítem, al hacer la compra (ver PRESENTACIONES_VALIDAS / POST /compras).
   if (unidadMedida && !UNIDADES_VALIDAS.includes(unidadMedida)) {
-    return res.status(400).json({ error: `Unidad de medida inválida. Debe ser una de: ${UNIDADES_VALIDAS.join(', ')}.` });
+    return res.status(400).json({ campo: 'unidadMedida', error: `Unidad de medida inválida. Debe ser una de: ${UNIDADES_VALIDAS.join(', ')}.` });
   }
   // Los empaques (vasos, pitillos, desechables) ya no se crean como
   // insumos — ver requisito 4: usa /empaques.
   if (await categoriaEsEmpaques(categoriaId)) {
-    return res.status(422).json({ error: ERROR_CATEGORIA_EMPAQUES });
+    return res.status(422).json({ campo: 'categoriaId', error: ERROR_CATEGORIA_EMPAQUES });
   }
-  const flags = resolverFlagsTipoUso(req.body);
-  if (flags.error) return res.status(400).json({ error: flags.error });
 
   // stock_minimo es OBLIGATORIO al crear (ya no default 0 en silencio: un
   // insumo sin mínimo definido nunca dispara la alerta de stock bajo). El
@@ -1890,34 +2417,150 @@ insRouter.post('/', auth, async (req, res) => {
   // cuando la unidad es "unidad" (no hay "3.5 pitillos"), decimales para
   // el resto (kg/g/lb/oz/L/mL).
   const errorMin = errorCantidadPorUnidad(stockMinimo, 'El stock mínimo', unidadMedida);
-  if (errorMin) return res.status(400).json({ error: errorMin });
+  if (errorMin) return res.status(400).json({ campo: 'stockMinimo', error: errorMin });
+  // "Provisto" (el campo vino en el body, sea cual sea el valor) es solo
+  // para decidir si hay ALGO que validar el FORMATO — un 0 explícito
+  // (típico de un <input type="number"> controlado, que arranca en 0 en
+  // vez de "") es tan válido como no mandar nada. Lo que de verdad
+  // importa para el resto de la lógica (exigir a qué local va, el texto
+  // de Observaciones, el movimiento en el kardex) es si la cantidad es
+  // REALMENTE positiva — ver "hayStockInicialReal" más abajo. BUG real
+  // corregido acá: antes se usaba "provisto" (mera presencia) para todo
+  // eso, y un formulario que manda stockActual=0 sin querer (en vez de
+  // omitirlo) terminaba exigiendo un local_id que no hacía falta.
   const stockActualProvisto = stockActual !== undefined && stockActual !== null && stockActual !== '';
   if (stockActualProvisto) {
     const errorStock = errorCantidadPorUnidad(stockActual, 'El stock inicial', unidadMedida);
-    if (errorStock) return res.status(400).json({ error: errorStock });
+    if (errorStock) return res.status(400).json({ campo: 'stockActual', error: errorStock });
+  }
+  const stockActualNum = Number(stockActual) || 0;
+  const hayStockInicialReal = stockActualNum > 0;
+
+  // "¿En qué locales existe este insumo?" — el formulario ofrece tres
+  // formas de contestar, y las tres siguen siendo válidas al mismo tiempo:
+  //   • todosLosLocales=true            → CUALQUIER local activo. Se
+  //     mantiene por compatibilidad (algún cliente viejo podría seguir
+  //     mandándolo) aunque el formulario actual ya no ofrece esa opción —
+  //     hoy el flujo normal es UN solo local por alta (ver más abajo).
+  //   • localesSeleccionados=[ids...]   → SOLO esos locales. El formulario
+  //     actual manda siempre exactamente un id acá (ya no hay selector
+  //     múltiple ni "Todos los locales"), pero el backend sigue aceptando
+  //     varios por si algún cliente lo necesita — lo único que NUNCA se
+  //     acepta es una lista VACÍA: un insumo sin ningún local marcado no
+  //     quedaría activo en ninguna parte (activo=false en insumo_local
+  //     para TODOS, ver la siembra más abajo), un insumo "fantasma"
+  //     invisible en cualquier local hasta que alguien lo active a mano
+  //     sin siquiera saber que existe.
+  //   • ninguno de los dos              → se asume un único local: el que
+  //     venga en local_id (o el propio del rol operativo).
+  const todosLosLocales = req.body.todosLosLocales === true || req.body.todosLosLocales === 'true';
+  let localesSeleccionados = null; // null = "un solo local" (local_id/propio)
+  if (req.body.localesSeleccionados !== undefined && req.body.localesSeleccionados !== null) {
+    if (!Array.isArray(req.body.localesSeleccionados)) {
+      return res.status(400).json({ campo: 'localesSeleccionados', error: 'Los locales donde existe el insumo deben mandarse como una lista de ids.' });
+    }
+    if (req.body.localesSeleccionados.length === 0) {
+      return res.status(400).json({ campo: 'localesSeleccionados', error: 'Selecciona al menos un local donde existe este insumo.' });
+    }
+    const idsInvalidos = req.body.localesSeleccionados.filter(id => !Number.isInteger(Number(id)) || Number(id) <= 0);
+    if (idsInvalidos.length) {
+      return res.status(400).json({ campo: 'localesSeleccionados', error: 'La lista de locales donde existe el insumo contiene un id inválido.' });
+    }
+    localesSeleccionados = req.body.localesSeleccionados.map(Number);
   }
 
-  // El local ahora es OBLIGATORIO al crear un insumo (requisito 3): un
-  // insumo sin ningún local asignado no puede tener stock/mínimo en
-  // ninguna parte, así que ya no se permite crearlo "flotando" — se
-  // resuelve ANTES de insertar nada (automático para quien tiene local
-  // fijo; el Superadministrador debe elegirlo explícito en el body).
-  const { localId, error: errorLocal, requiereSeleccionLocal } = await resolverLocalDeTrabajo(req);
-  if (errorLocal) return res.status(400).json({ error: errorLocal, requiereSeleccionLocal: !!requiereSeleccionLocal });
+  const explicitoRaw = req.body.local_id;
+  const explicitoNum = Number(explicitoRaw);
+  const explicitoValido = explicitoRaw !== undefined && explicitoRaw !== null && explicitoRaw !== ''
+    && Number.isInteger(explicitoNum) && explicitoNum > 0;
 
-  // Espejo de la validación del frontend: no se puede crear un insumo si
-  // no hay ningún proveedor Activo (ni registrado, ni todos inactivos).
-  const { rows: activos } = await pool.query(`SELECT id FROM proveedores WHERE estado='Activo' LIMIT 1`);
-  if (activos.length === 0) {
-    return res.status(400).json({ error: 'No hay proveedores disponibles. Registra o activa un proveedor antes de crear un insumo.' });
+  // Rol operativo (Cajero/Bartender): solo puede seleccionar SU PROPIO
+  // local — nunca "todos", ni una lista con un id distinto al suyo, ni un
+  // local_id explícito distinto al suyo (403, no 400: es un intento real
+  // de operar fuera de su local, no un dato mal formado — y no se ignora
+  // en silencio, se rechaza). Administrador/Superadministrador no tienen
+  // este límite.
+  const rolLibre = puedeElegirCualquierLocal(req.user);
+  const propio = Number(req.user?.local_id) || null;
+  if (!rolLibre) {
+    if (!propio) {
+      return res.status(400).json({
+        campo: 'local_id',
+        error: 'Tu usuario no tiene un local de trabajo asignado: pide a un administrador que te asigne uno.',
+        requiereSeleccionLocal: true,
+      });
+    }
+    if (todosLosLocales
+        || (localesSeleccionados && localesSeleccionados.some(id => id !== propio))
+        || (explicitoValido && explicitoNum !== propio)) {
+      return res.status(403).json({ campo: 'local_id', error: 'No puedes operar sobre un local distinto al tuyo.' });
+    }
   }
-  if (await insumoNombreDuplicado(nombre, null)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+
+  // "local_id" (el que recibe el STOCK INICIAL) solo se exige cuando de
+  // verdad hace falta:
+  //   • hay una cantidad inicial REALMENTE positiva que ubicar
+  //     (hayStockInicialReal — no "stockActualProvisto": un 0 explícito no
+  //     necesita ningún local "recipiente", es 0 en todos lados igual), o
+  //   • es el ÚNICO dato disponible para saber en qué local existe el
+  //     insumo (ni todosLosLocales ni localesSeleccionados se mandaron).
+  const haceFaltaLocalId = hayStockInicialReal || (!todosLosLocales && !localesSeleccionados);
+  let localId = null;
+  if (haceFaltaLocalId) {
+    if (!rolLibre) {
+      localId = propio; // ya validado arriba: no puede ser otro
+    } else if (explicitoValido) {
+      localId = explicitoNum;
+    } else if (localesSeleccionados && localesSeleccionados.length === 1) {
+      localId = localesSeleccionados[0]; // un solo local elegido: se infiere, sin pedirlo dos veces
+    } else {
+      localId = propio; // conveniencia si el admin además tiene uno propio
+    }
+    if (!localId) {
+      return res.status(400).json({
+        campo: 'local_id',
+        error: hayStockInicialReal
+          ? 'Elige a qué local va el stock inicial: como Administrador puedes operar sobre cualquier local activo.'
+          : 'Elige en qué local existe este insumo: como Administrador puedes operar sobre cualquier local activo.',
+        requiereSeleccionLocal: true,
+      });
+    }
+    const { rows: localOk } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
+    if (!localOk[0]) return res.status(400).json({ campo: 'local_id', error: 'El local indicado no existe o no está activo.' });
+    // BUG corregido en la ronda anterior, se conserva: el local del stock
+    // inicial siempre tiene que estar entre los locales donde el insumo
+    // quedó marcado como existente — nunca se cuela en una fila inactiva.
+    if (localesSeleccionados && !localesSeleccionados.includes(localId)) {
+      return res.status(400).json({
+        campo: 'local_id',
+        error: 'El local del stock inicial debe estar entre los locales donde marcaste que este insumo existe.',
+      });
+    }
   }
+
+  const dupNombre = await insumoExistentePorNombre(nombre, null);
+  if (dupNombre) {
+    return res.status(400).json(respuestaNombreDuplicado(dupNombre));
+  }
+
+  // "Observaciones" es un campo libre y editable, distinto de la
+  // descripción del insumo — sirve para dejar constancia de eventos como
+  // el stock inicial. Si se crea CON cantidad inicial y quien llena el
+  // formulario no escribió su propia observación, se guarda un texto por
+  // defecto que explica de dónde salió ese número (nunca "de la nada");
+  // pero si el usuario SÍ mandó su propio texto, ese se respeta siempre —
+  // el default nunca pisa lo que el usuario ya escribió.
+  const errorObsIns = errorLongitud(req.body.observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
+  if (errorObsIns) return res.status(400).json({ campo: 'observaciones', error: errorObsIns });
+  const observacionesUsuario = textoLimpio(req.body.observaciones || '');
+  const observacionesFinal = observacionesUsuario
+    ? observacionesUsuario
+    : (hayStockInicialReal ? 'Comenzó con cantidad existente' : null);
+
   const { rows } = await pool.query(
-    `INSERT INTO insumos(nombre,categoria_id,unidad,precio_unitario,descripcion,estado,es_topping,es_insumo,es_adicion)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
-    [nombre, categoriaId || null, unidadMedida || null, precioUnitario || 0, descripcion || null, estado || 'Activo', flags.esTopping, flags.esInsumo, flags.esAdicion]
+    `INSERT INTO insumos(nombre,categoria_id,unidad,precio_unitario,descripcion,estado,observaciones)
+     VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [nombre, categoriaId || null, unidadMedida || null, precioUnitario || 0, descripcion || null, estado || 'Activo', observacionesFinal]
   );
   const insumoId = rows[0].id;
 
@@ -1930,49 +2573,83 @@ insRouter.post('/', auth, async (req, res) => {
   // stock_minimo como valor por defecto heredado — se puede ajustar
   // después, por local, con PUT /insumos/:id/locales/:localId.
   //
-  // Requisito 6 (esta ronda) — "Todos los locales": lo que varía con este
-  // flag es SOLO el "activo" de cada fila, nunca cuáles existen (todas
-  // existen siempre, ver arriba) — así ningún local muestra un error, solo
-  // 0 en vez de "insumo no disponible aquí".
-  //   • todosLosLocales=true → activo=true en TODAS (el "local_id" que se
-  //     resolvió arriba sigue siendo, únicamente, el que recibe el stock
-  //     inicial indicado — no cambia por este flag).
-  //   • sin el flag (un local puntual, el de siempre) → activo=true SOLO
-  //     en el local elegido; el resto queda activo=false (existen, pero no
+  // "¿En qué locales existe?" (todosLosLocales / localesSeleccionados, ya
+  // resueltos y validados arriba): lo que varía es SOLO el "activo" de
+  // cada fila, nunca cuáles existen (todas existen siempre, ver arriba) —
+  // así ningún local muestra un error, solo 0 en vez de "insumo no
+  // disponible aquí".
+  //   • todosLosLocales=true          → activo=true en TODAS.
+  //   • localesSeleccionados=[ids...] → activo=true SOLO en esos ids.
+  //   • ninguno de los dos            → activo=true SOLO en el local
+  //     elegido (localId); el resto queda activo=false (existen, pero no
   //     se ofrecen ahí hasta que alguien las active a mano).
+  // En los tres casos, localId (el que recibe el stock inicial) YA quedó
+  // validado arriba como parte del conjunto — nunca puede terminar en una
+  // fila que se cree inactiva.
   // TODO local, activo o inactivo (mismo criterio que
   // asegurarInsumoLocalEnTodosLosLocales en config/db.js): un local
   // desactivado igual conserva su fila en solo lectura, para no dejarle
   // huecos que la migración tenga que ir rellenando después.
-  const todosLosLocales = req.body.todosLosLocales === true || req.body.todosLosLocales === 'true';
   const { rows: locales } = await pool.query(`SELECT id FROM locales`);
   const stockMinimoNum = Number(stockMinimo);
-  const stockActualNum = Number(stockActual) || 0;
   for (const l of locales) {
     const esElElegido = l.id === localId;
-    const activoAqui = esElElegido || todosLosLocales;
-    await pool.query(
-      `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,$3,$4,$5)
-         ON CONFLICT (insumo_id, local_id) DO NOTHING`,
-      [insumoId, l.id, esElElegido ? stockActualNum : 0, stockMinimoNum, activoAqui]
-    );
+    const activoAqui = todosLosLocales || (localesSeleccionados ? localesSeleccionados.includes(l.id) : esElElegido);
+    try {
+      await pool.query(
+        `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,$3,$4,$5)
+           ON CONFLICT (insumo_id, local_id) DO NOTHING`,
+        [insumoId, l.id, esElElegido ? stockActualNum : 0, stockMinimoNum, activoAqui]
+      );
+    } catch (e) {
+      // 23503 = viola FK: el local se borró justo entre el SELECT de arriba
+      // y este INSERT (una carrera real, aunque rara, entre dos peticiones
+      // simultáneas) — no hay nada que sembrar para un local que ya no
+      // existe, así que se salta esta fila en vez de tumbar la creación
+      // completa del insumo por un local que dejó de importar.
+      if (e.code !== '23503') throw e;
+      console.error(`⚠️  No se sembró insumo_local para local #${l.id} (insumo #${insumoId}): el local ya no existe.`);
+    }
+  }
+  // Si se creó con cantidad inicial REAL (>0), ese número queda trazado en
+  // el kardex (movimientos_inventario) igual que cualquier otro ajuste de
+  // stock — nunca es solo un valor suelto en insumo_local sin rastro de su
+  // origen. Un stockActual=0 explícito no genera movimiento: no hay
+  // ningún cambio de stock que trazar.
+  if (hayStockInicialReal) {
+    await registrarMovimientoInventario(pool, {
+      tipo: 'ajuste', insumoId, localId, cantidad: stockActualNum,
+      referenciaTipo: 'alta_insumo', referenciaId: insumoId,
+    });
   }
   // La respuesta ya trae "porLocal" con el "activo" de cada fila (ver
   // obtenerInsumoCompleto) — así el front sabe exactamente en qué locales
   // quedó disponible este insumo, para mostrarlo al editar.
   res.status(201).json(await obtenerInsumoCompleto(insumoId));
   } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+    // 23505: dos altas casi simultáneas con el mismo nombre — la
+    // comprobación de arriba no alcanzó a verlas. Mismo mensaje accionable
+    // que el chequeo por adelantado (best-effort: si esta segunda consulta
+    // también falla, se cae al mensaje plano de siempre).
+    if (e.code === '23505') {
+      const dup = await insumoExistentePorNombre(nombre, null).catch(() => null);
+      return res.status(400).json(respuestaNombreDuplicado(dup));
+    }
     res.status(500).json({ error: e.message });
   }
 });
 insRouter.put('/:id', auth, async (req, res) => {
   try {
-  const { categoriaId, unidadMedida, precioUnitario, descripcion, estado } = req.body;
+  const { categoriaId, unidadMedida, precioUnitario, descripcion, estado, observaciones } = req.body;
   const errorNom = errorNombre(req.body.nombre, 'El nombre del insumo', LIMITES.NOMBRE);
   if (errorNom) return res.status(400).json({ error: errorNom });
   const errorDesc = errorLongitud(descripcion, 'La descripción del insumo', LIMITES.DESCRIPCION);
   if (errorDesc) return res.status(400).json({ error: errorDesc });
+  // Observaciones es libremente editable después de creado (a diferencia de
+  // la unidad): el texto por defecto que puso la creación ("Comenzó con
+  // cantidad existente") es solo un punto de partida, nunca un valor fijo.
+  const errorObsIns = errorLongitud(observaciones, 'Las observaciones', LIMITES.OBSERVACIONES);
+  if (errorObsIns) return res.status(400).json({ error: errorObsIns });
   const nombre = nombreNormalizado(req.body.nombre);
 
   // La unidad de medida es inmutable una vez creado el insumo: cambiarla
@@ -1981,7 +2658,7 @@ insRouter.put('/:id', auth, async (req, res) => {
   // cualquier intento de mandar un valor distinto al que ya tiene guardado
   // (incluso si el nuevo valor es, por sí solo, una unidad válida).
   const { rows: actual } = await pool.query(
-    'SELECT unidad, categoria_id, es_insumo, es_adicion, es_topping FROM insumos WHERE id=$1', [req.params.id]
+    'SELECT unidad, categoria_id FROM insumos WHERE id=$1', [req.params.id]
   );
   if (!actual[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const unidadEnviada = unidadMedida || null;
@@ -1991,24 +2668,24 @@ insRouter.put('/:id', auth, async (req, res) => {
   if (await categoriaEsEmpaques(categoriaId)) {
     return res.status(422).json({ error: ERROR_CATEGORIA_EMPAQUES });
   }
-  const flags = resolverFlagsTipoUso(req.body, {
-    esInsumo: actual[0].es_insumo, esAdicion: actual[0].es_adicion, esTopping: actual[0].es_topping,
-  });
-  if (flags.error) return res.status(400).json({ error: flags.error });
 
-  // La unicidad de nombre ahora es GLOBAL (ver insumoNombreDuplicado).
-  if (await insumoNombreDuplicado(nombre, req.params.id)) {
-    return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+  // La unicidad de nombre ahora es GLOBAL (ver insumoExistentePorNombre).
+  const dupNombreEdit = await insumoExistentePorNombre(nombre, req.params.id);
+  if (dupNombreEdit) {
+    return res.status(400).json(respuestaNombreDuplicado(dupNombreEdit));
   }
   const { rows } = await pool.query(
-    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,precio_unitario=$4,descripcion=$5,estado=$6,es_topping=$7,es_insumo=$8,es_adicion=$9
-     WHERE id=$10 RETURNING id`,
-    [nombre, categoriaId || null, unidadEnviada, precioUnitario, descripcion || null, estado, flags.esTopping, flags.esInsumo, flags.esAdicion, req.params.id]
+    `UPDATE insumos SET nombre=$1,categoria_id=$2,unidad=$3,precio_unitario=$4,descripcion=$5,estado=$6,observaciones=$7
+     WHERE id=$8 RETURNING id`,
+    [nombre, categoriaId || null, unidadEnviada, precioUnitario, descripcion || null, estado, textoLimpio(observaciones || '') || null, req.params.id]
   );
   if (!rows[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   res.json(await obtenerInsumoCompleto(req.params.id));
   } catch (e) {
-    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un insumo con ese nombre.' });
+    if (e.code === '23505') {
+      const dup = await insumoExistentePorNombre(nombre, req.params.id).catch(() => null);
+      return res.status(400).json(respuestaNombreDuplicado(dup));
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -2066,7 +2743,10 @@ insRouter.post('/:id/locales', auth, async (req, res) => {
   if (!existe[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const localId = Number(req.body.local_id);
   if (!Number.isInteger(localId) || localId <= 0) {
-    return res.status(400).json({ error: 'Debes indicar el local ("local_id").' });
+    return res.status(400).json({ error: 'Debes indicar el local.' });
+  }
+  if (sinAccesoALocal(req, localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
   }
   const { rows: localOk } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
   if (!localOk[0]) return res.status(400).json({ error: 'El local indicado no existe o no está activo.' });
@@ -2092,6 +2772,9 @@ insRouter.post('/:id/locales', auth, async (req, res) => {
 });
 insRouter.put('/:id/locales/:localId', auth, async (req, res) => {
   try {
+  if (sinAccesoALocal(req, req.params.localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
+  }
   const { rows: insumo } = await pool.query('SELECT unidad FROM insumos WHERE id=$1', [req.params.id]);
   if (!insumo[0]) return res.status(404).json({ error: 'Insumo no encontrado' });
   const { stockActual, stockMinimo, activo } = req.body;
@@ -2112,6 +2795,9 @@ insRouter.put('/:id/locales/:localId', auth, async (req, res) => {
 });
 insRouter.delete('/:id/locales/:localId', auth, async (req, res) => {
   try {
+  if (sinAccesoALocal(req, req.params.localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
+  }
   const { rows } = await pool.query(
     `DELETE FROM insumo_local WHERE insumo_id=$1 AND local_id=$2 RETURNING id`,
     [req.params.id, req.params.localId]
@@ -2233,7 +2919,7 @@ empRouterEmpaques.post('/', auth, async (req, res) => {
     [nombre, unidadMedida || 'unidad', precioUnitario || 0, descripcion || null, estado || 'Activo']
   );
   const empaqueId = rows[0].id;
-  const { localId } = await resolverLocalDeTrabajo(req);
+  const { localId } = await resolverLocalOperativo(req);
   if (localId) {
     await pool.query(
       `INSERT INTO empaque_local(empaque_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,$3,$4,true)`,
@@ -2316,7 +3002,10 @@ empRouterEmpaques.post('/:id/locales', auth, async (req, res) => {
   const { rows: existe } = await pool.query('SELECT id FROM empaques WHERE id=$1', [req.params.id]);
   if (!existe[0]) return res.status(404).json({ error: 'Empaque no encontrado' });
   const localId = Number(req.body.local_id);
-  if (!Number.isInteger(localId) || localId <= 0) return res.status(400).json({ error: 'Debes indicar el local ("local_id").' });
+  if (!Number.isInteger(localId) || localId <= 0) return res.status(400).json({ error: 'Debes indicar el local.' });
+  if (sinAccesoALocal(req, localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
+  }
   const { rows: localOk } = await pool.query(`SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localId]);
   if (!localOk[0]) return res.status(400).json({ error: 'El local indicado no existe o no está activo.' });
   const stockActual = Number(req.body.stockActual) || 0;
@@ -2335,6 +3024,9 @@ empRouterEmpaques.post('/:id/locales', auth, async (req, res) => {
 });
 empRouterEmpaques.put('/:id/locales/:localId', auth, async (req, res) => {
   try {
+  if (sinAccesoALocal(req, req.params.localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
+  }
   const { stockActual, stockMinimo, activo } = req.body;
   if (stockActual !== undefined && Number(stockActual) < 0) return res.status(400).json({ error: 'El stock no puede ser negativo.' });
   if (stockMinimo !== undefined && Number(stockMinimo) < 0) return res.status(400).json({ error: 'El stock mínimo no puede ser negativo.' });
@@ -2351,6 +3043,9 @@ empRouterEmpaques.put('/:id/locales/:localId', auth, async (req, res) => {
 });
 empRouterEmpaques.delete('/:id/locales/:localId', auth, async (req, res) => {
   try {
+  if (sinAccesoALocal(req, req.params.localId)) {
+    return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
+  }
   const { rows } = await pool.query(
     `DELETE FROM empaque_local WHERE empaque_id=$1 AND local_id=$2 RETURNING id`,
     [req.params.id, req.params.localId]
@@ -2399,7 +3094,7 @@ prodEmpRouter.get('/:id', auth, async (req, res) => {
 });
 const validarProductoEmpaqueBody = async (body) => {
   const productoId = Number(body.producto_id);
-  if (!Number.isInteger(productoId) || productoId <= 0) return { error: 'Debes indicar el producto ("producto_id").' };
+  if (!Number.isInteger(productoId) || productoId <= 0) return { error: 'Debes indicar el producto.' };
   const { rows: prod } = await pool.query('SELECT id FROM productos WHERE id=$1', [productoId]);
   if (!prod[0]) return { error: 'El producto indicado no existe.' };
 
@@ -2471,6 +3166,13 @@ const COMPRA_COLS = `
   c.id, c.codigo, c.proveedor_id AS "proveedorId", p.nombre AS "proveedorNombre",
   c.fecha, c.descuento, c.total, c.estado, c.observaciones, c.items,
   c.comprobante_url, c.comprobante_verificado, c.comprobante_total_ocr,
+  -- El comprobante SIEMPRE fue opcional acá (nunca hubo un NOT NULL ni una
+  -- validación que lo exigiera en el backend — la obligatoriedad que
+  -- existía era solo del FORMULARIO del frontend, ver CompraForm.jsx /
+  -- RegistrarCompraPage.jsx). Este booleano explícito es para que el
+  -- frontend no tenga que inferirlo revisando si "comprobante_url" viene
+  -- o no — mismo criterio que ya usa PEDIDO_SELECT con "tieneComprobante".
+  (c.comprobante_url IS NOT NULL) AS "tieneComprobante",
   c.ocr_resultado AS "ocrResultado",
   c.motivo_anulacion AS "motivoAnulacion",
   c.local_id AS "localId", lo.nombre AS "localNombre",
@@ -2639,7 +3341,19 @@ const validarItemCompra = async (item, index) => {
 // modo/tipo_presentacion/etc., así que la reversión usa la misma cuenta).
 const calcularCantidadStock = (item) => {
   if (item?.modo === 'presentacion') {
-    return (Number(item.cantidad_presentaciones) || 0) * (Number(item.contenido_por_presentacion) || 0);
+    const bruto = (Number(item.cantidad_presentaciones) || 0) * (Number(item.contenido_por_presentacion) || 0);
+    // Requisito de esta ronda — bug real: una multiplicación en punto
+    // flotante de dos valores con decimales "limpios" (ej. 3.5 cajas × 11.8
+    // de contenido) puede arrastrar ruido binario típico de JS
+    // (41.300000000000004) que antes se guardaba y mostraba tal cual: en
+    // compras.items (JSONB, sin tope de precisión, a diferencia de
+    // insumo_local.stock que SÍ es NUMERIC(10,2) y ahí Postgres ya lo
+    // redondeaba solo) y en los mensajes de error de anulación parcial
+    // ("solo quedan X pendientes de anular"). Se redondea a 2 decimales —
+    // mismo tope que validarItemCompra ya exige para "cantidad" y mismo
+    // scale que insumo_local.stock — antes de que ese número se use para
+    // sumar al stock, guardarse en cantidad_anulada, o mostrarse.
+    return Math.round(bruto * 100) / 100;
   }
   return Number(item?.cantidad) || 0;
 };
@@ -3039,13 +3753,23 @@ compRouter.get('/', auth, async (req, res) => {
   try {
   // Filtro opcional por local (?local_id=): para "ver compras de este
   // local". Sin el parámetro, devuelve todas las activas (igual que antes).
-  const { local_id } = req.query;
+  // ?desde=/?hasta= filtran por c.fecha (la fecha REAL de la compra, no
+  // cuándo se registró en el sistema) — es DATE, sin hora.
+  const { local_id, desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
-  let cond = `c.estado='activa'`;
+  // 'anulada_parcial' sigue en circulación (todavía le queda algún ítem
+  // válido, ver PATCH /:id/estado — perdón, /:id/anular) así que tiene que
+  // seguir apareciendo acá igual que 'activa'; sin esto, una compra parcial
+  // desaparecía de esta lista Y del historial (que solo pide 'anulada'
+  // exacta) — no quedaba visible en ningún lado.
+  let cond = `c.estado IN ('activa', 'anulada_parcial')`;
   if (local_id !== undefined && local_id !== '') {
     params.push(Number(local_id));
     cond += ` AND c.local_id = $${params.length}`;
   }
+  cond += [...condicionRangoFechasDate('c.fecha', desde, hasta, params)].map(c => ` AND ${c}`).join('');
   const { rows } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE ${cond} ORDER BY c.id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3064,16 +3788,19 @@ compRouter.get('/historial', auth, async (req, res) => {
   // muestra TODAS las compras activas sin límite de tiempo, con su propia
   // paginación en el frontend. El historial queda reservado únicamente
   // para lo que salió de circulación por haberse anulado.
-  const { local_id } = req.query;
+  const { local_id, desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
   let filtroLocal = '';
   if (local_id !== undefined && local_id !== '') {
     params.push(Number(local_id));
     filtroLocal = ` AND c.local_id = $${params.length}`;
   }
+  const filtroFecha = condicionRangoFechasDate('c.fecha', desde, hasta, params).map(c => ` AND ${c}`).join('');
   const { rows } = await pool.query(
     `SELECT ${COMPRA_COLS} ${COMPRA_JOINS}
-     WHERE c.estado = 'anulada'${filtroLocal}
+     WHERE c.estado = 'anulada'${filtroLocal}${filtroFecha}
      ORDER BY c.id DESC`,
     params
   );
@@ -3097,26 +3824,15 @@ compRouter.post('/', auth, async (req, res) => {
   } = req.body;
 
   // Local de la compra: define a qué local se le suma el stock.
-  //   • Usuario CON local fijo: si no manda `local_id`, se usa el suyo; si
-  //     lo manda, se respeta (una compra puede ser para otro local).
-  //   • Superadministrador / usuario SIN local fijo: DEBE elegirlo (selector).
-  let localIdCompra = Number(req.body.local_id) || null;
-  if (!localIdCompra) {
-    const superadmin = await esSuperadmin(req.user);
-    localIdCompra = superadmin ? null : (Number(req.user?.local_id) || null);
-  }
-  if (!Number.isInteger(localIdCompra) || localIdCompra <= 0) {
-    return res.status(400).json({
-      error: 'Elegí el local de la compra (campo "local_id"): define a qué local se le suma el stock.',
-      requiereSeleccionLocal: true,
-    });
-  }
-  const { rows: localOk } = await pool.query(
-    `SELECT id FROM locales WHERE id=$1 AND estado='Activo'`, [localIdCompra]
-  );
-  if (!localOk[0]) {
-    return res.status(400).json({ error: 'El local de la compra no existe o no está activo.', requiereSeleccionLocal: true });
-  }
+  //   • Administrador/Superadministrador: sin restricción — puede registrar
+  //     la compra para CUALQUIER local activo (el suyo, si tiene uno, es
+  //     solo el default cuando no manda local_id explícito).
+  //   • Cualquier otro rol (Cajero/Bartender): SIEMPRE el suyo — 403 si
+  //     manda uno distinto (antes esto se respetaba sin más: "una compra
+  //     puede ser para otro local" no debería valer para un rol operativo).
+  const resultadoLocal = await resolverLocalOperativo(req);
+  if (resultadoLocal.error) return responderErrorLocal(res, resultadoLocal);
+  const localIdCompra = resultadoLocal.localId;
 
   // Una compra es un hecho ya ocurrido: no se puede registrar con una
   // fecha posterior al día de hoy. El frontend ya bloquea esto en el
@@ -3224,6 +3940,20 @@ compRouter.post('/', auth, async (req, res) => {
   res.status(201).json(full[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// Anular una compra — TOTAL (comportamiento de siempre, sin "items" en el
+// body) o PARCIAL (con "items": [{insumo_id, cantidad}, ...]): revierte
+// el stock SOLO de los insumos/cantidades indicados, dejando el resto de
+// la compra intacto. Cada línea de compras.items lleva su propio
+// "cantidad_anulada" (acumulado — nunca se pisa, se suma), así que varias
+// anulaciones parciales sucesivas sobre el mismo insumo no revierten de
+// más ni pierden cuenta de lo ya anulado.
+//   • Sin "items" en el body → anula TODO lo que quede pendiente de cada
+//     línea (igual que antes de este cambio: compatibilidad total con
+//     cualquier caller que solo mande {motivo}).
+//   • Con "items" → SOLO se anula lo pedido. Si al terminar TODA la
+//     compra queda anulada (cada línea con cantidad_anulada >= lo
+//     comprado), estado='anulada'; si queda ALGO sin anular,
+//     estado='anulada_parcial'.
 compRouter.patch('/:id/anular', auth, async (req, res) => {
   try {
   // El motivo de anulación queda como registro permanente de por qué se
@@ -3239,22 +3969,92 @@ compRouter.patch('/:id/anular', auth, async (req, res) => {
   if (!actual[0]) return res.status(404).json({ error: 'Compra no encontrada' });
   if (actual[0].estado === 'anulada') return res.status(400).json({ error: 'Esta compra ya está anulada.' });
 
-  // Revertir el stock que esta compra había sumado — con la misma cuenta
-  // que se usó al crearla, SOLO en el local de la compra. Las compras
-  // nuevas traen it.insumo_id sellado; las viejas (de antes de ese cambio)
-  // no lo traen y se resuelven por nombre contra el catálogo global.
-  for (const it of (actual[0].items || [])) {
-    const insumoId = it.insumo_id || await resolverInsumoIdPorNombre(it.insumo);
-    if (!insumoId || !actual[0].local_id) continue; // sin insumo o sin local resuelto: nada que revertir
+  // Cada línea, con su insumo_id resuelto (las viejas no lo traían
+  // sellado — se resuelve por nombre igual que antes) y lo que TODAVÍA le
+  // queda por anular (comprado - ya anulado en anulaciones previas).
+  const items = (actual[0].items || []).map((it) => ({ ...it }));
+  for (const it of items) {
+    if (!it.insumo_id) it.insumo_id = await resolverInsumoIdPorNombre(it.insumo);
+  }
+  const pendiente = (it) => calcularCantidadStock(it) - (Number(it.cantidad_anulada) || 0);
+
+  const itemsSolicitados = Array.isArray(req.body.items) ? req.body.items : null;
+
+  if (itemsSolicitados) {
+    if (itemsSolicitados.length === 0) {
+      return res.status(400).json({ error: 'La lista de items a anular no puede venir vacía.' });
+    }
+    // Se valida TODO antes de tocar nada: si un solo ítem pedido no
+    // corresponde a la compra o excede lo pendiente, la anulación
+    // completa se rechaza (nunca una anulación a medias por un error en
+    // el ítem 3 de 5).
+    for (let i = 0; i < itemsSolicitados.length; i++) {
+      const pedido = itemsSolicitados[i];
+      const insumoId = Number(pedido?.insumo_id);
+      const cantidad = Number(pedido?.cantidad);
+      if (!Number.isInteger(insumoId) || insumoId <= 0) {
+        return res.status(400).json({ error: `Ítem ${i + 1}: "insumo_id" es obligatorio y debe ser un id válido.` });
+      }
+      if (!Number.isFinite(cantidad) || cantidad <= 0) {
+        return res.status(400).json({ error: `Ítem ${i + 1}: "cantidad" debe ser un número mayor a 0.` });
+      }
+      const lineas = items.filter((it) => it.insumo_id === insumoId);
+      if (lineas.length === 0) {
+        return res.status(400).json({ error: `El insumo #${insumoId} no forma parte de esta compra.` });
+      }
+      const disponible = lineas.reduce((sum, it) => sum + Math.max(pendiente(it), 0), 0);
+      if (cantidad > disponible + 1e-9) {
+        return res.status(400).json({
+          error: `El insumo #${insumoId}: no se pueden anular ${cantidad} — solo quedan ${disponible} pendientes de anular en esta compra.`,
+        });
+      }
+    }
+
+    // Ya validado todo: se consume cada solicitud contra las líneas de ese
+    // insumo (en orden), acumulando cantidad_anulada por línea.
+    for (const pedido of itemsSolicitados) {
+      const insumoId = Number(pedido.insumo_id);
+      let restante = Number(pedido.cantidad);
+      for (const it of items) {
+        if (restante <= 0) break;
+        if (it.insumo_id !== insumoId) continue;
+        const disponibleLinea = pendiente(it);
+        if (disponibleLinea <= 0) continue;
+        const aAnular = Math.min(disponibleLinea, restante);
+        it.cantidad_anulada = (Number(it.cantidad_anulada) || 0) + aAnular;
+        restante -= aAnular;
+      }
+    }
+  } else {
+    // Sin "items": anular TODO lo pendiente de cada línea — mismo
+    // resultado que la anulación total de siempre.
+    for (const it of items) {
+      const rest = pendiente(it);
+      if (rest > 0) it.cantidad_anulada = (Number(it.cantidad_anulada) || 0) + rest;
+    }
+  }
+
+  // Revertir stock — solo la porción recién anulada en ESTA llamada (no
+  // el acumulado histórico, que ya se revirtió en anulaciones previas).
+  const itemsOriginales = actual[0].items || [];
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    const anuladoAntes = Number(itemsOriginales[i]?.cantidad_anulada) || 0;
+    const anuladoAhora = (Number(it.cantidad_anulada) || 0) - anuladoAntes;
+    if (anuladoAhora <= 0 || !it.insumo_id || !actual[0].local_id) continue;
     await ajustarStockInsumoLocal(
-      insumoId, actual[0].local_id, -calcularCantidadStock(it),
+      it.insumo_id, actual[0].local_id, -anuladoAhora,
       { tipo: 'anulacion_compra', referenciaTipo: 'compra', referenciaId: Number(req.params.id) }
     );
   }
 
+  // Estado final de la compra según cuánto quedó sin anular en total.
+  const totalPendiente = items.reduce((sum, it) => sum + Math.max(pendiente(it), 0), 0);
+  const estadoFinal = totalPendiente <= 1e-9 ? 'anulada' : 'anulada_parcial';
+
   await pool.query(
-    `UPDATE compras SET estado='anulada', motivo_anulacion=$1, fecha_anulacion=NOW() WHERE id=$2`,
-    [motivo, req.params.id]
+    `UPDATE compras SET estado=$1, items=$2, motivo_anulacion=$3, fecha_anulacion=NOW() WHERE id=$4`,
+    [estadoFinal, JSON.stringify(items), motivo, req.params.id]
   );
   const { rows: full } = await pool.query(`SELECT ${COMPRA_COLS} ${COMPRA_JOINS} WHERE c.id=$1`, [req.params.id]);
   res.json(full[0]);
@@ -3297,6 +4097,25 @@ const ESTADOS_PEDIDO_VALIDOS = [...ESTADOS_PEDIDO_ORDEN, 'cancelado'];
 const normalizarEstadoPedido = (v) =>
   String(v ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
 
+// Alias único por pedido "de mostrador/mesa" (sin cliente_id): distingue
+// a dos clientes con el MISMO nombre que tienen un pedido abierto al
+// mismo tiempo (ej. dos "Juan" — "Juan - mesa 3" vs "Juan - ventana").
+// Solo se exige (y se valida único) cuando NO hay cliente_id — un
+// cliente registrado ya tiene un identificador real y sin ambigüedad.
+// "Activo" acá significa "todavía no llegó a un estado final" (ni
+// entregado ni cancelado): una vez el pedido se entrega, su venta queda
+// como un hecho ya cerrado y el alias puede reutilizarse para un cliente
+// nuevo — no tiene sentido "reservarlo" para siempre.
+const aliasEnUso = async (alias, excluirId) => {
+  if (!alias) return false;
+  const params = excluirId ? [alias, excluirId] : [alias];
+  const cond = excluirId
+    ? `lower(btrim(alias))=lower(btrim($1)) AND estado NOT IN ('entregado','cancelado') AND id<>$2`
+    : `lower(btrim(alias))=lower(btrim($1)) AND estado NOT IN ('entregado','cancelado')`;
+  const { rows } = await pool.query(`SELECT id FROM pedidos WHERE ${cond} LIMIT 1`, params);
+  return !!rows[0];
+};
+
 // Único conjunto de métodos de pago válido para pedidos NUEVOS — coincide
 // con el CHECK pedidos_pago_check de config/db.js/schema.sql (agregado con
 // NOT VALID: no toca pedidos ya guardados con un valor viejo como
@@ -3338,6 +4157,37 @@ const normalizarPago = (pago) => (pago ? String(pago).toLowerCase() : null);
 // valor real que el frontend siempre mandó en minúscula — de ahí que el
 // pago en efectivo quedara bloqueado como si no lo fuera.
 const esEfectivo = (pago) => String(pago || '').toLowerCase() === 'efectivo';
+
+// Estado del PAGO — CAMPO SEPARADO del estado del pedido (nunca se
+// mezclan): antes, "pago rechazado" solo existía como una combinación
+// implícita (pedido.estado='cancelado' + comprobante_motivo_rechazo lleno)
+// indistinguible, para quien consume la API, de cualquier OTRO motivo de
+// cancelación (el cliente se arrepiente, un administrador lo anula, etc.) —
+// el frontend no tenía ningún campo propio donde leer "esto fue un pago
+// rechazado" para decidir mostrar "Contactar con nosotros" en vez de "Ver
+// factura". Se deriva de columnas que YA EXISTEN (no hace falta una
+// migración ni una tabla nueva):
+//   • 'rechazado'              → el pedido se canceló por un comprobante
+//     rechazado (comprobante_motivo_rechazo lleno — SOLO lo pone PATCH
+//     /:id/comprobante/rechazar). Una cancelación por cualquier otra causa
+//     deja ese campo en NULL, así que nunca se confunde con esta.
+//   • 'pendiente_verificacion' → tiene (o requiere) comprobante y todavía
+//     nadie lo revisó.
+//   • 'aprobado'               → pago_confirmado = true (comprobante ya
+//     aprobado, o efectivo/pago en local confirmado a mano).
+//   • 'pendiente'              → el resto: efectivo/local sin confirmar
+//     todavía, o un pedido cargado por mostrador sin método de pago.
+const calcularEstadoPago = (p) => {
+  if (p.estado === 'cancelado' && p.comprobante_motivo_rechazo) return 'rechazado';
+  if (p.estado === 'pendiente_verificacion') return 'pendiente_verificacion';
+  if (p.pago_confirmado) return 'aprobado';
+  return 'pendiente';
+};
+// Envuelve un pedido (o el resultado de un INSERT/UPDATE "RETURNING *")
+// agregándole "estado_pago" — se usa en TODA respuesta que devuelva un
+// pedido, para que el contrato sea siempre el mismo sin importar por qué
+// endpoint se pidió.
+const conEstadoPago = (p) => (p ? { ...p, estado_pago: calcularEstadoPago(p) } : p);
 
 // Separa, para cada línea de "items" de un pedido, la RECETA BASE del
 // producto (fija, sale de fichas_tecnicas — nunca cambia por pedido) de la
@@ -3465,6 +4315,91 @@ const enriquecerItemsPedido = async (items) => {
   });
 };
 
+// ── Estado de DEVOLUCIÓN de un pedido — campo separado de "estado" y de
+// "estado_pago" (mismo criterio: nunca mezclar conceptos distintos en un
+// solo campo ambiguo). Se calcula sumando TODAS las devoluciones
+// APROBADAS de este pedido (puede haber más de una, ej. dos devoluciones
+// parciales que entre las dos terminan cubriendo todo el pedido) contra
+// las cantidades realmente compradas en cada línea de "pedidos.items".
+//   • 'ninguna' → no hay ninguna devolución aprobada.
+//   • 'parcial' → lo devuelto no cubre TODAS las unidades de TODAS las
+//     líneas — el pedido/la venta principal se mantienen intactos.
+//   • 'total'   → lo devuelto cubre exactamente (o más, por seguridad)
+//     todo lo comprado — recién ahí tiene sentido que la VENTA completa
+//     quede marcada 'devuelto' (ver PATCH /devoluciones/:id/estado).
+// `devolucionesAprobadas` son filas crudas de la tabla (con su columna
+// "items", el array ya resuelto por línea que arma POST /devoluciones —
+// cada entrada trae "item_index").
+const calcularEstadoDevolucion = (pedidoItems, devolucionesAprobadas) => {
+  const devueltoPorIndex = new Map();
+  for (const dev of devolucionesAprobadas) {
+    const itemsDev = Array.isArray(dev.items) ? dev.items : [];
+    for (const it of itemsDev) {
+      const idx = it?.item_index;
+      if (idx === undefined || idx === null) continue;
+      devueltoPorIndex.set(idx, (devueltoPorIndex.get(idx) || 0) + (Number(it.cantidad) || 0));
+    }
+  }
+  let totalComprado = 0;
+  let totalDevuelto = 0;
+  const detalle = [];
+  (pedidoItems || []).forEach((it, idx) => {
+    const comprado = Number(it?.cantidad) || 1;
+    const devuelto = Math.min(devueltoPorIndex.get(idx) || 0, comprado);
+    totalComprado += comprado;
+    totalDevuelto += devuelto;
+    if (devuelto > 0) {
+      detalle.push({ item_index: idx, nombre: it?.nombre ?? null, cantidadComprada: comprado, cantidadDevuelta: devuelto });
+    }
+  });
+  const estado = totalDevuelto === 0 ? 'ninguna' : (totalDevuelto >= totalComprado ? 'total' : 'parcial');
+  return { estado_devolucion: estado, itemsDevueltos: detalle };
+};
+
+// Agrega estado_devolucion + cantidadDevuelta/devuelto por línea a un
+// pedido YA armado con `productos` (ver enriquecerItemsPedido). Una sola
+// consulta por pedido — se usa en GET /:id (la "factura"); las listas
+// (GET /, /mis-pedidos) usan la variante en bloque de más abajo para no
+// hacer una consulta por cada pedido del listado.
+const conEstadoDevolucion = async (pedido) => {
+  const { rows: devs } = await pool.query(
+    `SELECT items FROM devoluciones WHERE pedido_id=$1 AND estado='aprobada'`, [pedido.id]
+  );
+  const { estado_devolucion, itemsDevueltos } = calcularEstadoDevolucion(pedido.items, devs);
+  const devueltoPorIndex = new Map(itemsDevueltos.map(d => [d.item_index, d.cantidadDevuelta]));
+  const productos = (pedido.productos || []).map((p, idx) => ({
+    ...p,
+    cantidadDevuelta: devueltoPorIndex.get(idx) || 0,
+    devuelto: (devueltoPorIndex.get(idx) || 0) > 0,
+  }));
+  return { ...pedido, productos, estado_devolucion };
+};
+
+// Variante en bloque para listas (GET /, /mis-pedidos): UNA consulta para
+// todos los pedidos del resultado, en vez de una por pedido.
+const conEstadoDevolucionEnBloque = async (pedidos) => {
+  if (pedidos.length === 0) return pedidos;
+  const ids = pedidos.map(p => p.id);
+  const { rows: devs } = await pool.query(
+    `SELECT pedido_id, items FROM devoluciones WHERE pedido_id = ANY($1::int[]) AND estado='aprobada'`, [ids]
+  );
+  const devsPorPedido = new Map();
+  for (const d of devs) {
+    if (!devsPorPedido.has(d.pedido_id)) devsPorPedido.set(d.pedido_id, []);
+    devsPorPedido.get(d.pedido_id).push(d);
+  }
+  return pedidos.map(p => {
+    const { estado_devolucion, itemsDevueltos } = calcularEstadoDevolucion(p.items, devsPorPedido.get(p.id) || []);
+    const devueltoPorIndex = new Map(itemsDevueltos.map(d => [d.item_index, d.cantidadDevuelta]));
+    const productos = (p.productos || []).map((prod, idx) => ({
+      ...prod,
+      cantidadDevuelta: devueltoPorIndex.get(idx) || 0,
+      devuelto: (devueltoPorIndex.get(idx) || 0) > 0,
+    }));
+    return { ...p, productos, estado_devolucion };
+  });
+};
+
 const pedRouter = require('express').Router();
 pedRouter.param('id', validateId); // valida :id (numérico) antes de las rutas de abajo
 
@@ -3507,7 +4442,9 @@ pedRouter.get('/', auth, async (req, res) => {
   //     (local_id IS NULL, reclamables). Nunca ve los de otro local.
   //   • Administrador (sin local_id) → ve todos; puede acotar con ?local_id=.
   //   • ?sede= se mantiene solo como respaldo para tokens viejos sin local_id.
-  const { sede, local_id: localIdQuery, comprobante } = req.query;
+  const { sede, local_id: localIdQuery, comprobante, desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
   const conds = [];
   if (req.user.rol === 'Cliente') {
@@ -3527,13 +4464,39 @@ pedRouter.get('/', auth, async (req, res) => {
   // lleno o no (útil para revisar los 'pendiente_verificacion' por separado).
   if (comprobante === 'con') conds.push('ped.comprobante_img IS NOT NULL');
   if (comprobante === 'sin') conds.push('ped.comprobante_img IS NULL');
+  conds.push(...condicionRangoFechas('ped.created_at', desde, hasta, params));
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(`${PEDIDO_SELECT} ${where} ORDER BY ped.id DESC`, params);
   // "productos" (mismo nombre que ya usaba el frontend) ahora trae, por
   // cada línea, la receta fija de la ficha técnica separada de la
   // personalización elegida en esa línea — ver enriquecerItemsPedido.
-  const pedidos = await Promise.all(
-    rows.map(async (p) => ({ ...p, productos: await enriquecerItemsPedido(p.items) }))
+  const pedidosBase = await Promise.all(
+    rows.map(async (p) => conEstadoPago({ ...p, productos: await enriquecerItemsPedido(p.items) }))
+  );
+  const pedidosConDevolucion = await conEstadoDevolucionEnBloque(pedidosBase);
+  // Un pedido totalmente devuelto (estado_devolucion='total') deja de
+  // contar como "pedido activo" en ESTE listado — sigue existiendo tal
+  // cual (nada se borra ni se oculta en /pedidos/:id, ni en el historial
+  // propio del cliente en /mis-pedidos), pero ya no aparece acá porque
+  // este es el listado operativo (Cajero/Admin: "qué hay que atender"),
+  // no un histórico. Consultarlo por completo sigue siendo cosa de
+  // GET /devoluciones — esa es la fuente de verdad de qué se devolvió.
+  // Una devolución PARCIAL (estado_devolucion='parcial') NO lo saca de
+  // acá: el resto del pedido sigue siendo una venta real y activa.
+  //
+  // Requisito de esta ronda — bug real: un pedido ya 'entregado' (y, por
+  // lo tanto, ya con su fila en `ventas` — ver registrarVentaDePedido más
+  // arriba, invocada en el PATCH /:id/estado que hace esa transición)
+  // seguía apareciendo acá, en el listado operativo de "pedidos activos".
+  // Eso mezclaba lo ya despachado/vendido con lo que de verdad falta
+  // atender (pendiente_verificacion, pendiente, en_proceso, en_camino).
+  // Lo entregado debe consultarse desde GET /ventas (que ya lo trae por
+  // el JOIN pedidos↔ventas — ver VENTA_SELECT), no desde acá. Igual que
+  // con las devoluciones totales: el pedido NO se borra ni se oculta en
+  // /pedidos/:id ni en el historial propio del cliente en /mis-pedidos,
+  // solo deja de listarse como "activo" en este endpoint.
+  const pedidos = pedidosConDevolucion.filter(
+    (p) => p.estado_devolucion !== 'total' && p.estado !== 'entregado'
   );
   res.json(pedidos);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -3598,12 +4561,20 @@ pedRouter.get('/mis-pedidos', auth, async (req, res) => {
     `${PEDIDO_SELECT} WHERE ped.cliente_id = $1 ORDER BY ped.id DESC`,
     [req.user.id]
   );
-  const pedidos = await Promise.all(
-    rows.map(async (p) => ({ ...p, productos: await enriquecerItemsPedido(p.items) }))
+  const pedidosBase = await Promise.all(
+    rows.map(async (p) => conEstadoPago({ ...p, productos: await enriquecerItemsPedido(p.items) }))
   );
+  const pedidos = await conEstadoDevolucionEnBloque(pedidosBase);
   res.json(pedidos);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
+// GET /pedidos/:id — ES la factura/detalle completo del pedido (mismo
+// endpoint para web y móvil: JSON llano detrás de auth, sin nada
+// específico de un cliente). Trae cliente, tipo de entrega, método de
+// pago, cada producto con su receta/personalización (toppings/adiciones)
+// y precio, el total, el comprobante si lo hay, estado del pedido,
+// estado_pago (separado, ver Ronda 22) y estado_devolucion (separado
+// también — ver conEstadoDevolucion) con el detalle de qué se devolvió.
 pedRouter.get('/:id', auth, async (req, res) => {
   try {
   const { rows } = await pool.query(
@@ -3622,8 +4593,26 @@ pedRouter.get('/:id', auth, async (req, res) => {
   // (fija, de fichas_tecnicas) y "personalizacion" (toppings/adiciones de
   // esa línea) separados en cada ítem — ver enriquecerItemsPedido.
   const productos = await enriquecerItemsPedido(rows[0].items);
-  res.json({ ...rows[0], productos });
+  const pedido = await conEstadoDevolucion(conEstadoPago({ ...rows[0], productos }));
+  res.json(pedido);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Verificación de cobertura de domicilios EN TIEMPO REAL, sin crear el
+// pedido — la usa la landing en el paso 2 del checkout para avisar de una
+// vez si la dirección escrita queda fuera de la comuna 8/9, en lugar de
+// dejar que el cliente llene todo el formulario y se entere al final.
+// Público (sin auth): el checkout de la landing no tiene sesión.
+pedRouter.post('/verificar-cobertura', async (req, res) => {
+  const direccion = (req.body?.direccion || '').trim();
+  if (direccion.length < 8) {
+    return res.status(400).json({ error: 'Escribe una dirección de al menos 8 caracteres.' });
+  }
+  try {
+    const cobertura = await determinarSedePorDireccion(direccion);
+    res.json(cobertura);
+  } catch (e) {
+    res.status(502).json({ error: 'No se pudo verificar la dirección con el servicio de geocodificación.' });
+  }
 });
 // Requisito 2: UN SOLO endpoint de creación de pedido para Admin y
 // Cajero (y, sin token, para el cliente/landing) — mismo contrato para
@@ -3632,23 +4621,30 @@ pedRouter.get('/:id', auth, async (req, res) => {
 // nunca exige uno (el checkout de la landing no tiene sesión de
 // admin/cajero) — ver middleware/auth.js.
 pedRouter.post('/', authOpcional, async (req, res) => {
-  const { cliente_id, numero, cliente, tipo, pago, mesa, total, items, comprobante, comprobante_img, comprobante_ocr, origen, direccion_alternativa, hora, estado, atendido_por, sede, local_id, _meta } = req.body;
+  const { cliente_id, numero, cliente, alias, tipo, pago, metodo_pago_local, mesa, total, items, comprobante, comprobante_img, comprobante_ocr, origen, direccion_alternativa, hora, estado, atendido_por, sede, local_id, zona_manual, _meta } = req.body;
   // Compatibilidad: si vienen en _meta los usamos también
   const meta = _meta || {};
 
-  // El Cajero NO elige local ni "atendido por": siempre son los suyos
-  // (req.user, del token), sin importar qué traiga el body — así el
-  // frontend puede usar el MISMO formulario/payload que el Administrador
-  // (que sí puede elegir cualquier local/atendido_por, igual que hoy) sin
-  // que un cajero pueda crear un pedido a nombre de otro local o de otra
-  // persona. Sin token, o con cualquier otro rol (Cliente desde la
-  // landing), el comportamiento es exactamente el de siempre: local/
-  // atendido_por se resuelven desde el body más abajo.
+  // Los roles operativos (Cajero, Bartender, y cualquier otro que no sea
+  // Administrador) NO eligen local ni "atendido por": siempre son los
+  // suyos (req.user, del token), sin importar qué traiga el body — el
+  // mismo formulario/payload sirve para Administrador/Superadministrador
+  // (que sí pueden elegir cualquier local/atendido_por: es una atribución
+  // del rol, no algo que "no tengan") sin que un rol operativo pueda crear
+  // un pedido a nombre de otro local o de otra persona. Si mandan un local
+  // DISTINTO al suyo, se rechaza con 403 — antes se ignoraba en silencio.
+  // Sin token, o con rol Cliente (checkout de la landing), el
+  // comportamiento es el de siempre: local/atendido_por se resuelven
+  // desde el body más abajo, sin ningún límite.
   let localIdBody = local_id;
   let atendidoPorBody = atendido_por;
-  if (req.user?.rol === 'Cajero') {
+  const esRolOperativo = req.user?.rol && req.user.rol !== 'Cliente' && !puedeElegirCualquierLocal(req.user);
+  if (esRolOperativo) {
     if (!req.user.local_id) {
-      return res.status(400).json({ error: 'Tu usuario no tiene un local de trabajo asignado: pedile a un administrador que te asigne uno antes de crear pedidos.' });
+      return res.status(400).json({ error: 'Tu usuario no tiene un local de trabajo asignado: pide a un administrador que te asigne uno antes de crear pedidos.' });
+    }
+    if (local_id !== undefined && local_id !== null && local_id !== '' && Number(local_id) !== Number(req.user.local_id)) {
+      return res.status(403).json({ error: 'No puedes operar sobre un local distinto al tuyo.' });
     }
     localIdBody = req.user.local_id;
     atendidoPorBody = req.user.id;
@@ -3671,6 +4667,33 @@ pedRouter.post('/', authOpcional, async (req, res) => {
     return res.status(400).json({ error: 'Debés elegir un método de pago: Efectivo, Nequi o Llave Bancolombia.' });
   }
   const tipoFinal = tipo || meta.tipo || null;
+  // Bug real corregido esta ronda: "efectivo" (que significa "se paga
+  // contraentrega, sin comprobante") estaba prohibido para tipo='local'
+  // ("recoger en el local no tiene a nadie esperando para cobrar antes de
+  // preparar"). Eso forzaba a un pedido de recoger-y-pagar-al-llegar a
+  // elegir Nequi/Llave Bancolombia igual, y esos métodos SIEMPRE nacen en
+  // 'pendiente_verificacion' (ver más abajo) exigiendo un comprobante que
+  // en este caso no existe — el pedido quedaba trabado ahí para siempre
+  // (caso real: pedido #158). Regla correcta: lo que decide si se exige
+  // comprobante es el MÉTODO DE PAGO (¿implica transferencia previa?), no
+  // el tipo de entrega — "efectivo" ahora es válido para domicilio Y para
+  // recoger en el local (en ambos casos: sin comprobante, directo a
+  // 'pendiente'). Nequi/Llave Bancolombia siguen exigiendo comprobante +
+  // verificación manual, sin cambios, en los dos tipos de entrega.
+  // Método de pago para "Recoger en el local" — texto libre (o el nombre
+  // de uno de los metodos_pago ya configurados, sin exigir que coincida:
+  // ver metodoPagoRouter, deliberadamente independiente igual que "pago"
+  // ya lo es). Es un campo APARTE de "pago" (que sigue su propio flujo de
+  // comprobante/verificación sin cambios) y SOLO tiene sentido cuando el
+  // cliente va a recoger en persona — un domicilio ya sigue su propio
+  // flujo de método de pago, así que mandarlo ahí se rechaza en vez de
+  // guardarse en silencio.
+  const metodoPagoLocalTexto = textoLimpio(metodo_pago_local ?? meta.metodoPagoLocal) || null;
+  if (metodoPagoLocalTexto && tipoFinal !== 'local') {
+    return res.status(400).json({ error: 'El método de pago para recoger en el local solo aplica a pedidos de tipo "local" (recoger) — un pedido a domicilio sigue su propio flujo de método de pago.' });
+  }
+  const errorMetodoPagoLocal = errorLongitud(metodoPagoLocalTexto, 'El método de pago para recoger en el local', LIMITES.NOMBRE_CORTO);
+  if (errorMetodoPagoLocal) return res.status(400).json({ error: errorMetodoPagoLocal });
   // Local OPERATIVO del pedido — qué local lo atiende (cajeros/bartender de
   // ESE local lo ven; los de otro local, no). Se fija desde la creación:
   //   • el cliente que recoge en local (tipo='local') → su local elegido;
@@ -3683,6 +4706,50 @@ pedRouter.post('/', authOpcional, async (req, res) => {
   const localIdRaw = localIdBody ?? meta.local_id ?? null;
   const sedeNombre = sede || meta.sede || null;
   try {
+    // "¿Quién es este pedido?" — dos caminos válidos, nunca ninguno:
+    //   • cliente_id de un cliente YA REGISTRADO: se valida que exista de
+    //     verdad. Antes esto no se validaba en absoluto — un cliente_id
+    //     inventado no rompía nada acá, sino más abajo, con un 500 crudo
+    //     al chocar contra la FK del INSERT (pedidos.cliente_id
+    //     REFERENCES clientes(id)).
+    //   • SIN cliente_id (pedido de mesa/mostrador, cliente sin cuenta):
+    //     exige al menos el nombre (campo "cliente", texto) — antes un
+    //     pedido podía crearse sin cliente_id NI nombre, totalmente
+    //     anónimo, imposible de identificar o contactar después.
+    const clienteIdRaw = cliente_id ?? meta.cliente_id ?? null;
+    let clienteIdFinal = null;
+    if (clienteIdRaw !== undefined && clienteIdRaw !== null && clienteIdRaw !== '') {
+      clienteIdFinal = Number(clienteIdRaw);
+      if (!Number.isInteger(clienteIdFinal) || clienteIdFinal <= 0) {
+        return res.status(400).json({ error: 'El cliente indicado no es válido.' });
+      }
+      const { rows: clienteFila } = await pool.query('SELECT id FROM clientes WHERE id=$1', [clienteIdFinal]);
+      if (!clienteFila[0]) {
+        return res.status(400).json({ error: 'El cliente indicado no existe.' });
+      }
+    } else {
+      const nombreClienteTexto = textoLimpio(cliente ?? meta.cliente);
+      if (!nombreClienteTexto) {
+        return res.status(400).json({
+          error: 'Indica el cliente_id de un cliente registrado, o al menos un nombre para identificar el pedido — no puede quedar totalmente anónimo.',
+        });
+      }
+      // Sin cliente_id, el nombre solo no alcanza para distinguir a dos
+      // clientes con el mismo nombre que tienen un pedido abierto al
+      // mismo tiempo — se exige también un "alias" (ej. "Juan - mesa 3"),
+      // único entre los pedidos que siguen activos ahora mismo.
+      const aliasTexto = textoLimpio(alias ?? meta.alias);
+      if (!aliasTexto) {
+        return res.status(400).json({
+          error: 'Indica un alias para este pedido (ej. "Juan - mesa 3"), para distinguirlo de otro cliente con el mismo nombre.',
+        });
+      }
+      if (await aliasEnUso(aliasTexto, null)) {
+        return res.status(409).json({
+          error: `Ya hay un pedido activo con el alias "${aliasTexto}". Usa uno distinto (ej. agregando la mesa o una referencia).`,
+        });
+      }
+    }
     if (localIdRaw != null && String(localIdRaw).trim() !== '') {
       localIdFinal = Number(localIdRaw);
       if (!Number.isInteger(localIdFinal) || localIdFinal <= 0) {
@@ -3767,15 +4834,84 @@ pedRouter.post('/', authOpcional, async (req, res) => {
     // maneja domiciliarios. El tipo de entrega 'domicilio' se mantiene.
     const atendidoPorId = Number.isInteger(Number(atendidoPorBody)) && Number(atendidoPorBody) > 0 ? Number(atendidoPorBody) : null;
 
+    // Cobertura de domicilios: solo comuna 8 y 9 de Medellín. Antes esto
+    // no se validaba en ningún lado (geocoding.js existía pero no se
+    // llamaba desde ninguna ruta), así que se podía crear un pedido a
+    // domicilio con cualquier dirección fuera del perímetro. Se geocodifica
+    // con Geoapify y se rechaza si la dirección no cae en la cobertura.
+    const direccionAlternativaFinal = direccion_alternativa || meta.direccionAlternativa || null;
+    // Sede elegida A MANO por el cliente en el checkout — solo se usa como
+    // respaldo cuando la dirección no se pudo geocodificar (ver más abajo).
+    // Nunca sirve para saltarse un rechazo real por estar fuera de comuna
+    // 8/9 (eso siempre se respeta, sin importar qué mande el cliente acá).
+    const zonaManualFinal = zona_manual || meta.zonaManual || null;
+    let sedeSugeridaPorDireccion = null;
+    if (tipoFinal === 'domicilio') {
+      if (!direccionAlternativaFinal) {
+        return res.status(400).json({ error: 'Debes indicar la dirección de entrega para un pedido a domicilio.' });
+      }
+      let cobertura;
+      try {
+        cobertura = await determinarSedePorDireccion(direccionAlternativaFinal);
+      } catch (geoErr) {
+        return res.status(502).json({ error: 'No se pudo verificar la dirección con el servicio de geocodificación. Intenta de nuevo.' });
+      }
+      if (cobertura.cubierto) {
+        // Caso normal: la dirección se ubicó y cae en comuna 8 o 9 — el
+        // local queda asignado automáticamente al que corresponde.
+        sedeSugeridaPorDireccion = cobertura.sede;
+      } else if (cobertura.motivo === 'no_geocodificada') {
+        // La dirección no se pudo ubicar en el mapa (barrio/numeración no
+        // indexada, común en Comuna 8/9) — NO se rechaza de plano, porque
+        // eso podría ser un falso negativo (dirección real y cubierta que
+        // el geocodificador simplemente no reconoce). Se exige que el
+        // cliente confirme a mano cuál local le queda más cerca.
+        if (zonaManualFinal !== 'Local Villa Liliam' && zonaManualFinal !== 'Local 3 Esquinas') {
+          return res.status(409).json({
+            error: 'No pudimos ubicar automáticamente esa dirección en el mapa. Confirma cuál local te queda más cerca para continuar.',
+            motivo: 'no_geocodificada',
+            requiereSeleccionManual: true,
+          });
+        }
+        sedeSugeridaPorDireccion = zonaManualFinal;
+      } else {
+        // 'fuera_de_cobertura': la dirección sí se ubicó, y realmente cae
+        // fuera de comuna 8/9. Este rechazo es siempre firme — la
+        // selección manual de arriba nunca aplica para este caso.
+        return res.status(400).json({
+          error: 'Esa dirección está fuera de la zona de cobertura (comuna 8 y 9 de Medellín). No podemos entregar domicilios ahí.',
+          detalle: cobertura,
+        });
+      }
+      // El filtro real de GET /pedidos (para cajeros/bartenders modernos)
+      // restringe por "local_id" numérico, no por "sede" en texto — sin
+      // esto, el pedido quedaría con local_id NULL y CUALQUIER cajero lo
+      // vería como "sin asignar" (ver GET /pedidos: "ped.local_id IS NULL"
+      // cuenta como reclamable por todos). Se resuelve el id a partir del
+      // nombre real ya determinado arriba (sedeSugeridaPorDireccion).
+      if (sedeSugeridaPorDireccion) {
+        const { rows: localFila } = await pool.query(
+          `SELECT id FROM locales WHERE nombre=$1 AND estado='Activo' LIMIT 1`,
+          [sedeSugeridaPorDireccion]
+        );
+        if (localFila[0]) localIdFinal = localFila[0].id;
+      }
+    }
+
     const { rows } = await pool.query(
-      `INSERT INTO pedidos(cliente_id,numero,cliente,tipo,pago,mesa,total,items,comprobante,comprobante_img,comprobante_hash,comprobante_ocr,origen,direccion_alternativa,hora,estado,atendido_por,sede,local_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+      `INSERT INTO pedidos(cliente_id,numero,cliente,alias,tipo,pago,metodo_pago_local,mesa,total,items,comprobante,comprobante_img,comprobante_hash,comprobante_ocr,origen,direccion_alternativa,hora,estado,atendido_por,sede,local_id)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
       [
-        cliente_id || null,
+        clienteIdFinal,
         numero || meta.numero || null,
         cliente || meta.cliente || null,
+        // Solo se guarda cuando de verdad se exigió (sin cliente_id) — un
+        // pedido de un cliente registrado no necesita alias.
+        clienteIdFinal ? null : textoLimpio(alias ?? meta.alias),
         tipoFinal,
         pagoFinal,
+        // Ya validado arriba: solo llega con valor cuando tipoFinal==='local'.
+        metodoPagoLocalTexto,
         mesa || null,
         total || 0,
         JSON.stringify(items || []),
@@ -3784,7 +4920,7 @@ pedRouter.post('/', authOpcional, async (req, res) => {
         comprobanteHash,
         comprobanteOcrFinal ? JSON.stringify(comprobanteOcrFinal) : null,
         origenFinal,
-        direccion_alternativa || meta.direccionAlternativa || null,
+        direccionAlternativaFinal,
         hora || meta.hora || null,
         estadoInicial,
         atendidoPorId,
@@ -3792,28 +4928,74 @@ pedRouter.post('/', authOpcional, async (req, res) => {
         // un local operativo, se guarda su nombre real; si no, el nombre
         // recibido; si tampoco, NULL (pedido sin asignar). La fuente de
         // verdad de "qué local atiende el pedido" es local_id (abajo).
-        localNombreResuelto || sedeNombre || null,
+        localNombreResuelto || sedeSugeridaPorDireccion || sedeNombre || null,
         // Local operativo, ya asignado desde la creación. NULL = pedido sin
         // asignar, reclamable por cualquier local (ver PATCH /:id/tomar).
         localIdFinal,
       ]
     );
-    res.status(201).json(rows[0]);
+    res.status(201).json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Edición de un pedido existente (cliente, tipo de entrega, método de pago,
 // productos/total, personal asignado, dirección). Antes este endpoint no
 // existía: el módulo permitía crear, cambiar estado y "detener" un pedido,
 // pero no corregir un pedido ya creado.
+// Edita un pedido existente — SOLO personal interno (Cajero/Bartender/
+// Administrador), nunca el cliente: antes esta ruta no tenía NINGÚN
+// chequeo de rol ni de dueño, así que cualquier Cliente autenticado podía
+// editar total/items/local/atendido_por de CUALQUIER pedido (no solo el
+// suyo) con un simple PUT — un hueco real de autorización, no algo
+// hipotético. El caso "el cliente manda el comprobante por otro medio y
+// alguien lo adjunta acá" (ver comentario más abajo) siempre fue el
+// CAJERO quien lo hace por el cliente, nunca el cliente mismo —
+// "CLIENTE: solo lectura de su propio pedido" se cumple bloqueando esta
+// ruta entera para ese rol, sin perder ningún flujo real.
 pedRouter.put('/:id', auth, async (req, res) => {
+  if (req.user?.rol === 'Cliente') {
+    return res.status(403).json({ error: 'Los clientes no pueden editar un pedido — solo consultarlo. Si necesitas corregir algo, contacta al local.' });
+  }
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  const { cliente, tipo, pago, total, items, atendido_por, direccion_alternativa, sede, local_id, comprobante_img } = req.body;
+  const { cliente, alias, tipo, pago, metodo_pago_local, total, items, atendido_por, direccion_alternativa, sede, local_id, comprobante_img } = req.body;
   const pagoFinal = normalizarPago(pago);
   if (metodoPagoInvalido(pagoFinal)) {
     return res.status(400).json({ error: `Método de pago inválido. Debe ser uno de: ${METODOS_PAGO_VALIDOS.join(', ')}.` });
   }
+  // undefined = no vino en este PUT (edición parcial: no se toca) — ver más
+  // abajo, donde se resuelve el tipo RESULTANTE antes de decidir si choca.
+  const metodoPagoLocalTexto = metodo_pago_local !== undefined ? (textoLimpio(metodo_pago_local) || null) : undefined;
+  const errorMetodoPagoLocal = errorLongitud(metodoPagoLocalTexto, 'El método de pago para recoger en el local', LIMITES.NOMBRE_CORTO);
+  if (errorMetodoPagoLocal) return res.status(400).json({ error: errorMetodoPagoLocal });
   try {
+    // Mismo chequeo de unicidad que en POST — solo si de verdad se está
+    // cambiando el alias en este PUT (edición parcial: si no viene en el
+    // body, no se toca ni se revisa).
+    const aliasTexto = alias !== undefined ? textoLimpio(alias) : undefined;
+    if (aliasTexto) {
+      if (await aliasEnUso(aliasTexto, id)) {
+        return res.status(409).json({
+          error: `Ya hay otro pedido activo con el alias "${aliasTexto}". Usa uno distinto.`,
+        });
+      }
+    }
+    // "Efectivo" ya es válido en los dos tipos de entrega (ver POST, mismo
+    // motivo: lo que exige comprobante es el MÉTODO de pago, no el tipo de
+    // entrega) — como PUT es una edición PARCIAL (tipo o pago pueden no
+    // venir en este body), se sigue resolviendo la combinación RESULTANTE
+    // contra lo que ya tiene guardado el pedido, para el chequeo que sí
+    // queda (metodo_pago_local solo tiene sentido en tipo='local').
+    if (pagoFinal || tipo !== undefined || metodoPagoLocalTexto) {
+      const { rows: actualTipoPago } = await pool.query('SELECT tipo, pago FROM pedidos WHERE id=$1', [id]);
+      if (!actualTipoPago[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+      const tipoResultante = (tipo !== undefined && tipo !== null && tipo !== '') ? tipo : actualTipoPago[0].tipo;
+      // Igual que en POST: el método de pago para "recoger en el local"
+      // solo tiene sentido cuando el pedido de verdad es de tipo 'local' —
+      // un domicilio sigue su propio flujo de método de pago.
+      if (metodoPagoLocalTexto && tipoResultante !== 'local') {
+        return res.status(400).json({ error: 'El método de pago para recoger en el local solo aplica a pedidos de tipo "local" (recoger) — un pedido a domicilio sigue su propio flujo de método de pago.' });
+      }
+    }
     // Igual que en POST: si mandan local_id, tiene que ser un local activo
     // real (no se valida acá si tipo='local' porque PUT es una edición
     // parcial — tipo puede no venir en este body).
@@ -3853,7 +5035,16 @@ pedRouter.put('/:id', auth, async (req, res) => {
          sede = COALESCE($8, sede),
          local_id = COALESCE($9, local_id),
          comprobante_img  = COALESCE($11, comprobante_img),
-         comprobante_hash = COALESCE($12, comprobante_hash)
+         comprobante_hash = COALESCE($12, comprobante_hash),
+         alias = COALESCE($13, alias),
+         -- Si el tipo RESULTANTE (el que manda este PUT, o si no vino, el
+         -- que ya tenía el pedido) queda en 'domicilio', el método de pago
+         -- para "recoger en el local" se limpia solo — no tiene sentido
+         -- ahí (ver la validación de arriba, que además rechaza mandarlo
+         -- explícito en ese caso). Si el tipo resultante sigue siendo
+         -- 'local', se preserva el valor actual salvo que este PUT mande
+         -- uno nuevo.
+         metodo_pago_local = CASE WHEN COALESCE($2, tipo) = 'domicilio' THEN NULL ELSE COALESCE($14, metodo_pago_local) END
        WHERE id=$10 RETURNING *`,
       [
         cliente ?? null,
@@ -3868,10 +5059,12 @@ pedRouter.put('/:id', auth, async (req, res) => {
         id,
         comprobante_img ?? null,
         comprobanteHash,
+        aliasTexto || null,
+        metodoPagoLocalTexto ?? null,
       ]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-    res.json(rows[0]);
+    res.json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Cambia el estado de un pedido respetando el flujo real: no se puede
@@ -3891,13 +5084,23 @@ pedRouter.put('/:id', auth, async (req, res) => {
 //         frontend pueda re-sincronizar su vista.
 //   404 → el pedido no existe.
 pedRouter.patch('/:id/estado', auth, async (req, res) => {
+  // "CLIENTE: solo lectura de su propio pedido" — antes esta ruta no tenía
+  // NINGÚN chequeo de rol; un Cliente quedaba bloqueado casi siempre por el
+  // chequeo de local de más abajo (su token no trae local_id), PERO no en
+  // un pedido todavía sin local asignado (local_id IS NULL, "reclamable")
+  // — ahí un Cliente autenticado sí podía cambiarle el estado a un pedido
+  // que ni siquiera era el suyo. Se bloquea explícito y temprano, sin
+  // depender de ese efecto colateral.
+  if (req.user?.rol === 'Cliente') {
+    return res.status(403).json({ error: 'Los clientes no pueden cambiar el estado de un pedido — solo pueden consultarlo.' });
+  }
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
 
   const estadoCrudo = req.body?.estado;
   if (estadoCrudo === undefined || estadoCrudo === null || String(estadoCrudo).trim() === '') {
     return res.status(400).json({
-      error: "Falta el campo 'estado' en la petición. Si lo que querés es solo confirmar el cobro (sin mover el estado), usá PATCH /pedidos/:id/confirmar-pago.",
+      error: "Falta indicar el nuevo estado del pedido. Si solo querés confirmar el cobro sin mover el estado, usá la opción de \"confirmar pago\" en su lugar.",
     });
   }
   const estado = normalizarEstadoPedido(estadoCrudo);
@@ -3908,12 +5111,36 @@ pedRouter.patch('/:id/estado', auth, async (req, res) => {
       valoresValidos: ESTADOS_PEDIDO_VALIDOS,
     });
   }
+  // Un Bartender solo prepara: puede avanzar el pedido hasta 'en_camino'
+  // ("Listo para recoger"/"En camino"), nunca marcarlo 'entregado' (esa
+  // confirmación dispara la venta + el descuento de inventario, y es
+  // responsabilidad de Cajero/Administrador) ni cancelarlo. Antes esto
+  // SOLO se ocultaba en la pantalla del Bartender (BartenderPage.jsx no
+  // expone ningún botón más allá de esos dos) — el servidor aceptaba
+  // cualquier transición con solo tener sesión de Bartender, así que una
+  // petición directa a la API (o un bug futuro de UI) se saltaba el
+  // límite sin que nada lo impidiera. Validado ACÁ, no solo en pantalla.
+  const ESTADOS_PERMITIDOS_BARTENDER = ['en_proceso', 'en_camino'];
+  if (req.user?.rol === 'Bartender' && !ESTADOS_PERMITIDOS_BARTENDER.includes(estado)) {
+    return res.status(403).json({
+      error: 'Como Bartender solo puedes avanzar un pedido hasta "Listo para recoger". Marcarlo como entregado o cancelarlo lo hace Cajero o Administrador.',
+    });
+  }
   try {
     const { rows: actual } = await pool.query(
       'SELECT id, estado, pago, pago_confirmado, tipo, sede, local_id, items, total FROM pedidos WHERE id=$1', [id]
     );
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
     const ped = actual[0];
+    // Un rol operativo (Cajero/Bartender) solo puede mover el estado de
+    // pedidos de SU local — de lo contrario podría marcar como "entregado"
+    // (y descontar el inventario de) un pedido de otro local. Administrador/
+    // Superadministrador no tienen esta restricción. Un pedido SIN local
+    // asignado (ped.local_id NULL — "reclamable") no bloquea a nadie: es
+    // justamente el caso pensado para que cualquier local lo tome.
+    if (!puedeElegirCualquierLocal(req.user) && ped.local_id && Number(ped.local_id) !== Number(req.user?.local_id)) {
+      return res.status(403).json({ error: 'No puedes operar sobre un pedido de un local distinto al tuyo.' });
+    }
     const estadoActual = ped.estado;
     // Aviso NO bloqueante que viaja junto al pedido actualizado: se llena si
     // al entregar hubo insumos de la receta que no existen en el local y por
@@ -3945,7 +5172,7 @@ pedRouter.patch('/:id/estado', auth, async (req, res) => {
       //     a la entrega, no frena la preparación.
       if (idxNuevo >= IDX_EN_PROCESO && pagoRequiereComprobante(ped.pago) && !ped.pago_confirmado) {
         return res.status(409).json({
-          error: `El pedido #${id} se paga por ${ped.pago} y su comprobante todavía no fue aprobado. Aprobalo con PATCH /pedidos/${id}/comprobante/aprobar antes de pasarlo a "${estado}".`,
+          error: `El pedido #${id} se paga por ${ped.pago} y su comprobante todavía no fue aprobado. Aprueba el comprobante antes de pasarlo a "${estado}".`,
           estadoActual, estadoSolicitado: estado, pago: ped.pago, pagoConfirmado: ped.pago_confirmado,
         });
       }
@@ -3986,7 +5213,7 @@ pedRouter.patch('/:id/estado', auth, async (req, res) => {
     const { rows } = await pool.query(
       `UPDATE pedidos SET ${sets.join(', ')} WHERE id=$${vals.length} RETURNING *`, vals
     );
-    res.json(avisoInventario ? { ...rows[0], avisoInventario } : rows[0]);
+    res.json(conEstadoPago(avisoInventario ? { ...rows[0], avisoInventario } : rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // El cajero puede marcar el cobro de un pedido como confirmado a mano —
@@ -4011,7 +5238,7 @@ pedRouter.patch('/:id/confirmar-pago', auth, permitirRoles('Cajero', 'Administra
     // saltaría la verificación del comprobante.
     if (pagoRequiereComprobante(actual[0].pago)) {
       return res.status(400).json({
-        error: `El pedido #${id} se paga por ${actual[0].pago}: su pago se confirma aprobando el comprobante con PATCH /pedidos/${id}/comprobante/aprobar, no con /confirmar-pago.`,
+        error: `El pedido #${id} se paga por ${actual[0].pago}: su pago se confirma aprobando el comprobante, no con esta opción.`,
       });
     }
     if (actual[0].estado === 'cancelado' || actual[0].estado === 'entregado') {
@@ -4020,7 +5247,7 @@ pedRouter.patch('/:id/confirmar-pago', auth, permitirRoles('Cajero', 'Administra
     const { rows } = await pool.query(
       `UPDATE pedidos SET pago_confirmado = TRUE WHERE id=$1 RETURNING *`, [id]
     );
-    res.json(rows[0]);
+    res.json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Aprobar/rechazar el comprobante de transferencia (Nequi/Bancolombia) de
@@ -4044,7 +5271,7 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
     const { rows: actual } = await pool.query('SELECT estado, pago, comprobante_img FROM pedidos WHERE id=$1', [id]);
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (esEfectivo(actual[0].pago)) {
-      return res.status(400).json({ error: 'Los pedidos en efectivo no requieren aprobación de comprobante — usa PATCH /:id/confirmar-pago.' });
+      return res.status(400).json({ error: 'Este pedido se paga en efectivo/contraentrega — no tiene comprobante que aprobar. Confirma el cobro desde la opción de "confirmar pago".' });
     }
     if (actual[0].estado !== 'pendiente_verificacion') {
       return res.status(400).json({ error: 'Este pedido no tiene un comprobante pendiente de verificación.' });
@@ -4053,9 +5280,11 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
     // Nequi/Llave Bancolombia pero no subió la imagen, el pedido quedó igual
     // en 'pendiente_verificacion' (para que el cajero lo vea en esa lista),
     // pero acá no hay nada que aprobar hasta que el cliente lo envíe y se
-    // adjunte con PUT /pedidos/:id.
+    // adjunte. Mensaje en lenguaje de negocio a propósito — antes mencionaba
+    // rutas internas de la API ("PUT /pedidos/158"), algo que no debería
+    // llegarle nunca a quien lo lee desde la pantalla de Cajero/Admin.
     if (!actual[0].comprobante_img) {
-      return res.status(400).json({ error: `El pedido #${id} no tiene comprobante subido. Contactá al cliente para que lo envíe y adjuntalo con PUT /pedidos/${id} antes de aprobarlo.` });
+      return res.status(400).json({ error: `El pedido #${id} todavía no tiene el comprobante de pago. Contacta al cliente para que lo envíe y quede adjunto antes de aprobarlo.` });
     }
     // Aprobar = confirmar el pago y pasar a 'pendiente' (listo para que el
     // cajero dé "empezar preparación" → en_proceso, como paso aparte).
@@ -4063,7 +5292,7 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
       `UPDATE pedidos SET estado = 'pendiente', pago_confirmado = TRUE WHERE id=$1 RETURNING *`,
       [id]
     );
-    res.json(rows[0]);
+    res.json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Administrador'), async (req, res) => {
@@ -4091,7 +5320,7 @@ pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Admi
       `UPDATE pedidos SET estado = 'cancelado', comprobante_motivo_rechazo = $1 WHERE id=$2 RETURNING *`,
       [motivo, id]
     );
-    res.json(rows[0]);
+    res.json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Un cajero/bartender "toma" (reclama) un pedido que todavía NO está
@@ -4100,6 +5329,14 @@ pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Admi
 // El UPDATE es atómico (WHERE local_id IS NULL en la misma consulta) para
 // que, si dos locales intentan tomarlo a la vez, solo uno lo consiga.
 pedRouter.patch('/:id/tomar', auth, async (req, res) => {
+  // Ya quedaba bloqueado de hecho para un Cliente (su token nunca trae
+  // local_id, así que "miLocal" abajo siempre daba null), pero se agrega
+  // el chequeo explícito por las mismas razones que en PATCH /:id/estado:
+  // no depender de un efecto colateral para algo que es, en el fondo, una
+  // regla de permisos ("CLIENTE: solo lectura de su propio pedido").
+  if (req.user?.rol === 'Cliente') {
+    return res.status(403).json({ error: 'Los clientes no pueden tomar/reclamar pedidos.' });
+  }
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   const miLocal = Number(req.user.local_id) || null;
@@ -4122,10 +5359,20 @@ pedRouter.patch('/:id/tomar', auth, async (req, res) => {
       if (!existente[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
       return res.status(409).json({ error: `Este pedido ya fue tomado por ${existente[0].nombre || 'otro local'}` });
     }
-    res.json(rows[0]);
+    res.json(conEstadoPago(rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-pedRouter.delete('/:id', auth, async (req, res) => {
+// Borrado DEFINITIVO de un pedido — hallazgo real de esta ronda, no algo
+// que se haya pedido tocar puntualmente, pero cae directo dentro de
+// "permisos por rol a nivel de API/controlador" para pedidos: esta ruta no
+// tenía NINGÚN chequeo de rol ni de dueño — cualquier usuario autenticado,
+// CLIENTE incluido, podía borrar cualquier pedido (el suyo o el de otro)
+// solo con su id, sin dejar rastro (a diferencia de 'cancelado', que sí
+// queda en el historial). Se restringe a Administrador — mismo criterio
+// que ya usa el resto de borrados verdaderamente destructivos en esta API
+// (ej. DELETE /locales/:id) — "cancelar" (PATCH /:id/estado) sigue siendo
+// la vía normal para Cajero/Bartender, que además conserva el registro.
+pedRouter.delete('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   try {
@@ -4166,10 +5413,14 @@ const VENTA_SELECT = `
 // local específico sin dejar de ver "Todos" cuando no manda el parámetro.
 ventRouter.get('/', auth, async (req, res) => {
   try {
-  const { sede } = req.query;
+  const { sede, desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
-  let where = '';
-  if (sede) { params.push(sede); where = 'WHERE p.sede = $1'; }
+  const conds = [];
+  if (sede) { params.push(sede); conds.push(`p.sede = $${params.length}`); }
+  conds.push(...condicionRangoFechas('v.created_at', desde, hasta, params));
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(`${VENTA_SELECT} ${where} ORDER BY v.id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -4326,7 +5577,7 @@ devRouter.post('/', auth, async (req, res) => {
 
   const solicitados = normalizarItemsSolicitados(req.body);
   if (solicitados.length === 0) {
-    return res.status(400).json({ error: 'Debes indicar al menos un producto a devolver ("items", o "producto_id"/"item_index" sueltos).' });
+    return res.status(400).json({ error: 'Debes indicar al menos un producto a devolver.' });
   }
 
   // Los productos/cantidades a devolver NUNCA se toman de lo que mande el
@@ -4349,7 +5600,7 @@ devRouter.post('/', auth, async (req, res) => {
     if (solicitado.item_index !== undefined && solicitado.item_index !== null && solicitado.item_index !== '') {
       const n = Number(solicitado.item_index);
       if (!Number.isInteger(n) || n < 0 || n >= pedidoItems.length) {
-        return res.status(400).json({ error: `item_index inválido en el ítem ${numeroItem}: no existe esa línea en el pedido ${pedido_id}.` });
+        return res.status(400).json({ error: `La línea indicada en el ítem ${numeroItem} no existe en el pedido ${pedido_id}.` });
       }
       idx = n;
     }
@@ -4360,7 +5611,7 @@ devRouter.post('/', auth, async (req, res) => {
       : (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
           ? String(solicitado.producto_id) : null);
     if (!idPedido) {
-      return res.status(400).json({ error: `Cada ítem debe indicar "producto_id" o "item_index" (ítem ${numeroItem}).` });
+      return res.status(400).json({ error: `Cada ítem debe indicar qué producto o qué línea del pedido corresponde (ítem ${numeroItem}).` });
     }
 
     if (idx === null) {
@@ -4370,7 +5621,7 @@ devRouter.post('/', auth, async (req, res) => {
       }
     } else if (solicitado.producto_id !== undefined && solicitado.producto_id !== null && solicitado.producto_id !== ''
                && String(solicitado.producto_id) !== idPorIndex) {
-      return res.status(400).json({ error: `"producto_id" no coincide con "item_index" en el ítem ${numeroItem}.` });
+      return res.status(400).json({ error: `El producto indicado no coincide con la línea del pedido señalada en el ítem ${numeroItem}.` });
     }
 
     const cantidad = Number(solicitado.cantidad);
@@ -4449,13 +5700,39 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
   );
   if (!rows[0]) return res.status(404).json({ error: 'Devolución no encontrada' });
 
- 
+  // La venta COMPLETA solo se marca 'devuelto' cuando la devolución (o la
+  // SUMA de varias devoluciones aprobadas del mismo pedido) cubre el
+  // pedido COMPLETO. Antes, CUALQUIER devolución aprobada — aunque fuera
+  // de un solo producto entre varios (tipo='parcial') — marcaba la venta
+  // ENTERA como 'devuelto', borrando que el resto del pedido seguía siendo
+  // una venta real. Se recalcula siempre (no solo al aprobar): rechazar o
+  // reabrir una devolución que hacía que el total quedara cubierto debe
+  // poder devolver la venta a 'vendido' otra vez.
   if (rows[0].pedido_id) {
-    const nuevoEstadoVenta = estado === 'aprobada' ? 'devuelto' : 'vendido';
-    await pool.query('UPDATE ventas SET estado=$1 WHERE pedido_id=$2', [nuevoEstadoVenta, rows[0].pedido_id]);
+    const { rows: pedidoRows } = await pool.query('SELECT items FROM pedidos WHERE id=$1', [rows[0].pedido_id]);
+    const pedidoItems = Array.isArray(pedidoRows[0]?.items) ? pedidoRows[0].items : [];
+    const { rows: devsAprobadas } = await pool.query(
+      `SELECT items FROM devoluciones WHERE pedido_id=$1 AND estado='aprobada'`, [rows[0].pedido_id]
+    );
+    const { estado_devolucion } = calcularEstadoDevolucion(pedidoItems, devsAprobadas);
+    await pool.query(
+      'UPDATE ventas SET estado=$1 WHERE pedido_id=$2',
+      [estado_devolucion === 'total' ? 'devuelto' : 'vendido', rows[0].pedido_id]
+    );
   }
 
   const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [rows[0].id]);
+  // El pedido asociado ya refleja "estado_devolucion" + qué línea se
+  // devolvió al consultarlo por GET /pedidos/:id — acá se adjunta también
+  // en la propia respuesta de la devolución, para que quien aprobó/rechazó
+  // vea de una vez el efecto sobre el pedido sin tener que pedirlo aparte.
+  if (rows[0].pedido_id) {
+    const { rows: pedidoActual } = await pool.query(`${PEDIDO_SELECT} WHERE ped.id=$1`, [rows[0].pedido_id]);
+    if (pedidoActual[0]) {
+      const productos = await enriquecerItemsPedido(pedidoActual[0].items);
+      full[0].pedido = await conEstadoDevolucion(conEstadoPago({ ...pedidoActual[0], productos }));
+    }
+  }
   res.json(full[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4729,7 +6006,13 @@ const fichaRouter = require('express').Router();
 fichaRouter.param('id', validateId);
 fichaRouter.get('/', auth, async (req, res) => {
   try {
-  const { rows } = await pool.query(`${FICHA_COLS} ORDER BY f.id DESC`);
+  const { desde, hasta } = req.query;
+  const errorRango = errorRangoFechas(desde, hasta);
+  if (errorRango) return res.status(400).json({ error: errorRango });
+  const params = [];
+  const conds = condicionRangoFechas('f.created_at', desde, hasta, params);
+  const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+  const { rows } = await pool.query(`${FICHA_COLS} ${where} ORDER BY f.id DESC`, params);
   res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -5011,11 +6294,20 @@ localRouter.post('/', auth, permitirRoles('Administrador'), async (req, res) => 
        FROM insumos i`
   );
   for (const ins of insumosExistentes) {
-    await pool.query(
-      `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,0,$3,true)
-         ON CONFLICT (insumo_id, local_id) DO NOTHING`,
-      [ins.id, rows[0].id, ins.minimoDefecto]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO insumo_local(insumo_id, local_id, stock, stock_minimo, activo) VALUES($1,$2,0,$3,true)
+           ON CONFLICT (insumo_id, local_id) DO NOTHING`,
+        [ins.id, rows[0].id, ins.minimoDefecto]
+      );
+    } catch (e) {
+      // 23503 = viola FK: el insumo se borró justo entre el SELECT de
+      // arriba y este INSERT (carrera real entre dos peticiones
+      // simultáneas) — nada que sembrar para un insumo que ya no existe;
+      // se salta esta fila en vez de tumbar la creación completa del local.
+      if (e.code !== '23503') throw e;
+      console.error(`⚠️  No se sembró insumo_local para insumo #${ins.id} (local #${rows[0].id}): el insumo ya no existe.`);
+    }
   }
   res.status(201).json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -5050,13 +6342,23 @@ localRouter.patch('/:id/estado', auth, permitirRoles('Administrador'), async (re
   res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-// Un local solo se puede eliminar si NO tiene ningún registro asociado.
-// Antes no había ruta DELETE (el frontend recibía un 404/500 genérico —
-// "Error en la solicitud"); y aunque la hubiera, algunas FK a locales
-// borran en cascada suave (pedidos_local_id_fkey es ON DELETE SET NULL, así
-// que un borrado "exitoso" habría dejado pedidos huérfanos sin local). Este
-// chequeo explícito responde 409 diciendo exactamente qué hay asociado y
-// cuántos, y solo deja borrar el local si está completamente libre.
+// Un local solo se puede eliminar si NO tiene ningún registro real
+// asociado: ventas, pedidos, empleados o compras (los 4 que de verdad
+// representan actividad — nunca se borran en cascada, por diseño: si hay
+// alguno, se bloquea con 409 y se dice exactamente qué y cuántos). Se
+// agregan además dos chequeos de seguridad que NO pidieron explícitamente
+// pero que evitan romper algo real:
+//   • usuarios con sesión fija en este local (usuarios.local_id no tiene
+//     ON DELETE en su FK — un local con usuarios lo tronaría con un error
+//     crudo de integridad referencial en vez de un 409 legible);
+//   • movimientos_inventario con historial en este local (su FK tampoco
+//     tiene ON DELETE — mismo motivo).
+// Un insumo/empaque con FILA en insumo_local/empaque_local pero en CERO
+// stock (el caso normal: todo insumo tiene fila en TODOS los locales,
+// existencia no implica uso real) NO bloquea — esas filas cascadean solas
+// al borrar el local (ON DELETE CASCADE, ver config/db.js). Lo que SÍ
+// bloquea es que quede STOCK REAL (≠0) sin transferir: perderlo en
+// silencio sería un bug de inventario, no una limpieza.
 localRouter.delete('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
   try {
   const { rows: existe } = await pool.query('SELECT id FROM locales WHERE id=$1', [req.params.id]);
@@ -5067,37 +6369,180 @@ localRouter.delete('/:id', auth, permitirRoles('Administrador'), async (req, res
        (SELECT COUNT(*) FROM compras       WHERE local_id = $1)                                   AS compras,
        (SELECT COUNT(*) FROM pedidos       WHERE local_id = $1)                                   AS pedidos,
        (SELECT COUNT(*) FROM ventas v JOIN pedidos p ON p.id = v.pedido_id WHERE p.local_id = $1) AS ventas,
-       (SELECT COUNT(*) FROM insumo_local  WHERE local_id = $1)                                   AS insumos,
-       (SELECT COUNT(*) FROM empaque_local WHERE local_id = $1)                                   AS empaques,
        (SELECT COUNT(*) FROM empleados     WHERE local_id = $1)                                   AS empleados,
-       (SELECT COUNT(*) FROM usuarios      WHERE local_id = $1)                                   AS usuarios`,
+       (SELECT COUNT(*) FROM usuarios      WHERE local_id = $1)                                   AS usuarios,
+       (SELECT COUNT(*) FROM insumo_local  WHERE local_id = $1 AND stock <> 0)                    AS insumos_con_stock,
+       (SELECT COUNT(*) FROM empaque_local WHERE local_id = $1 AND stock <> 0)                    AS empaques_con_stock,
+       (SELECT COUNT(*) FROM movimientos_inventario WHERE local_id = $1)                          AS movimientos`,
     [req.params.id]
   );
   const cats = [
-    [Number(n.compras),   'compra',   'compras'],
-    [Number(n.pedidos),   'pedido',   'pedidos'],
-    [Number(n.ventas),    'venta',    'ventas'],
-    [Number(n.insumos),   'insumo con stock registrado',   'insumos con stock registrado'],
-    [Number(n.empaques),  'empaque con stock registrado',  'empaques con stock registrado'],
-    [Number(n.empleados), 'empleado', 'empleados'],
-    [Number(n.usuarios),  'usuario',  'usuarios'],
+    [Number(n.ventas),           'venta',                              'ventas'],
+    [Number(n.pedidos),          'pedido',                             'pedidos'],
+    [Number(n.empleados),        'empleado asignado',                  'empleados asignados'],
+    [Number(n.compras),          'compra registrada',                  'compras registradas'],
+    [Number(n.usuarios),         'usuario con sesión en este local',   'usuarios con sesión en este local'],
+    [Number(n.insumos_con_stock),  'insumo con stock sin transferir',  'insumos con stock sin transferir'],
+    [Number(n.empaques_con_stock), 'empaque con stock sin transferir', 'empaques con stock sin transferir'],
+    [Number(n.movimientos),      'movimiento de inventario registrado', 'movimientos de inventario registrados'],
   ];
   const partes = cats.filter(([c]) => c > 0).map(([c, s, p]) => `${c} ${c === 1 ? s : p}`);
   if (partes.length) {
-    const total = cats.reduce((a, [c]) => a + c, 0);
     const listado = partes.length === 1
       ? partes[0]
       : `${partes.slice(0, -1).join(', ')} y ${partes[partes.length - 1]}`;
     return res.status(409).json({
-      error: `No se puede eliminar: este local tiene ${listado} asociado${total === 1 ? '' : 's'}. Elimina o reasigna esos registros primero.`,
+      error: `No se puede eliminar: tiene ${listado}. Elimina, reasigna o transfiere esos registros primero.`,
     });
   }
 
+  // Nada bloquea: las filas de insumo_local/empaque_local de este local
+  // (todas en stock 0, ya verificado arriba) se eliminan solas por
+  // ON DELETE CASCADE al borrar el local — no hace falta un DELETE aparte.
   await pool.query('DELETE FROM locales WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/locales', localRouter);
+
+// ── MÉTODOS DE PAGO (dinámicos) ──────────────────────────────
+// Catálogo administrable de métodos de pago que el checkout de la
+// Landing puede ofrecer (nombre + descripción + QR opcional) — separado
+// a propósito de `pedidos.pago` (el identificador interno fijo
+// 'efectivo'/'nequi'/'transferencia' que ya exige el CHECK de la base,
+// ver METODOS_PAGO_VALIDOS más arriba): esta tabla es solo lo que se
+// MUESTRA en el checkout (para poder agregar/editar/desactivar un método
+// sin tocar código), no reemplaza ni valida contra ese enum existente —
+// nada de lo ya construido para pedidos/pago se toca.
+//
+// El QR reutiliza el mecanismo de imágenes YA EXISTENTE en este
+// proyecto: la subida real la hace el FRONTEND directo a Cloudinary
+// (mismo patrón que ya usa el comprobante de una compra —
+// cloudinaryService.js, sin backend de por medio) y acá solo se guarda
+// la URL resultante como texto — igual que ya hacen `productos.imagen`,
+// `categorias.imagen` y `compras.comprobante_url`. No se construyó (ni
+// hacía falta) ningún endpoint de subida de archivos nuevo.
+const metodoPagoNombreDuplicado = async (nombre, excluirId) => {
+  const params = excluirId ? [nombre, excluirId] : [nombre];
+  const cond = excluirId ? 'lower(btrim(nombre))=lower(btrim($1)) AND id<>$2' : 'lower(btrim(nombre))=lower(btrim($1))';
+  const { rows } = await pool.query(`SELECT id FROM metodos_pago WHERE ${cond} LIMIT 1`, params);
+  return !!rows[0];
+};
+
+const METODO_PAGO_COLS = `
+  id, nombre, descripcion, url_qr AS "urlQr", activo,
+  fecha_actualizacion AS "fechaActualizacion", created_at AS "fechaCreacion"
+`;
+
+const metodoPagoRouter = require('express').Router();
+metodoPagoRouter.param('id', validateId);
+
+// Público — lo consume el checkout de la Landing, sin sesión. Solo los
+// métodos ACTIVOS: uno desactivado deja de ofrecerse ahí, sin que haga
+// falta borrarlo (conserva su historial/configuración para reactivarlo).
+metodoPagoRouter.get('/', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE activo=true ORDER BY nombre`
+    );
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Admin — todos (activos e inactivos), para la pantalla de gestión.
+// Mismo patrón que GET /locales/todos.
+metodoPagoRouter.get('/todos', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago ORDER BY id DESC`);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+metodoPagoRouter.get('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE id=$1`, [req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+metodoPagoRouter.post('/', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del método de pago', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorDesc = errorLongitud(req.body.descripcion, 'La descripción', LIMITES.DESCRIPCION);
+    if (errorDesc) return res.status(400).json({ error: errorDesc });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await metodoPagoNombreDuplicado(nombre, null)) {
+      return res.status(400).json({ error: 'Ya existe un método de pago con ese nombre.' });
+    }
+    // url_qr es OPCIONAL (requisito explícito: "imagen no obligatoria") —
+    // un método de pago puede crearse sin QR y agregárselo después con
+    // PATCH /:id/qr.
+    const { rows } = await pool.query(
+      `INSERT INTO metodos_pago(nombre, descripcion, url_qr, activo)
+       VALUES($1,$2,$3,$4) RETURNING id`,
+      [nombre, textoLimpio(req.body.descripcion) || null, req.body.url_qr || null, req.body.activo !== false]
+    );
+    const { rows: full } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE id=$1`, [rows[0].id]);
+    res.status(201).json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un método de pago con ese nombre.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+metodoPagoRouter.put('/:id', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const errorNom = errorNombre(req.body.nombre, 'El nombre del método de pago', LIMITES.NOMBRE_CORTO);
+    if (errorNom) return res.status(400).json({ error: errorNom });
+    const errorDesc = errorLongitud(req.body.descripcion, 'La descripción', LIMITES.DESCRIPCION);
+    if (errorDesc) return res.status(400).json({ error: errorDesc });
+    const nombre = nombreNormalizado(req.body.nombre);
+    if (await metodoPagoNombreDuplicado(nombre, req.params.id)) {
+      return res.status(400).json({ error: 'Ya existe un método de pago con ese nombre.' });
+    }
+    // "activo" solo se toca si de verdad vino en el body — si no, se
+    // conserva el que ya tenía (editar nombre/descripción no debe
+    // reactivar sin querer un método que estaba desactivado a propósito).
+    const activoFinal = req.body.activo === undefined ? null : req.body.activo !== false;
+    const { rows } = await pool.query(
+      `UPDATE metodos_pago
+          SET nombre=$1, descripcion=$2, url_qr=COALESCE($3, url_qr), activo=COALESCE($4, activo), fecha_actualizacion=NOW()
+        WHERE id=$5 RETURNING id`,
+      [nombre, textoLimpio(req.body.descripcion) || null, req.body.url_qr ?? null, activoFinal, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Ya existe un método de pago con ese nombre.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+// Subir/cambiar (o quitar, mandando url_qr=null) SOLO el QR, sin tener
+// que reenviar el resto del formulario — mismo espíritu que
+// PUT /pedidos/:id aceptando comprobante_img suelto para adjuntarlo
+// después de creado.
+metodoPagoRouter.patch('/:id/qr', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE metodos_pago SET url_qr=$1, fecha_actualizacion=NOW() WHERE id=$2 RETURNING id`,
+      [req.body.url_qr || null, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+metodoPagoRouter.patch('/:id/estado', auth, permitirRoles('Administrador'), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `UPDATE metodos_pago SET activo = NOT activo, fecha_actualizacion=NOW() WHERE id=$1 RETURNING id`,
+      [req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'No encontrado' });
+    const { rows: full } = await pool.query(`SELECT ${METODO_PAGO_COLS} FROM metodos_pago WHERE id=$1`, [req.params.id]);
+    res.json(full[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+r.use('/metodos-pago', metodoPagoRouter);
 
 // ── RESEÑAS ────────────────────────────────────────────────
 const resenasRouter = require('express').Router();

@@ -47,6 +47,15 @@ router.post('/login', async (req, res) => {
     // para que la respuesta tarde lo mismo exista o no la cuenta.
     const ok = await bcrypt.compare(String(password || ''), u ? u.password : HASH_SENUELO);
     if (!u || !ok) return res.status(401).json({ error: ERROR_CREDENCIALES });
+    // Cuenta desactivada (a mano, o en cascada al desactivar su rol — ver
+    // PATCH /roles/:id/estado): antes esto no se revisaba en absoluto acá,
+    // así que "desactivar" un usuario no le impedía seguir iniciando
+    // sesión con total normalidad. Va DESPUÉS de validar la contraseña
+    // (nunca antes): así no se revela si una cuenta existe/está inactiva
+    // a quien todavía no probó la contraseña correcta.
+    if (u.estado !== 'Activo') {
+      return res.status(403).json({ error: 'Tu cuenta está desactivada. Contacta a un administrador.' });
+    }
     // "sede" viaja en el JWT para que el middleware `auth` la exponga en
     // req.user y las rutas puedan filtrar pedidos por local sin tener que
     // volver a consultar la tabla usuarios en cada petición. "local_id" (la
@@ -69,7 +78,7 @@ router.post('/login', async (req, res) => {
 router.post('/cliente/registro', async (req, res) => {
   const {
     nombre: nombre_, correo: correo_, username: username_,
-    password, telefono, tipoDoc, numeroDoc, departamento, municipio, comuna, direccion,
+    password, telefono, tipoDoc, numeroDoc,
   } = req.body;
   try {
     // El nombre nunca se revisaba: un registro con nombre = "   " quedaba
@@ -112,9 +121,9 @@ router.post('/cliente/registro', async (req, res) => {
     // Guardar cliente sin verificar
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      `INSERT INTO clientes(nombre,correo,password,telefono,username,tipo_doc,numero_doc,departamento,municipio,comuna,direccion,verificado)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false) RETURNING id,nombre,correo`,
-      [nombre, correo, hash, telefono||null, username||null, tipoDoc||null, numeroDoc||null, departamento||null, municipio||null, comuna||null, direccion||null]
+      `INSERT INTO clientes(nombre,correo,password,telefono,username,tipo_doc,numero_doc,verificado)
+       VALUES($1,$2,$3,$4,$5,$6,$7,false) RETURNING id,nombre,correo`,
+      [nombre, correo, hash, telefono||null, username||null, tipoDoc||null, numeroDoc||null]
     );
 
     // Generar y guardar token
@@ -168,6 +177,12 @@ router.post('/cliente/login', async (req, res) => {
     const c = rows[0];
     const ok = await bcrypt.compare(String(password || ''), c ? c.password : HASH_SENUELO);
     if (!c || !ok) return res.status(401).json({ error: ERROR_CREDENCIALES });
+    // Mismo chequeo que el login de usuarios/empleados — clientes.estado
+    // ya se podía poner en 'Inactivo' desde PATCH /clientes/:id/estado,
+    // pero no bloqueaba el login en absoluto.
+    if (c.estado !== 'Activo') {
+      return res.status(403).json({ error: 'Tu cuenta está desactivada. Contacta a un administrador.' });
+    }
     const token = sign({ id: c.id, correo: c.correo, rol: 'Cliente' });
     // Perfil completo (mismas columnas/alias que GET /clientes/mi-perfil),
     // + username, que ya se usaba para iniciar sesión pero no forma parte

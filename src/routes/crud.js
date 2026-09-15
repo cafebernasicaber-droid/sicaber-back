@@ -84,6 +84,21 @@ const crud = (table, fields, opciones = {}) => {
   // 'items' de combos) deben convertirse a texto JSON antes de mandarlos
   // a Postgres, porque las columnas jsonb no aceptan un arreglo JS crudo.
   const toDbValue = (v) => (v !== null && typeof v === 'object') ? JSON.stringify(v) : v;
+  // BUG real (encontrado al agregar 'imagen' a categorias de producto):
+  // si el caller no manda "estado" (ej. un formulario de creación que solo
+  // pide nombre/imagen y deja el estado por defecto), este helper insertaba
+  // NULL explícito — nunca dejaba que corriera el DEFAULT 'Activo' de la
+  // columna — y Postgres rechazaba el INSERT completo con una violación de
+  // NOT NULL cruda (500), sin relación aparente con lo que sí se mandó. Se
+  // resuelve en un solo lugar (todas las tablas que usan este crud()
+  // comparten el mismo arreglo "fields") en vez de tener que acordarse de
+  // mandar "estado" siempre desde cada formulario.
+  const valorCampo = (f, body) => {
+    if (f === 'estado' && (body.estado === undefined || body.estado === null || body.estado === '')) {
+      return 'Activo';
+    }
+    return toDbValue(body[f] ?? null);
+  };
 
   r.post('/', auth, async (req, res) => {
     try {
@@ -91,7 +106,7 @@ const crud = (table, fields, opciones = {}) => {
       if (errorValidacion) return res.status(400).json({ error: errorValidacion });
 
       const body = normalizarBody(req.body);
-      const vals = fields.map(f => toDbValue(body[f] ?? null));
+      const vals = fields.map(f => valorCampo(f, body));
       const { rows } = await pool.query(
         `INSERT INTO ${table}(${cols}) VALUES(${nums}) RETURNING *`, vals
       );
@@ -108,7 +123,7 @@ const crud = (table, fields, opciones = {}) => {
       if (errorValidacion) return res.status(400).json({ error: errorValidacion });
 
       const body = normalizarBody(req.body);
-      const vals = [...fields.map(f => toDbValue(body[f] ?? null)), req.params.id];
+      const vals = [...fields.map(f => valorCampo(f, body)), req.params.id];
       const { rows } = await pool.query(
         `UPDATE ${table} SET ${sets} WHERE id=$${fields.length + 1} RETURNING *`, vals
       );
