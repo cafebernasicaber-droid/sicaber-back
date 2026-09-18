@@ -187,6 +187,12 @@ CREATE TABLE IF NOT EXISTS combos (
   imagen      TEXT,
   items       JSONB DEFAULT '[]',
   estado      VARCHAR(20)  NOT NULL DEFAULT 'Activo',
+  -- Ventana de vigencia del combo (NULL = sin límite en ese extremo) — ya
+  -- las usa GET /combos para filtrar solo los vigentes hoy, y POST/PUT
+  -- /combos para guardarlas (ver routes/index.js). Mismo criterio que
+  -- fecha_inicio_desc/fecha_fin_desc de productos.
+  fecha_inicio DATE,
+  fecha_fin    DATE,
   created_at  TIMESTAMP DEFAULT NOW()
 );
 

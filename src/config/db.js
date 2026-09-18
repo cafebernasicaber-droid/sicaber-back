@@ -848,8 +848,15 @@ const migrar = async () => {
     // Los dos índices que sostienen la detección de comprobantes
     // reutilizados (por imagen y por número de referencia). Parciales:
     // solo indexan las filas que de verdad tienen comprobante.
-    `CREATE INDEX IF NOT EXISTS idx_pedidos_comprobante_hash ON pedidos (comprobante_hash) WHERE comprobante_hash IS NOT NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_pedidos_comprobante_hash ON pedidos (comprobante_hash) WHERE comprobante_hash IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_pedidos_comprobante_ref ON pedidos (comprobante_entidad, comprobante_referencia) WHERE comprobante_referencia IS NOT NULL`,
+    // combos: ventana de vigencia (NULL = sin límite en ese extremo).
+    // GET/POST/PUT /combos ya leían y escribían fecha_inicio/fecha_fin,
+    // pero las columnas nunca se crearon acá ni en schema.sql — GET /combos
+    // reventaba con 500 "column fecha_inicio does not exist" en cualquier
+    // base que no las tuviera puestas a mano.
+    `ALTER TABLE combos ADD COLUMN IF NOT EXISTS fecha_inicio DATE`,
+    `ALTER TABLE combos ADD COLUMN IF NOT EXISTS fecha_fin DATE`,
 
   ];
   for (const sql of alters) {

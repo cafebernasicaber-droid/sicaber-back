@@ -24,6 +24,13 @@ const CORS_ORIGENES_EXTRA = (process.env.CORS_ORIGENES_EXTRA || '')
   .filter(Boolean);
 
 const CORS_REGEX_LOCALHOST = /^http:\/\/localhost:\d+$/;
+// Mismo caso que localhost pero escrito como IP en vez de nombre — lo usan
+// sobre todo apps móviles (Flutter/React Native) corriendo en un emulador o
+// en un celular físico conectado a la misma red Wi-Fi que el backend en
+// desarrollo, que no pueden usar "localhost" para llegar a la PC:
+// 127.0.0.1 / [::1] (loopback, IPv4 e IPv6) y los tres rangos de IP privada
+// (192.168.x.x, 10.x.x.x, 172.16.x.x-172.31.x.x).
+const CORS_REGEX_RED_LOCAL = /^http:\/\/(127\.0\.0\.1|\[::1\]|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}):\d+$/;
 const CORS_REGEX_TUNNEL = /^https:\/\/[a-z0-9-]+\.app\.github\.dev$/;
 // Vercel genera un dominio distinto por cada despliegue de vista previa
 // (por rama, por pull request), no solo el de producción. Sin este patrón
@@ -43,6 +50,7 @@ app.use(cors({
       CORS_ORIGENES_ESTATICOS.includes(origin) ||
       CORS_ORIGENES_EXTRA.includes(origin) ||
       CORS_REGEX_LOCALHOST.test(origin) ||
+      CORS_REGEX_RED_LOCAL.test(origin) ||
       CORS_REGEX_TUNNEL.test(origin) ||
       CORS_REGEX_VERCEL.test(origin);
 
@@ -51,7 +59,15 @@ app.use(cors({
     // aportar nada. Un rechazo sí hay que poder verlo para diagnosticar.
     if (permitido) return callback(null, true);
     console.warn(`CORS: origen rechazado → "${origin}"`);
-    return callback(new Error(`Origen no permitido por CORS: ${origin}`));
+    // BUG REAL corregido: pasar un Error acá hace que el paquete `cors`
+    // llame a next(err) — la petición sigue de largo hasta el manejador
+    // global de errores de abajo, que la responde como 500 "Origen no
+    // permitido por CORS" EN LA RUTA QUE SEA (no un rechazo de CORS común:
+    // un 500 real). Un origen no autorizado debe fallar del modo normal de
+    // CORS —sin los headers Access-Control-*, para que el navegador lo
+    // bloquee del lado del cliente— sin tumbar la petición del lado del
+    // servidor. callback(null, false) hace exactamente eso.
+    return callback(null, false);
   },
   credentials: true
 }));
