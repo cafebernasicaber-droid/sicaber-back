@@ -158,6 +158,15 @@ const comunaPorNombreBarrio = (camposBarrio) => {
   return null;
 };
 
+// Acepta 9, '9', '09', 'Comuna 9' -> devuelve SIEMPRE el numero (o null).
+// Sin esto, una comuna que llegue como texto '09' no encuentra su local en
+// COBERTURA_POR_COMUNA y la direccion se rechaza como fuera de cobertura.
+const normalizarComuna = (valor) => {
+  if (valor == null || valor === '') return null;
+  if (typeof valor === 'number') return Number.isFinite(valor) ? valor : null;
+  return extraerNumeroComuna(valor);
+};
+
 function extraerNumeroComuna(texto) {
   if (!texto) return null;
   const t = String(texto).trim();
@@ -423,6 +432,12 @@ async function determinarSedePorDireccion(direccionTexto) {
   let falloServicio = null;
   try {
     resultado = await geocodificarGeoMedellin(texto);
+    // GeoMedellin contesto, pero sin comuna utilizable. Ese resultado no
+    // sirve para decidir cobertura y ADEMAS bloquea el respaldo: el
+    // `if (!resultado)` de abajo lo daba por bueno, Geoapify nunca se
+    // consultaba y la direccion terminaba en 'no_geocodificada' aunque
+    // Geoapify la hubiera resuelto perfectamente. Se descarta.
+    if (resultado && normalizarComuna(resultado.comuna) == null) resultado = null;
   } catch (e) {
     // GeoMedellín no disponible ahora mismo: se anota y se sigue con el
     // respaldo. Solo si Geoapify TAMBIÉN falla se reporta como caída.
@@ -460,13 +475,14 @@ async function determinarSedePorDireccion(direccionTexto) {
   }
 
   let respuesta;
-  if (!resultado || resultado.comuna == null) {
+  const comunaFinal = resultado ? normalizarComuna(resultado.comuna) : null;
+  if (!resultado || comunaFinal == null) {
     respuesta = {
       sede: null, cubierto: false, motivo: 'no_geocodificada',
       requiereSeleccionManual: true, detalle: resultado, avisoProximidad: null,
     };
   } else {
-    const sede = COBERTURA_POR_COMUNA[resultado.comuna] || null;
+    const sede = COBERTURA_POR_COMUNA[comunaFinal] || null;
     respuesta = sede
       ? {
         sede, cubierto: true, motivo: null, detalle: resultado,
