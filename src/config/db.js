@@ -16,12 +16,53 @@ const path = require('path');
 // (productos.precio, adiciones.precio, toppings.cantidad, compras.total,
 // insumos.stock, fichas_tecnicas.costo_estimado, etc.), en vez de andar
 // convirtiéndolo a mano ruta por ruta.
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+// ── Cómo se arma la conexión ─────────────────────────────────────────────
+// BUG REAL corregido acá: desde que el proyecto pasó a Neon, este archivo
+// leía ÚNICAMENTE `DATABASE_URL`. Pero scripts/run-tests.js arranca el
+// servidor de pruebas pasándole `DB_NAME=sicaber_test` (ver test/README.md,
+// donde se explica por qué los tests JAMÁS deben tocar la base real). Como
+// db.js ya no mira DB_NAME, ese override dejó de tener efecto: `npm test`
+// apuntaba a la MISMA base de DATABASE_URL — la de producción — y la suite,
+// que crea y borra pedidos, insumos y ventas, corría contra los datos
+// reales del negocio.
+//
+// Ahora: si hay variables sueltas DB_* se usan esas (y DB_NAME manda, que
+// es lo que el runner necesita); si no, se usa DATABASE_URL como siempre.
+const usaVariablesSueltas = !!(process.env.DB_NAME && (process.env.DB_HOST || process.env.DB_USER));
+
+// SSL solo donde de verdad hace falta. Neon lo exige; un Postgres local no
+// lo tiene habilitado y forzarlo hacía fallar la conexión con "The server
+// does not support SSL connections" — otra razón por la que era imposible
+// levantar el entorno de pruebas contra una base local.
+const requiereSsl = () => {
+  if (process.env.DB_SSL === 'false') return false;
+  if (process.env.DB_SSL === 'true') return true;
+  const url = process.env.DATABASE_URL || '';
+  if (usaVariablesSueltas) {
+    const host = process.env.DB_HOST || 'localhost';
+    return !['localhost', '127.0.0.1', '::1'].includes(host);
+  }
+  if (/sslmode=disable/.test(url)) return false;
+  // Una URL a localhost tampoco necesita SSL.
+  return !/@(localhost|127\.0\.0\.1)[:/]/.test(url);
+};
+
+const configuracionPool = {
+  ...(usaVariablesSueltas
+    ? {
+      host: process.env.DB_HOST || 'localhost',
+      port: Number(process.env.DB_PORT) || 5432,
+      user: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+    }
+    : { connectionString: process.env.DATABASE_URL }),
+  ...(requiereSsl() ? { ssl: { rejectUnauthorized: false } } : {}),
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
-});
+};
+
+const pool = new Pool(configuracionPool);
 
 // CRÍTICO: sin este listener, cuando una conexión inactiva del pool se cae
 // (ECONNRESET, "Connection terminated unexpectedly", etc.) Node.js la trata
@@ -759,6 +800,56 @@ const migrar = async () => {
        ('Pasto'), ('Manizales'), ('Neiva'), ('Villavicencio'), ('Armenia'),
        ('Valledupar')
      ON CONFLICT (nombre) DO NOTHING`,
+
+    // ── Códigos de verificación: intentos fallidos ─────────────────────
+    // Un código de 6 dígitos son un millón de combinaciones y antes se
+    // podían probar TODAS: la verificación no llevaba ninguna cuenta de
+    // los intentos. Con esta columna, services/codigosVerificacion.js
+    // quema el código tras 5 fallos (ver CODIGO_MAX_INTENTOS).
+    `ALTER TABLE tokens_verificacion ADD COLUMN IF NOT EXISTS intentos INTEGER NOT NULL DEFAULT 0`,
+    // Búsqueda del último código vivo de un correo (la hace CADA
+    // verificación y cada reenvío): sin índice era un recorrido completo
+    // de la tabla, que solo crece.
+    `CREATE INDEX IF NOT EXISTS idx_tokens_correo_tipo ON tokens_verificacion (lower(correo), tipo, created_at DESC)`,
+
+    // ── Validación del comprobante de pago hecha por el BACKEND ────────
+    // Hasta ahora lo único que se guardaba era `comprobante_ocr`: el
+    // resultado que el FRONTEND calculaba y mandaba, aceptado tal cual y
+    // sin ninguna verificación (el propio comentario de esa columna decía
+    // que era "puramente informativo"). Es decir: quien decidía si el
+    // monto del comprobante coincidía con el total era el cliente, desde
+    // su navegador — con abrir las herramientas de desarrollo bastaba
+    // para mandar { coincide: true } con cualquier imagen.
+    //
+    // Estas columnas guardan lo que el SERVIDOR extrajo y concluyó por su
+    // cuenta (ver services/comprobante.js). `comprobante_ocr` se conserva
+    // intacta como dato informativo del cliente, pero ya no decide nada.
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_validacion JSONB`,
+    // Valor leído del comprobante por el backend, en pesos. Es el número
+    // que se compara contra el total real del pedido.
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_valor NUMERIC(12,2)`,
+    // Entidad detectada (bancolombia / nequi / daviplata / otra) y número
+    // de referencia o comprobante. La referencia es la segunda barrera
+    // contra la reutilización: el hash de la imagen cambia con solo
+    // recortarla o volver a comprimirla, el número de aprobación no.
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_entidad VARCHAR(40)`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_referencia VARCHAR(80)`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_fecha VARCHAR(60)`,
+    // Auditoría de la decisión: quién aprobó/rechazó el comprobante y
+    // cuándo. Antes no quedaba ningún rastro de quién había aprobado un
+    // pago — solo el booleano `pago_confirmado`.
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_verificado_por INTEGER`,
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS comprobante_verificado_en TIMESTAMPTZ`,
+    // Total recalculado por el servidor a partir de los precios reales de
+    // la base de datos (ver calcularTotalPedido en routes/index.js). El
+    // `total` que manda el cliente ya no es la referencia para validar un
+    // pago: el comprobante se compara contra ESTE número.
+    `ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS total_calculado NUMERIC(12,2)`,
+    // Los dos índices que sostienen la detección de comprobantes
+    // reutilizados (por imagen y por número de referencia). Parciales:
+    // solo indexan las filas que de verdad tienen comprobante.
+    `CREATE INDEX IF NOT EXISTS idx_pedidos_comprobante_hash ON pedidos (comprobante_hash) WHERE comprobante_hash IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_pedidos_comprobante_ref ON pedidos (comprobante_entidad, comprobante_referencia) WHERE comprobante_referencia IS NOT NULL`,
 
   ];
   for (const sql of alters) {

@@ -17,6 +17,10 @@ const {
 // partir de la categoría del producto. Ver config/tiposPreparacion.js.
 const { resolverTipoPreparacion } = require('../config/tiposPreparacion');
 const { determinarSedePorDireccion } = require('../services/geocoding');
+// Lectura y validación del comprobante de pago en el SERVIDOR (valor,
+// entidad y referencia extraídos del propio comprobante, sin depender del
+// diseño de cada banco). Ver services/comprobante.js.
+const { validarComprobante } = require('../services/comprobante');
 
 const r = express.Router();
 
@@ -4189,6 +4193,188 @@ const calcularEstadoPago = (p) => {
 // endpoint se pidió.
 const conEstadoPago = (p) => (p ? { ...p, estado_pago: calcularEstadoPago(p) } : p);
 
+// ─────────────────────────────────────────────────────────────────────────
+//  TOTAL DEL PEDIDO CALCULADO POR EL SERVIDOR
+// ─────────────────────────────────────────────────────────────────────────
+// Hasta ahora, `total` era simplemente lo que mandaba el body: se guardaba
+// tal cual (`total || 0`) y con ese número se registraba después la venta.
+// Nadie lo contrastaba nunca contra los precios reales de la base. Eso
+// hacía inútil cualquier validación del comprobante: bastaba con mandar
+// `total: 1000` junto a un carrito de $80.000 para que un comprobante de
+// $1.000 "cuadrara" perfectamente.
+//
+// Esta función reconstruye el total desde los PRECIOS VIGENTES en la base
+// (producto o combo + adiciones con costo; los toppings son gratis por
+// definición — ver la tabla `toppings`, que nunca tuvo columna de precio),
+// aplicando el descuento solo si está vigente hoy, igual que
+// DESCUENTO_VIGENTE_EXPR.
+//
+// Devuelve `calculable: false` —sin error— cuando el pedido no se puede
+// reconstruir con certeza: carrito vacío, líneas sin un id real de
+// producto/combo (pedidos de mostrador escritos a mano), o una adición que
+// ya no existe en el catálogo. En esos casos se conserva el total recibido
+// y NO se rechaza nada: rechazar por no poder calcular convertiría un
+// control de seguridad en una falla de disponibilidad.
+const idsSeleccionados = (valor) => (Array.isArray(valor) ? valor : [])
+  .map((v) => (v !== null && typeof v === 'object' ? v.id : v))
+  .map(Number)
+  .filter((n) => Number.isInteger(n) && n > 0);
+
+const calcularTotalPedido = async (items) => {
+  const lista = Array.isArray(items) ? items : [];
+  if (lista.length === 0) return { calculable: false, motivo: 'sin_items', total: null, lineas: [] };
+
+  const productoIds = new Set();
+  const comboIds = new Set();
+  const adicionIds = new Set();
+  const identificadores = [];
+
+  for (const it of lista) {
+    const ident = parseIdentificadorProducto(it?.id ?? it?.id_producto ?? it?.producto_id);
+    // Línea sin id numérico real (ej. un ítem suelto escrito por el
+    // cajero): no hay precio de catálogo contra el cual comparar.
+    if (!ident) return { calculable: false, motivo: 'item_sin_identificador', total: null, lineas: [] };
+    identificadores.push(ident);
+    if (ident.tipo === 'combo') comboIds.add(ident.id); else productoIds.add(ident.id);
+    for (const id of idsSeleccionados(it?.adiciones ?? it?.personalizacion?.adiciones)) adicionIds.add(id);
+  }
+
+  const [productos, combos, adiciones] = await Promise.all([
+    productoIds.size
+      ? pool.query(`SELECT id, precio, ${DESCUENTO_VIGENTE_EXPR} AS descuento FROM productos WHERE id = ANY($1) AND estado = 'Activo'`, [[...productoIds]])
+      : { rows: [] },
+    comboIds.size ? pool.query('SELECT id, precio FROM combos WHERE id = ANY($1)', [[...comboIds]]) : { rows: [] },
+    adicionIds.size ? pool.query('SELECT id, precio FROM adiciones WHERE id = ANY($1)', [[...adicionIds]]) : { rows: [] },
+  ]);
+
+  const precioProducto = new Map(productos.rows.map((p) => [p.id, p]));
+  const precioCombo = new Map(combos.rows.map((c) => [c.id, Number(c.precio) || 0]));
+  const precioAdicion = new Map(adiciones.rows.map((a) => [a.id, Number(a.precio) || 0]));
+
+  let total = 0;
+  const lineas = [];
+  for (let i = 0; i < lista.length; i++) {
+    const it = lista[i];
+    const ident = identificadores[i];
+    const cantidad = Number(it?.cantidad) || 1;
+    if (!Number.isFinite(cantidad) || cantidad <= 0) {
+      return { calculable: false, motivo: 'cantidad_invalida', total: null, lineas: [] };
+    }
+
+    let unitario;
+    if (ident.tipo === 'combo') {
+      if (!precioCombo.has(ident.id)) return { calculable: false, motivo: 'combo_desconocido', total: null, lineas: [] };
+      unitario = precioCombo.get(ident.id);
+    } else {
+      const prod = precioProducto.get(ident.id);
+      // Producto inexistente o inactivo: no se puede fijar un precio de
+      // referencia (y un pedido de un producto retirado ya es de por sí
+      // algo que un humano debería mirar).
+      if (!prod) return { calculable: false, motivo: 'producto_desconocido', total: null, lineas: [] };
+      const descuento = Number(prod.descuento) || 0;
+      unitario = Math.round((Number(prod.precio) || 0) * (100 - descuento) / 100);
+    }
+
+    // Adiciones: costo POR UNIDAD, igual que el consumo de insumos que ya
+    // calcula calcularRecetaEfectiva (cantidad × unidades).
+    let adicionesLinea = 0;
+    for (const idAdicion of idsSeleccionados(it?.adiciones ?? it?.personalizacion?.adiciones)) {
+      if (!precioAdicion.has(idAdicion)) return { calculable: false, motivo: 'adicion_desconocida', total: null, lineas: [] };
+      adicionesLinea += precioAdicion.get(idAdicion);
+    }
+
+    const subtotal = (unitario + adicionesLinea) * cantidad;
+    total += subtotal;
+    lineas.push({ indice: i, tipo: ident.tipo, id: ident.id, cantidad, unitario, adiciones: adicionesLinea, subtotal });
+  }
+
+  return { calculable: true, motivo: null, total: Math.round(total), lineas };
+};
+
+// Margen al comparar el total recibido con el calculado: 1 peso por línea.
+// No es una puerta trasera —con eso no se paga nada de menos—, es para
+// absorber el redondeo de los porcentajes de descuento, que el navegador y
+// Postgres no tienen por qué redondear exactamente igual en el último peso.
+const toleranciaTotal = (lineas) => Math.max(1, Number(lineas) || 1);
+
+// ─────────────────────────────────────────────────────────────────────────
+//  COMPROBANTE: validación + anti-reutilización, en el backend
+// ─────────────────────────────────────────────────────────────────────────
+// Un comprobante se considera YA USADO si pertenece a un pedido que:
+//   • sigue vigente (no cancelado), o
+//   • tuvo su pago aprobado alguna vez (aunque después se cancelara: la
+//     plata se recibió), o
+//   • fue rechazado por comprobante inválido — así nadie puede ir probando
+//     el mismo pantallazo pedido por pedido hasta que uno pase.
+// Antes la condición era solo `estado <> 'cancelado'`, así que un
+// comprobante rechazado quedaba libre para reintentarlo en otro pedido.
+const CONDICION_COMPROBANTE_EN_USO = `
+  (estado <> 'cancelado' OR pago_confirmado = TRUE OR comprobante_motivo_rechazo IS NOT NULL)
+`;
+
+const buscarComprobanteRepetido = async ({ hash, entidad, referencia, excluirPedidoId }) => {
+  const params = [];
+  const condiciones = [];
+  if (hash) {
+    params.push(hash);
+    condiciones.push(`comprobante_hash = $${params.length}`);
+  }
+  // Segunda barrera: el número de aprobación del banco. El hash cambia con
+  // solo recortar o volver a comprimir la imagen; la referencia, no.
+  if (referencia) {
+    params.push(referencia);
+    params.push(entidad || 'otra');
+    condiciones.push(`(comprobante_referencia = $${params.length - 1} AND COALESCE(comprobante_entidad,'otra') = $${params.length})`);
+  }
+  if (condiciones.length === 0) return null;
+
+  let sql = `SELECT id, comprobante_hash, comprobante_referencia FROM pedidos
+              WHERE (${condiciones.join(' OR ')}) AND ${CONDICION_COMPROBANTE_EN_USO}`;
+  if (excluirPedidoId) {
+    params.push(excluirPedidoId);
+    sql += ` AND id <> $${params.length}`;
+  }
+  sql += ' LIMIT 1';
+
+  const { rows } = await pool.query(sql, params);
+  if (!rows[0]) return null;
+  return {
+    pedidoId: rows[0].id,
+    porHash: !!hash && rows[0].comprobante_hash === hash,
+  };
+};
+
+// Analiza el comprobante contra el total REAL del pedido y comprueba que no
+// se haya usado ya. Es el único punto donde se decide si un comprobante
+// sirve — lo usan POST /pedidos, PUT /pedidos/:id y la aprobación.
+const revisarComprobante = async ({ imagen, ocrCliente, textoPlano, total, excluirPedidoId }) => {
+  const hash = imagen ? crypto.createHash('sha256').update(imagen).digest('hex') : null;
+
+  // El chequeo por hash va primero y es barato: si es una imagen repetida,
+  // no hace falta ni leerla.
+  const repetidoPorHash = hash
+    ? await buscarComprobanteRepetido({ hash, excluirPedidoId })
+    : null;
+  if (repetidoPorHash) return { hash, duplicado: repetidoPorHash, validacion: null };
+
+  const validacion = await validarComprobante({ imagenBase64: imagen, ocrCliente, textoPlano, total });
+
+  const repetidoPorReferencia = validacion.referencia
+    ? await buscarComprobanteRepetido({ entidad: validacion.entidad, referencia: validacion.referencia, excluirPedidoId })
+    : null;
+
+  return { hash, duplicado: repetidoPorReferencia, validacion };
+};
+
+// Convierte el veredicto en las columnas que se guardan en `pedidos`.
+const columnasComprobante = (validacion) => ({
+  validacion: validacion ? JSON.stringify(validacion) : null,
+  valor: validacion?.valor ?? null,
+  entidad: validacion?.entidad ?? null,
+  referencia: validacion?.referencia ?? null,
+  fecha: validacion?.fecha ?? null,
+});
+
 // Separa, para cada línea de "items" de un pedido, la RECETA BASE del
 // producto (fija, sale de fichas_tecnicas — nunca cambia por pedido) de la
 // PERSONALIZACIÓN de esa línea (toppings/adiciones que el cliente eligió
@@ -4421,10 +4607,26 @@ const PEDIDO_SELECT = `
          ua.nombre AS "atendidoPorNombre",
          (ped.comprobante_img IS NOT NULL) AS "tieneComprobante",
          ped.comprobante_img AS "comprobanteImg",
-         ped.comprobante_ocr AS "comprobanteOcr"
+         ped.comprobante_ocr AS "comprobanteOcr",
+         -- Veredicto del BACKEND sobre el comprobante (no el del
+         -- navegador, que es "comprobanteOcr" y quedó como dato
+         -- informativo). Es lo que tiene que mostrar la pantalla de
+         -- Cajero/Admin al lado de la imagen para decidir, y lo que el
+         -- cliente ve como "pago verificado" o "en revisión".
+         ped.comprobante_validacion AS "comprobanteValidacion",
+         ped.comprobante_valor      AS "comprobanteValor",
+         ped.comprobante_entidad    AS "comprobanteEntidad",
+         ped.comprobante_referencia AS "comprobanteReferencia",
+         ped.comprobante_verificado_en AS "comprobanteVerificadoEn",
+         uv.nombre AS "comprobanteVerificadoPorNombre",
+         -- Total recalculado por el servidor desde el catálogo. Cuando
+         -- viene en NULL es que el carrito no era reconstruible (pedido de
+         -- mostrador escrito a mano) y manda "total".
+         ped.total_calculado AS "totalCalculado"
     FROM pedidos ped
     LEFT JOIN locales  l  ON ped.local_id        = l.id
     LEFT JOIN usuarios ua ON ped.atendido_por    = ua.id
+    LEFT JOIN usuarios uv ON ped.comprobante_verificado_por = uv.id
 `;
 
 pedRouter.get('/', auth, async (req, res) => {
@@ -4608,9 +4810,27 @@ pedRouter.post('/verificar-cobertura', async (req, res) => {
     return res.status(400).json({ error: 'Escribe una dirección de al menos 8 caracteres.' });
   }
   try {
+    // determinarSedePorDireccion ya NO lanza por fallos del servicio
+    // externo: devuelve motivo='servicio_no_disponible'. Antes, cualquier
+    // timeout de Geoapify/GeoMedellín salía por este catch como un 502
+    // seco, que el checkout mostraba igual que "tu dirección no tiene
+    // cobertura" — dos cosas completamente distintas.
     const cobertura = await determinarSedePorDireccion(direccion);
-    res.json(cobertura);
+    // Mensaje listo para mostrar, para que el frontend no tenga que
+    // traducir cada motivo por su cuenta (y no le queden casos sin cubrir).
+    const MENSAJES = {
+      fuera_de_cobertura: 'Esa dirección está fuera de la zona de cobertura (comuna 8 y 9 de Medellín).',
+      no_geocodificada: 'No pudimos ubicar esa dirección en el mapa. Confirma cuál local te queda más cerca para continuar.',
+      servicio_no_disponible: 'El servicio de mapas no está disponible en este momento. Confirma cuál local te queda más cerca para continuar.',
+    };
+    res.json({
+      ...cobertura,
+      mensaje: cobertura.cubierto
+        ? `Tu dirección la atiende ${cobertura.sede}.`
+        : (MENSAJES[cobertura.motivo] || 'No pudimos verificar la dirección.'),
+    });
   } catch (e) {
+    console.error('💥 POST /pedidos/verificar-cobertura:', e);
     res.status(502).json({ error: 'No se pudo verificar la dirección con el servicio de geocodificación.' });
   }
 });
@@ -4621,7 +4841,7 @@ pedRouter.post('/verificar-cobertura', async (req, res) => {
 // nunca exige uno (el checkout de la landing no tiene sesión de
 // admin/cajero) — ver middleware/auth.js.
 pedRouter.post('/', authOpcional, async (req, res) => {
-  const { cliente_id, numero, cliente, alias, tipo, pago, metodo_pago_local, mesa, total, items, comprobante, comprobante_img, comprobante_ocr, origen, direccion_alternativa, hora, estado, atendido_por, sede, local_id, zona_manual, _meta } = req.body;
+  const { cliente_id, numero, cliente, alias, tipo, pago, metodo_pago_local, mesa, total, items, comprobante, comprobante_img, comprobante_ocr, comprobante_texto, origen, direccion_alternativa, hora, estado, atendido_por, sede, local_id, zona_manual, _meta } = req.body;
   // Compatibilidad: si vienen en _meta los usamos también
   const meta = _meta || {};
 
@@ -4650,11 +4870,18 @@ pedRouter.post('/', authOpcional, async (req, res) => {
     atendidoPorBody = req.user.id;
   }
   const comprobanteImgFinal = comprobante_img || meta.comprobanteImg || null;
-  // OCR del comprobante: se guarda tal cual llega, SIN validar nada. Aunque
-  // el OCR haya fallado, no haya leído nada, o el monto no cuadre, el pedido
-  // se crea igual y el comprobante queda adjunto — la decisión de aprobar o
-  // rechazar el pago es 100% manual (Cajero/Admin).
+  // Lo que manda el frontend sobre el comprobante se sigue guardando, pero
+  // YA NO DECIDE NADA: antes, el objeto `comprobante_ocr` que llegaba del
+  // navegador era toda la "validación" que existía (el propio comentario
+  // de la migración decía que era informativo y que la decisión era 100%
+  // manual). Ahora el servidor vuelve a leer el comprobante por su cuenta
+  // —con su propio OCR si está habilitado, o reanalizando el TEXTO crudo,
+  // nunca el veredicto— y compara contra el total real. Ver
+  // services/comprobante.js y revisarComprobante más arriba.
   const comprobanteOcrFinal = comprobante_ocr ?? meta.comprobanteOcr ?? meta.ocr ?? null;
+  // Texto del comprobante, si el frontend lo manda aparte. Es materia
+  // prima para el análisis del servidor, no una conclusión.
+  const comprobanteTextoFinal = comprobante_texto ?? meta.comprobanteTexto ?? null;
   const pagoFinal = normalizarPago(pago || meta.pago || null);
   if (metodoPagoInvalido(pagoFinal)) {
     return res.status(400).json({ error: `Método de pago inválido. Debe ser uno de: ${METODOS_PAGO_VALIDOS.join(', ')}.` });
@@ -4776,22 +5003,72 @@ pedRouter.post('/', authOpcional, async (req, res) => {
       localNombreResuelto = localValido[0].nombre;
     }
 
-    // Evitar que el mismo pantallazo de pago se use para más de un pedido.
-    // Se calcula un hash (SHA-256) del contenido de la imagen — no del
-    // nombre de archivo, que se puede cambiar fácilmente — y se compara
-    // contra los comprobantes ya recibidos en pedidos que siguen vigentes
-    // (no cancelados). Si ya existe, se rechaza antes de tocar la base.
+    // ── Total: se recalcula en el servidor ──────────────────────────────
+    // El `total` del body deja de ser la verdad. Cuando el carrito se puede
+    // reconstruir contra el catálogo (ver calcularTotalPedido), se compara
+    // y se rechaza cualquier diferencia: sin esto, mandar `total: 1000`
+    // con un carrito de $80.000 hacía que un comprobante de $1.000 cuadrara
+    // perfectamente con "el total del pedido".
+    const totalRecibido = Math.round(Number(total) || 0);
+    const resumenTotal = await calcularTotalPedido(items);
+    let totalFinal = totalRecibido;
+    if (resumenTotal.calculable) {
+      const margen = toleranciaTotal(resumenTotal.lineas.length);
+      if (Math.abs(resumenTotal.total - totalRecibido) > margen) {
+        return res.status(400).json({
+          error: `El total del pedido no corresponde a los precios vigentes. Según el catálogo son $${resumenTotal.total.toLocaleString('es-CO')} y se recibió $${totalRecibido.toLocaleString('es-CO')}. Actualiza el carrito e intenta de nuevo.`,
+          totalCalculado: resumenTotal.total,
+          totalRecibido,
+        });
+      }
+      // Se guarda el total del SERVIDOR, no el del cliente: cualquier
+      // diferencia de redondeo dentro del margen se resuelve a favor del
+      // catálogo, que es la única fuente de precios.
+      totalFinal = resumenTotal.total;
+    }
+
+    // ── Comprobante: lectura y validación en el servidor ────────────────
+    // Tres cosas a la vez, en este orden:
+    //   1. ¿Es un pantallazo que ya se usó en otro pedido? (hash SHA-256
+    //      del contenido, no del nombre del archivo, que se cambia solo).
+    //   2. ¿Qué dice el comprobante? — valor, entidad y referencia, leídos
+    //      por el backend sin depender del diseño del banco.
+    //   3. ¿Coincide con el número de aprobación de otro pedido? (el hash
+    //      cambia recortando la imagen; la referencia del banco, no).
     let comprobanteHash = null;
-    if (comprobanteImgFinal) {
-      comprobanteHash = crypto.createHash('sha256').update(comprobanteImgFinal).digest('hex');
-      const { rows: dup } = await pool.query(
-        `SELECT id FROM pedidos WHERE comprobante_hash = $1 AND estado <> 'cancelado' LIMIT 1`,
-        [comprobanteHash]
-      );
-      if (dup[0]) {
+    let validacionComprobante = null;
+    if (comprobanteImgFinal || comprobanteTextoFinal) {
+      const revision = await revisarComprobante({
+        imagen: comprobanteImgFinal,
+        ocrCliente: comprobanteOcrFinal,
+        textoPlano: comprobanteTextoFinal,
+        total: totalFinal,
+      });
+      comprobanteHash = revision.hash;
+      validacionComprobante = revision.validacion;
+
+      if (revision.duplicado) {
         return res.status(409).json({
-          error: 'Este comprobante ya fue usado en otro pedido. Cada comprobante de pago solo se puede usar una vez.',
-          pedidoExistente: dup[0].id,
+          error: revision.duplicado.porHash
+            ? 'Este comprobante ya fue usado en otro pedido. Cada comprobante de pago solo se puede usar una vez.'
+            : 'Ese número de comprobante ya fue usado en otro pedido. Cada pago solo se puede usar una vez.',
+          pedidoExistente: revision.duplicado.pedidoId,
+          motivo: revision.duplicado.porHash ? 'comprobante_repetido' : 'referencia_repetida',
+        });
+      }
+
+      // Valor leído CON CLARIDAD y distinto al total: rechazo inmediato.
+      // Es el caso que el requisito pide bloquear — un comprobante solo
+      // vale para el pedido que está pagando. Cuando el comprobante no se
+      // puede leer, NO se rechaza: el pedido entra igual y queda en
+      // 'pendiente_verificacion' para que un cajero mire la imagen
+      // (rechazar por ilegible castigaría al cliente por una foto borrosa).
+      if (validacionComprobante?.estado === 'valor_no_coincide') {
+        return res.status(400).json({
+          error: validacionComprobante.mensaje,
+          motivo: 'valor_no_coincide',
+          valorComprobante: validacionComprobante.valor,
+          totalPedido: totalFinal,
         });
       }
     }
@@ -4854,22 +5131,33 @@ pedRouter.post('/', authOpcional, async (req, res) => {
       try {
         cobertura = await determinarSedePorDireccion(direccionAlternativaFinal);
       } catch (geoErr) {
+        // Red de seguridad: determinarSedePorDireccion ya no lanza por
+        // fallos del servicio externo (los devuelve como motivo), así que
+        // llegar acá significa un error de programación, no una caída de
+        // Geoapify. Se registra completo en el log del servidor.
+        console.error('💥 Geocodificación inesperada al crear el pedido:', geoErr);
         return res.status(502).json({ error: 'No se pudo verificar la dirección con el servicio de geocodificación. Intenta de nuevo.' });
       }
       if (cobertura.cubierto) {
         // Caso normal: la dirección se ubicó y cae en comuna 8 o 9 — el
         // local queda asignado automáticamente al que corresponde.
         sedeSugeridaPorDireccion = cobertura.sede;
-      } else if (cobertura.motivo === 'no_geocodificada') {
-        // La dirección no se pudo ubicar en el mapa (barrio/numeración no
-        // indexada, común en Comuna 8/9) — NO se rechaza de plano, porque
-        // eso podría ser un falso negativo (dirección real y cubierta que
-        // el geocodificador simplemente no reconoce). Se exige que el
-        // cliente confirme a mano cuál local le queda más cerca.
+      } else if (cobertura.motivo === 'no_geocodificada' || cobertura.motivo === 'servicio_no_disponible') {
+        // Dos casos que se resuelven igual, pero por razones distintas:
+        //   • 'no_geocodificada'       → la dirección no está indexada en el
+        //     mapa (barrio/numeración informal, muy común en Comuna 8/9).
+        //   • 'servicio_no_disponible' → Geoapify/GeoMedellín no contestaron.
+        //     ANTES esto era un 502 que dejaba al cliente sin poder pedir
+        //     por una caída ajena; ahora se le permite confirmar el local a
+        //     mano, igual que en el otro caso.
+        // Ninguno de los dos es un rechazo: rechazar de plano sería un
+        // falso negativo sobre una dirección real y cubierta.
         if (zonaManualFinal !== 'Local Villa Liliam' && zonaManualFinal !== 'Local 3 Esquinas') {
           return res.status(409).json({
-            error: 'No pudimos ubicar automáticamente esa dirección en el mapa. Confirma cuál local te queda más cerca para continuar.',
-            motivo: 'no_geocodificada',
+            error: cobertura.motivo === 'servicio_no_disponible'
+              ? 'El servicio de mapas no está disponible en este momento. Confirma cuál local te queda más cerca para continuar.'
+              : 'No pudimos ubicar automáticamente esa dirección en el mapa. Confirma cuál local te queda más cerca para continuar.',
+            motivo: cobertura.motivo,
             requiereSeleccionManual: true,
           });
         }
@@ -4898,9 +5186,11 @@ pedRouter.post('/', authOpcional, async (req, res) => {
       }
     }
 
+    const comprobanteCols = columnasComprobante(validacionComprobante);
     const { rows } = await pool.query(
-      `INSERT INTO pedidos(cliente_id,numero,cliente,alias,tipo,pago,metodo_pago_local,mesa,total,items,comprobante,comprobante_img,comprobante_hash,comprobante_ocr,origen,direccion_alternativa,hora,estado,atendido_por,sede,local_id)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
+      `INSERT INTO pedidos(cliente_id,numero,cliente,alias,tipo,pago,metodo_pago_local,mesa,total,items,comprobante,comprobante_img,comprobante_hash,comprobante_ocr,origen,direccion_alternativa,hora,estado,atendido_por,sede,local_id,
+                           total_calculado,comprobante_validacion,comprobante_valor,comprobante_entidad,comprobante_referencia,comprobante_fecha)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27) RETURNING *`,
       [
         clienteIdFinal,
         numero || meta.numero || null,
@@ -4913,7 +5203,9 @@ pedRouter.post('/', authOpcional, async (req, res) => {
         // Ya validado arriba: solo llega con valor cuando tipoFinal==='local'.
         metodoPagoLocalTexto,
         mesa || null,
-        total || 0,
+        // Total del SERVIDOR cuando se pudo calcular; el recibido solo
+        // cuando el carrito no era reconstruible (ver calcularTotalPedido).
+        totalFinal,
         JSON.stringify(items || []),
         comprobante || meta.comprobante || null,
         comprobanteImgFinal,
@@ -4932,9 +5224,25 @@ pedRouter.post('/', authOpcional, async (req, res) => {
         // Local operativo, ya asignado desde la creación. NULL = pedido sin
         // asignar, reclamable por cualquier local (ver PATCH /:id/tomar).
         localIdFinal,
+        // Total reconstruido desde el catálogo (NULL si el carrito no era
+        // reconstruible) — es contra ESTE número que se valida el pago.
+        resumenTotal.calculable ? resumenTotal.total : null,
+        // Veredicto completo del backend sobre el comprobante + los datos
+        // que extrajo de él.
+        comprobanteCols.validacion,
+        comprobanteCols.valor,
+        comprobanteCols.entidad,
+        comprobanteCols.referencia,
+        comprobanteCols.fecha,
       ]
     );
-    res.status(201).json(conEstadoPago(rows[0]));
+    res.status(201).json(conEstadoPago({
+      ...rows[0],
+      // El frontend necesita saber, al crear, si el comprobante quedó
+      // verificado solo o si un cajero lo tiene que mirar — antes no había
+      // ninguna señal y todo pedido se veía igual.
+      comprobanteValidacion: validacionComprobante,
+    }));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Edición de un pedido existente (cliente, tipo de entrega, método de pago,
@@ -4957,7 +5265,7 @@ pedRouter.put('/:id', auth, async (req, res) => {
   }
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
-  const { cliente, alias, tipo, pago, metodo_pago_local, total, items, atendido_por, direccion_alternativa, sede, local_id, comprobante_img } = req.body;
+  const { cliente, alias, tipo, pago, metodo_pago_local, total, items, atendido_por, direccion_alternativa, sede, local_id, comprobante_img, comprobante_texto } = req.body;
   const pagoFinal = normalizarPago(pago);
   if (metodoPagoInvalido(pagoFinal)) {
     return res.status(400).json({ error: `Método de pago inválido. Debe ser uno de: ${METODOS_PAGO_VALIDOS.join(', ')}.` });
@@ -5012,15 +5320,75 @@ pedRouter.put('/:id', auth, async (req, res) => {
     // lo contacta, el cliente lo manda, y acá se adjunta (con su hash, para
     // que siga aplicando el anti-reutilización). No se toca 'estado' ni
     // 'pago_confirmado' — eso lo decide /comprobante/aprobar.
+    //
+    // Pasa por EXACTAMENTE la misma validación que POST /pedidos (valor
+    // contra el total real, entidad, referencia y anti-reutilización por
+    // hash y por número de aprobación). Antes acá solo se calculaba el
+    // hash: un comprobante adjuntado por esta vía se saltaba por completo
+    // cualquier revisión de monto, así que era el camino fácil para meter
+    // un comprobante que no correspondía al pedido.
+    // Total de referencia del pedido, resuelto SIEMPRE en el servidor:
+    //   • si este PUT cambia los items, se recalcula contra el catálogo;
+    //   • si no, se usa el total ya calculado que tiene guardado el pedido.
+    // Vale tanto para lo que se va a guardar como para validar el
+    // comprobante: los dos tienen que mirar el mismo número.
+    const { rows: filaActual } = await pool.query(
+      'SELECT total, total_calculado, items FROM pedidos WHERE id=$1', [id]
+    );
+    if (!filaActual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+
+    let totalCalculadoNuevo = null;
+    let totalReferencia = Math.round(Number(filaActual[0].total_calculado ?? filaActual[0].total) || 0);
+    if (items !== undefined || total !== undefined) {
+      const resumen = await calcularTotalPedido(items ?? filaActual[0].items);
+      if (resumen.calculable) {
+        const margen = toleranciaTotal(resumen.lineas.length);
+        const recibido = total !== undefined ? Math.round(Number(total) || 0) : resumen.total;
+        // Mismo control que en POST: si mandan un total que no cuadra con
+        // los precios del catálogo, no se guarda. Un pedido editado no
+        // puede convertirse en la vía para bajarle el precio a mano.
+        if (Math.abs(resumen.total - recibido) > margen) {
+          return res.status(400).json({
+            error: `El total del pedido no corresponde a los precios vigentes. Según el catálogo son $${resumen.total.toLocaleString('es-CO')} y se recibió $${recibido.toLocaleString('es-CO')}.`,
+            totalCalculado: resumen.total,
+            totalRecibido: recibido,
+          });
+        }
+        totalCalculadoNuevo = resumen.total;
+        totalReferencia = resumen.total;
+      } else if (total !== undefined) {
+        totalReferencia = Math.round(Number(total) || 0);
+      }
+    }
+
     let comprobanteHash = null;
-    if (comprobante_img) {
-      comprobanteHash = crypto.createHash('sha256').update(comprobante_img).digest('hex');
-      const { rows: dup } = await pool.query(
-        `SELECT id FROM pedidos WHERE comprobante_hash = $1 AND estado <> 'cancelado' AND id <> $2 LIMIT 1`,
-        [comprobanteHash, id]
-      );
-      if (dup[0]) {
-        return res.status(409).json({ error: 'Este comprobante ya fue usado en otro pedido.', pedidoExistente: dup[0].id });
+    let validacionComprobante = null;
+    if (comprobante_img || comprobante_texto) {
+      const revision = await revisarComprobante({
+        imagen: comprobante_img,
+        textoPlano: comprobante_texto,
+        ocrCliente: req.body?.comprobante_ocr,
+        total: totalReferencia,
+        excluirPedidoId: id,
+      });
+      comprobanteHash = revision.hash;
+      validacionComprobante = revision.validacion;
+
+      if (revision.duplicado) {
+        return res.status(409).json({
+          error: revision.duplicado.porHash
+            ? 'Este comprobante ya fue usado en otro pedido.'
+            : 'Ese número de comprobante ya fue usado en otro pedido.',
+          pedidoExistente: revision.duplicado.pedidoId,
+        });
+      }
+      if (validacionComprobante?.estado === 'valor_no_coincide') {
+        return res.status(400).json({
+          error: validacionComprobante.mensaje,
+          motivo: 'valor_no_coincide',
+          valorComprobante: validacionComprobante.valor,
+          totalPedido: totalReferencia,
+        });
       }
     }
     const { rows } = await pool.query(
@@ -5037,6 +5405,16 @@ pedRouter.put('/:id', auth, async (req, res) => {
          comprobante_img  = COALESCE($11, comprobante_img),
          comprobante_hash = COALESCE($12, comprobante_hash),
          alias = COALESCE($13, alias),
+         -- Resultado de la revisión del comprobante hecha por el backend.
+         -- Se guarda junto con la imagen para que el cajero vea, al lado
+         -- del pantallazo, qué leyó el servidor y por qué concluyó lo que
+         -- concluyó.
+         total_calculado        = COALESCE($15, total_calculado),
+         comprobante_validacion = COALESCE($16, comprobante_validacion),
+         comprobante_valor      = COALESCE($17, comprobante_valor),
+         comprobante_entidad    = COALESCE($18, comprobante_entidad),
+         comprobante_referencia = COALESCE($19, comprobante_referencia),
+         comprobante_fecha      = COALESCE($20, comprobante_fecha),
          -- Si el tipo RESULTANTE (el que manda este PUT, o si no vino, el
          -- que ya tenía el pedido) queda en 'domicilio', el método de pago
          -- para "recoger en el local" se limpia solo — no tiene sentido
@@ -5050,7 +5428,9 @@ pedRouter.put('/:id', auth, async (req, res) => {
         cliente ?? null,
         tipo ?? null,
         pagoFinal,
-        total ?? null,
+        // Si el carrito se pudo reconstruir, manda el total del SERVIDOR;
+        // el del body solo cuando no hay contra qué compararlo.
+        totalCalculadoNuevo ?? (total ?? null),
         items ? JSON.stringify(items) : null,
         Number.isInteger(Number(atendido_por)) && Number(atendido_por) > 0 ? Number(atendido_por) : null,
         direccion_alternativa ?? null,
@@ -5061,10 +5441,15 @@ pedRouter.put('/:id', auth, async (req, res) => {
         comprobanteHash,
         aliasTexto || null,
         metodoPagoLocalTexto ?? null,
+        totalCalculadoNuevo,
+        ...(() => {
+          const c = columnasComprobante(validacionComprobante);
+          return [c.validacion, c.valor, c.entidad, c.referencia, c.fecha];
+        })(),
       ]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-    res.json(conEstadoPago(rows[0]));
+    res.json(conEstadoPago(validacionComprobante ? { ...rows[0], comprobanteValidacion: validacionComprobante } : rows[0]));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Cambia el estado de un pedido respetando el flujo real: no se puede
@@ -5264,11 +5649,27 @@ pedRouter.patch('/:id/confirmar-pago', auth, permitirRoles('Cajero', 'Administra
 // pendiente"— para que quede a prueba de futuros cambios de flujo y para
 // que el frontend tenga una señal clara de cuándo estos botones no
 // aplican (pago efectivo usa /confirmar-pago en su lugar).
+//
+// AUTORIDAD FINAL DEL BACKEND (requisito 3): aprobar ya no es un simple
+// "poner el booleano en true porque el cajero hizo clic". Antes de
+// aceptar, el servidor vuelve a mirar SU PROPIO análisis del comprobante
+// (services/comprobante.js) y:
+//   • si él mismo determinó que el valor NO corresponde al total del
+//     pedido, la aprobación se RECHAZA — ni el cajero ni el frontend
+//     pueden pasar por encima de eso;
+//   • si no pudo leerlo (foto borrosa, recortada, formato desconocido),
+//     deja aprobar pero lo marca como revisión humana y registra quién fue;
+//   • si no hay ningún análisis guardado (pedidos anteriores a este
+//     cambio), se comporta como siempre.
 pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Administrador'), async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   try {
-    const { rows: actual } = await pool.query('SELECT estado, pago, comprobante_img FROM pedidos WHERE id=$1', [id]);
+    const { rows: actual } = await pool.query(
+      `SELECT estado, pago, comprobante_img, comprobante_validacion, comprobante_valor,
+              total, total_calculado
+         FROM pedidos WHERE id=$1`, [id]
+    );
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (esEfectivo(actual[0].pago)) {
       return res.status(400).json({ error: 'Este pedido se paga en efectivo/contraentrega — no tiene comprobante que aprobar. Confirma el cobro desde la opción de "confirmar pago".' });
@@ -5286,14 +5687,55 @@ pedRouter.patch('/:id/comprobante/aprobar', auth, permitirRoles('Cajero', 'Admin
     if (!actual[0].comprobante_img) {
       return res.status(400).json({ error: `El pedido #${id} todavía no tiene el comprobante de pago. Contacta al cliente para que lo envíe y quede adjunto antes de aprobarlo.` });
     }
+
+    // ── El veredicto del servidor manda ─────────────────────────────────
+    const validacion = actual[0].comprobante_validacion || null;
+    const totalPedido = Math.round(Number(actual[0].total_calculado ?? actual[0].total) || 0);
+
+    if (validacion?.estado === 'valor_no_coincide') {
+      return res.status(409).json({
+        error: `No se puede aprobar: el comprobante es por $${Number(validacion.valor || 0).toLocaleString('es-CO')} y el total del pedido es $${totalPedido.toLocaleString('es-CO')}. Rechaza el comprobante y pide al cliente el del pago correcto.`,
+        motivo: 'valor_no_coincide',
+        valorComprobante: validacion.valor,
+        totalPedido,
+      });
+    }
+
+    // Comprobante que el servidor no logró leer: se permite la aprobación
+    // humana (el cajero está mirando la imagen), pero queda registrada
+    // como tal. Poniendo COMPROBANTE_EXIGIR_CONFIRMACION_MANUAL=true, el
+    // despliegue puede exigir además que el cajero lo confirme
+    // explícitamente ({ confirmacionManual: true } en el body) — apagado
+    // por defecto para no cambiar el flujo que ya usan los cajeros.
+    const revisadoManualmente = !validacion || validacion.estado !== 'valido';
+    const exigirConfirmacion = String(process.env.COMPROBANTE_EXIGIR_CONFIRMACION_MANUAL || '').toLowerCase() === 'true';
+    if (revisadoManualmente && exigirConfirmacion && req.body?.confirmacionManual !== true) {
+      return res.status(409).json({
+        error: 'El sistema no pudo verificar automáticamente este comprobante. Revisa la imagen y confirma manualmente que el pago corresponde al pedido.',
+        motivo: 'requiere_confirmacion_manual',
+        validacion,
+      });
+    }
+
     // Aprobar = confirmar el pago y pasar a 'pendiente' (listo para que el
     // cajero dé "empezar preparación" → en_proceso, como paso aparte).
+    // Queda registrado QUIÉN aprobó y cuándo — antes no quedaba ningún
+    // rastro de quién había dado por bueno un pago.
     const { rows } = await pool.query(
-      `UPDATE pedidos SET estado = 'pendiente', pago_confirmado = TRUE WHERE id=$1 RETURNING *`,
-      [id]
+      `UPDATE pedidos
+          SET estado = 'pendiente',
+              pago_confirmado = TRUE,
+              comprobante_motivo_rechazo = NULL,
+              comprobante_verificado_por = $2,
+              comprobante_verificado_en  = NOW()
+        WHERE id=$1 RETURNING *`,
+      [id, req.user?.id ?? null]
     );
-    res.json(conEstadoPago(rows[0]));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json(conEstadoPago({ ...rows[0], revisadoManualmente }));
+  } catch (e) {
+    console.error('💥 PATCH /pedidos/:id/comprobante/aprobar:', e);
+    res.status(500).json({ error: 'No se pudo aprobar el comprobante. Intenta de nuevo.' });
+  }
 });
 pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Administrador'), async (req, res) => {
   const id = parseInt(req.params.id);
@@ -5308,20 +5750,47 @@ pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Admi
   const errorMotivo = errorLongitud(motivo, 'El motivo de rechazo', LIMITES.MOTIVO, 5);
   if (errorMotivo) return res.status(400).json({ error: errorMotivo });
   try {
-    const { rows: actual } = await pool.query('SELECT estado, pago FROM pedidos WHERE id=$1', [id]);
+    const { rows: actual } = await pool.query('SELECT estado, pago, pago_confirmado FROM pedidos WHERE id=$1', [id]);
     if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
     if (esEfectivo(actual[0].pago)) {
       return res.status(400).json({ error: 'Los pedidos en efectivo no tienen comprobante que rechazar.' });
     }
-    if (actual[0].estado !== 'pendiente_verificacion') {
+    // Se admite rechazar también un comprobante YA APROBADO, mientras el
+    // pedido no esté entregado ni cancelado: es el caso real de "el cajero
+    // aprobó por error / después se vio que el pago no entró". Antes solo
+    // se podía rechazar desde 'pendiente_verificacion', así que un pago
+    // aprobado por equivocación se quedaba aprobado para siempre y el
+    // pedido seguía avanzando como pagado — justo lo que el requisito 4
+    // pide evitar.
+    const ESTADOS_NO_RECHAZABLES = ['entregado', 'cancelado'];
+    if (ESTADOS_NO_RECHAZABLES.includes(actual[0].estado)) {
+      return res.status(400).json({
+        error: `El pedido #${id} ya está "${actual[0].estado}": su comprobante no se puede rechazar.`,
+      });
+    }
+    if (actual[0].estado !== 'pendiente_verificacion' && !actual[0].pago_confirmado) {
       return res.status(400).json({ error: 'Este pedido no tiene un comprobante pendiente de verificación.' });
     }
+    // pago_confirmado vuelve a FALSE de forma EXPLÍCITA. Sin esto, un
+    // comprobante aprobado y luego rechazado dejaba el pedido cancelado
+    // pero con el pago marcado como confirmado — y cualquier pantalla que
+    // mirara `pago_confirmado` (o estado_pago, que lo deriva) lo seguía
+    // mostrando como pagado.
     const { rows } = await pool.query(
-      `UPDATE pedidos SET estado = 'cancelado', comprobante_motivo_rechazo = $1 WHERE id=$2 RETURNING *`,
-      [motivo, id]
+      `UPDATE pedidos
+          SET estado = 'cancelado',
+              pago_confirmado = FALSE,
+              comprobante_motivo_rechazo = $1,
+              comprobante_verificado_por = $3,
+              comprobante_verificado_en  = NOW()
+        WHERE id=$2 RETURNING *`,
+      [motivo, id, req.user?.id ?? null]
     );
     res.json(conEstadoPago(rows[0]));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('💥 PATCH /pedidos/:id/comprobante/rechazar:', e);
+    res.status(500).json({ error: 'No se pudo rechazar el comprobante. Intenta de nuevo.' });
+  }
 });
 // Un cajero/bartender "toma" (reclama) un pedido que todavía NO está
 // asignado a ningún local (local_id IS NULL) — solo aplica a esos; un
@@ -6595,5 +7064,56 @@ resenasRouter.delete('/:id', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/resenas', resenasRouter);
+
+// ─────────────────────────────────────────────────────────────────────────
+//  DIAGNÓSTICO DE SERVICIOS EXTERNOS (solo Administrador)
+// ─────────────────────────────────────────────────────────────────────────
+// Los dos fallos que motivaron esta ronda —"no llega el código al correo" y
+// "la geocodificación no funciona desplegada"— tenían en común que desde
+// afuera se veían idénticos a un error cualquiera: un spinner infinito o un
+// 500 genérico. Para saber qué pasaba de verdad había que entrar a los
+// logs del hosting y leerlos a mano.
+//
+// Estas dos rutas contestan en segundos qué está roto y por qué, sin
+// exponer NUNCA credenciales: ni la contraseña del correo ni la API key
+// aparecen en la respuesta (solo si están presentes o no).
+r.get('/health/correo', auth, permitirRoles('Administrador'), async (_req, res) => {
+  const { diagnosticarCorreo, mensajeErrorCorreo } = require('../services/mailer');
+  const diagnostico = await diagnosticarCorreo();
+  res.json({
+    ok: diagnostico.ok,
+    host: diagnostico.host,
+    puertoUsado: diagnostico.puertoUsado,
+    // Presencia, nunca el valor.
+    credencialesConfiguradas: !!(process.env.MAIL_USER && process.env.MAIL_PASS),
+    mensaje: diagnostico.ok
+      ? `Conexión con el servidor de correo verificada por el puerto ${diagnostico.puertoUsado}.`
+      : mensajeErrorCorreo(diagnostico.codigo),
+    codigo: diagnostico.codigo,
+  });
+});
+
+r.get('/health/geocodificacion', auth, permitirRoles('Administrador'), async (req, res) => {
+  const direccion = textoLimpio(req.query?.direccion) || 'Carrera 10A # 52-44';
+  const inicio = Date.now();
+  try {
+    const resultado = await determinarSedePorDireccion(direccion);
+    res.json({
+      ok: resultado.motivo !== 'servicio_no_disponible',
+      apiKeyConfigurada: !!process.env.GEOAPIFY_API_KEY, // presencia, no el valor
+      direccionConsultada: direccion,
+      demoraMs: Date.now() - inicio,
+      resultado,
+    });
+  } catch (e) {
+    console.error('💥 GET /health/geocodificacion:', e);
+    res.status(500).json({
+      ok: false,
+      apiKeyConfigurada: !!process.env.GEOAPIFY_API_KEY,
+      demoraMs: Date.now() - inicio,
+      error: 'El servicio de geocodificación falló de forma inesperada.',
+    });
+  }
+});
 
 module.exports = r;

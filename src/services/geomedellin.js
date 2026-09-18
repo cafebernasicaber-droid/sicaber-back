@@ -10,7 +10,21 @@
 // reconoce nombres de lugares ni puntos de referencia (para eso sigue
 // existiendo la lista de PUNTOS_REFERENCIA_CONOCIDOS y Geoapify, en
 // geocoding.js).
+//
+// ⚠️ CORRECCIÓN DE PRODUCCIÓN: este servicio se consultaba con el `fetch`
+// global sin ningún timeout. Desde la máquina de desarrollo (conexión en
+// Colombia) responde en menos de un segundo; desde el servidor desplegado
+// responde muy lento o deja la conexión abierta sin contestar nunca — y
+// como no había timeout, la promesa quedaba viva para siempre y con ella
+// la petición HTTP del checkout. Ahora toda consulta pasa por
+// services/httpExterno.js, con techo de tiempo y un reintento.
+const { obtenerJson } = require('./httpExterno');
+
 const GEOMEDELLIN_URL = 'https://www.medellin.gov.co/servidormapas/rest/services/ServiciosCatastro/ConsultaOperadorCatastral/MapServer/1/query';
+// Más corto que el de Geoapify a propósito: este es el PRIMER intento de
+// dos, así que su demora se suma a la del respaldo. Vale más caer rápido
+// al respaldo que hacer esperar al cliente por el catastro.
+const TIMEOUT_GEOMEDELLIN_MS = Number(process.env.GEOMEDELLIN_TIMEOUT_MS || 4000);
 
 const TIPOS_VIA = {
   CALLE: 'CL', CL: 'CL',
@@ -53,16 +67,43 @@ const parsearDireccionColombiana = (direccionTexto) => {
 };
 
 const ejecutarConsulta = async (where) => {
-  const url = `${GEOMEDELLIN_URL}?where=${encodeURIComponent(where)}&outFields=cbml,latitud,longitud,direccioncodificada&f=json`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`GeoMedellín respondió ${resp.status}`);
-  const data = await resp.json();
+  const parametros = new URLSearchParams({
+    where,
+    outFields: 'cbml,latitud,longitud,direccioncodificada',
+    // Tope de filas: la consulta por vía/cruce/placa puede coincidir con
+    // decenas de lotes repartidos por toda la ciudad. Sin tope, la
+    // respuesta puede pesar megabytes que después se descartan igual.
+    resultRecordCount: '25',
+    returnGeometry: 'false',
+    f: 'json',
+  });
+  const data = await obtenerJson(`${GEOMEDELLIN_URL}?${parametros.toString()}`, {
+    timeoutMs: TIMEOUT_GEOMEDELLIN_MS,
+    reintentos: 1,
+    etiqueta: 'GeoMedellín',
+  });
+  // ArcGIS contesta HTTP 200 incluso cuando la consulta falló: el error
+  // viene DENTRO del JSON. Antes eso se leía como "0 resultados" y la
+  // dirección quedaba silenciosamente como no encontrada.
+  if (data?.error) {
+    const err = new Error(`GeoMedellín rechazó la consulta: ${data.error.message || data.error.code}`);
+    err.tipo = 'respuesta';
+    throw err;
+  }
   return data?.features || [];
 };
 
+// Los valores que entran acá salen de un regex estricto (tipo de vía de una
+// lista fija, números convertidos con Number(), apéndice de una sola letra
+// A-Z), así que no pueden traer comillas. El escape va igual: es una
+// consulta con sintaxis SQL armada por concatenación, y depender de que
+// "el regex de más arriba ya lo filtra" es exactamente la clase de
+// suposición que se rompe cuando alguien retoca ese regex.
+const escaparTextoSql = (valor) => String(valor).replace(/'/g, "''");
+
 const construirWhere = (p, incluirApendice) => {
-  let where = `tipo_via='${p.tipo_via}' AND numero_via=${p.numero_via} AND numero_cruce=${p.numero_cruce} AND numero_placa='${p.placa}'`;
-  if (incluirApendice && p.apendice_via) where += ` AND apendice_via='${p.apendice_via}'`;
+  let where = `tipo_via='${escaparTextoSql(p.tipo_via)}' AND numero_via=${Number(p.numero_via)} AND numero_cruce=${Number(p.numero_cruce)} AND numero_placa='${escaparTextoSql(p.placa)}'`;
+  if (incluirApendice && p.apendice_via) where += ` AND apendice_via='${escaparTextoSql(p.apendice_via)}'`;
   return where;
 };
 
