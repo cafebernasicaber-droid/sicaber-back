@@ -1,6 +1,7 @@
 const router  = require('express').Router();
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const pool    = require('../config/db');
 const { auth } = require('../middleware/auth');
 // Misma constante que usa GET /clientes/mi-perfil (routes/index.js) — así
@@ -24,6 +25,12 @@ const { enviarTokenRegistro, enviarTokenRecuperacion, mensajeErrorCorreo } = req
 const codigos = require('../services/codigosVerificacion');
 
 const sign = (payload) => jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+
+// Mismo Client ID configurado en Google Cloud Console (usado también por el
+// frontend en @react-oauth/google). El Client Secret NO hace falta acá: solo
+// se usa al verificar un ID token con verifyIdToken(), no un authorization
+// code, así que GOOGLE_CLIENT_ID es la única variable que este flujo lee.
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Respuesta de error interna UNIFORME. Antes cada catch hacía
 // `res.status(500).json({ error: e.message })`, lo que devolvía al
@@ -341,6 +348,79 @@ router.post('/cliente/login', async (req, res) => {
     );
     res.json({ token, cliente: perfil[0] });
   } catch (e) { return errorServidor(res, e, 'POST /auth/cliente/login'); }
+});
+
+// ── CLIENTE LOGIN/REGISTRO CON GOOGLE ──────────────────────────────────────
+// El frontend manda el "credential" (ID token JWT) que devuelve el botón de
+// @react-oauth/google. Acá se verifica CONTRA GOOGLE (nunca se confía en lo
+// que declara el propio token sin validarlo) y, según si el correo ya existe
+// en `clientes`, se hace login o se crea la cuenta en el mismo paso — el
+// usuario nunca ve una pantalla de "registro" aparte cuando entra con Google.
+router.post('/cliente/google', async (req, res) => {
+  const { token } = req.body;
+  if (!token) return res.status(400).json({ error: 'Falta el token de Google.' });
+  try {
+    // verifyIdToken revisa la firma, el emisor y que el "audience" sea
+    // nuestro Client ID. Si el token viene alterado o es de otra app, esto
+    // lanza y cae al catch — nunca se llega a leer el payload sin validar.
+    const ticket = await googleClient.verifyIdToken({
+      idToken: token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+
+    // email_verified=false pasa con cuentas de Google Workspace mal
+    // configuradas o correos no confirmados dentro de Google mismo. No
+    // podemos confiar en el correo como identidad si Google tampoco confía.
+    if (!payload.email_verified) {
+      return res.status(400).json({ error: 'Tu cuenta de Google no tiene el correo verificado.' });
+    }
+    const correo = payload.email.toLowerCase();
+    const nombre = payload.name || correo.split('@')[0];
+
+    let { rows } = await pool.query('SELECT * FROM clientes WHERE lower(correo)=lower($1)', [correo]);
+    let c = rows[0];
+
+    if (!c) {
+      // Cuenta nueva: password aleatoria (nadie la va a usar — este cliente
+      // siempre entra por Google) para no violar la columna NOT NULL que
+      // usa el registro normal. verificado=true de una: Google ya confirmó
+      // ese correo, así que no tiene sentido mandarle un código de 6 dígitos.
+      const passwordAleatoria = await bcrypt.hash(require('crypto').randomBytes(32).toString('hex'), 10);
+      const insert = await pool.query(
+        `INSERT INTO clientes(nombre,correo,password,verificado)
+         VALUES($1,$2,$3,true) RETURNING id`,
+        [nombre, correo, passwordAleatoria]
+      );
+      c = insert.rows[0];
+    } else if (c.estado !== 'Activo') {
+      // Misma regla que el login normal: una cuenta desactivada no debe
+      // poder volver a entrar solo porque usó Google en vez de contraseña.
+      return res.status(403).json({ error: 'Tu cuenta está desactivada. Contacta a un administrador.' });
+    } else if (!c.verificado) {
+      // Cuenta creada antes por registro normal pero nunca confirmó el
+      // código por correo: si ahora entra con Google a esa misma dirección,
+      // Google ya está confirmando que el correo es suyo, así que la
+      // verificamos acá y le ahorramos el paso del código de 6 dígitos.
+      await pool.query('UPDATE clientes SET verificado=true WHERE id=$1', [c.id]);
+    }
+
+    const jwtToken = sign({ id: c.id, correo, rol: 'Cliente' });
+    // Mismo perfil completo que devuelve /cliente/login, para que el
+    // frontend reuse tal cual el mismo manejo de sesión.
+    const { rows: perfil } = await pool.query(
+      `SELECT ${CLIENTE_COLS}, username FROM clientes WHERE id=$1`, [c.id]
+    );
+    res.json({ token: jwtToken, cliente: perfil[0] });
+  } catch (e) {
+    // verifyIdToken lanza si el token es inválido, expiró, o no es de
+    // nuestro Client ID — todos esos casos son "credencial mala", no un
+    // error 500 del servidor.
+    if (e.message?.includes('Token used too late') || e.message?.includes('Wrong recipient') || e.message?.includes('Invalid token signature')) {
+      return res.status(401).json({ error: 'No se pudo verificar tu cuenta de Google. Intenta de nuevo.' });
+    }
+    return errorServidor(res, e, 'POST /auth/cliente/google');
+  }
 });
 
 // ── SOLICITAR RECUPERACIÓN ─────────────────────────────────────────────────
