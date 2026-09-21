@@ -9,3 +9,5 @@ node_modules/
 # config/db.js) — contienen PII de clientes, nunca deben versionarse.
 /respaldo-migraciones/
 toques *
+
+toques *
