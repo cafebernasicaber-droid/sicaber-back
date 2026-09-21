@@ -17,8 +17,19 @@ const { permisosDeRol } = require('../middleware/permisos');
 const { passwordValida, PASSWORD_ERROR, errorPassword } = require('../config/passwordPolicy');
 // Validaciones compartidas de texto (ver config/validaciones.js): nombre no
 // vacío / no solo espacios y tope de longitud en el registro de clientes.
-const { textoLimpio, nombreNormalizado, errorNombre, errorDocumento, LIMITES } = require('../config/validaciones');
+// errorTelefono se suma acá para POST /cliente/google/completar (el
+// teléfono es obligatorio en ese formulario y hay que validar su formato
+// con la MISMA regla que ya usa el resto de la API, no con una nueva).
+const { textoLimpio, nombreNormalizado, errorNombre, errorDocumento, errorTelefono, LIMITES } = require('../config/validaciones');
 const { enviarTokenRegistro, enviarTokenRecuperacion, mensajeErrorCorreo } = require('../services/mailer');
+// Token TEMPORAL (firmado, con propósito propio y vencimiento) para
+// completar un registro iniciado con Google — ver services/tokenRegistro.js
+// y POST /cliente/google + /cliente/google/completar más abajo.
+const {
+  emitirTokenRegistroGoogle,
+  validarTokenRegistroGoogle,
+  mensajeMotivoTokenRegistro,
+} = require('../services/tokenRegistro');
 // Ciclo de vida completo del código de 6 dígitos (generar con crypto,
 // invalidar los anteriores, vencimiento explícito, límite de intentos y
 // de reenvíos). Ver services/codigosVerificacion.js.
@@ -353,9 +364,24 @@ router.post('/cliente/login', async (req, res) => {
 // ── CLIENTE LOGIN/REGISTRO CON GOOGLE ──────────────────────────────────────
 // El frontend manda el "credential" (ID token JWT) que devuelve el botón de
 // @react-oauth/google. Acá se verifica CONTRA GOOGLE (nunca se confía en lo
-// que declara el propio token sin validarlo) y, según si el correo ya existe
-// en `clientes`, se hace login o se crea la cuenta en el mismo paso — el
-// usuario nunca ve una pantalla de "registro" aparte cuando entra con Google.
+// que declara el propio token sin validarlo) y se bifurca según si el correo
+// ya existe en `clientes`:
+//
+//   • Correo YA REGISTRADO → login normal, sin cambios (misma respuesta
+//     { token, cliente } de /cliente/login).
+//
+//   • Correo NUEVO → NO se crea nada en la base. Se responde
+//     `registroPendiente: true` + un token TEMPORAL de registro (ver
+//     services/tokenRegistro.js) para que el frontend muestre el formulario
+//     de "completar registro" y lo mande a /cliente/google/completar.
+//
+// QUÉ ESTABA MAL ANTES: acá mismo se hacía INSERT del cliente con una
+// contraseña aleatoria que nadie conoce y sin teléfono ni documento. Si el
+// usuario cerraba la pestaña, quedaba una cuenta incompleta e inutilizable
+// (no puede iniciar sesión con contraseña porque no la tiene) que además
+// bloqueaba el registro normal por "correo ya registrado". Ahora la base no
+// se toca hasta que el registro está completo — abandonar el formulario no
+// deja ningún rastro.
 router.post('/cliente/google', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Falta el token de Google.' });
@@ -382,17 +408,28 @@ router.post('/cliente/google', async (req, res) => {
     let c = rows[0];
 
     if (!c) {
-      // Cuenta nueva: password aleatoria (nadie la va a usar — este cliente
-      // siempre entra por Google) para no violar la columna NOT NULL que
-      // usa el registro normal. verificado=true de una: Google ya confirmó
-      // ese correo, así que no tiene sentido mandarle un código de 6 dígitos.
-      const passwordAleatoria = await bcrypt.hash(require('crypto').randomBytes(32).toString('hex'), 10);
-      const insert = await pool.query(
-        `INSERT INTO clientes(nombre,correo,password,verificado)
-         VALUES($1,$2,$3,true) RETURNING id`,
-        [nombre, correo, passwordAleatoria]
-      );
-      c = insert.rows[0];
+      // Correo nuevo: NO se crea el cliente todavía (ver comentario de la
+      // ruta). Solo se emite el token temporal con la identidad que Google
+      // acaba de verificar, y el frontend pide los datos que faltan.
+      const registro = emitirTokenRegistroGoogle({ correo, nombre });
+      return res.status(200).json({
+        // Contrato explícito para el frontend: con esto sabe que NO hay
+        // sesión todavía y que debe abrir el formulario de completar
+        // registro en vez de guardar un token de sesión inexistente.
+        registroPendiente: true,
+        requiereCompletarRegistro: true, // alias, por si la pantalla ya usa este nombre
+        tokenRegistro: registro.token,
+        expiraEnMinutos: registro.expiraEnMinutos,
+        expiraEn: registro.expiraEn,
+        // Datos ya confirmados por Google que el formulario debe mostrar
+        // (y que NO se le piden otra vez al usuario).
+        correo,
+        nombre,
+        // Lo que falta por llenar, para que el formulario no tenga que
+        // tener la lista escrita a mano.
+        camposRequeridos: ['password', 'tipoDoc', 'numeroDoc', 'telefono'],
+        mensaje: 'Completa tu registro para terminar de crear tu cuenta.',
+      });
     } else if (c.estado !== 'Activo') {
       // Misma regla que el login normal: una cuenta desactivada no debe
       // poder volver a entrar solo porque usó Google en vez de contraseña.
@@ -420,6 +457,117 @@ router.post('/cliente/google', async (req, res) => {
       return res.status(401).json({ error: 'No se pudo verificar tu cuenta de Google. Intenta de nuevo.' });
     }
     return errorServidor(res, e, 'POST /auth/cliente/google');
+  }
+});
+
+// ── COMPLETAR REGISTRO INICIADO CON GOOGLE ─────────────────────────────────
+// Segundo (y último) paso del flujo de arriba. Recibe el token temporal que
+// emitió /cliente/google junto con los datos que Google no da (contraseña,
+// tipo y número de documento, teléfono) y RECIÉN ACÁ crea el cliente.
+//
+// El correo y el nombre NO se leen del body: salen del token firmado. Si
+// vinieran del body, cualquiera podría pedir un token para su propio correo
+// y usarlo para crear una cuenta a nombre de otra persona — el token sería
+// decorativo. Del body solo se acepta lo que el token no puede saber.
+//
+// Reglas aplicadas (las MISMAS que ya usa el registro normal, sin duplicar
+// lógica): política de contraseña (config/passwordPolicy.js), documento y
+// teléfono (config/validaciones.js), y el mismo bcrypt(10) de /cliente/registro.
+router.post('/cliente/google/completar', async (req, res) => {
+  // Se acepta el nombre del campo en varias formas porque el frontend ya
+  // existía antes que esta ruta y puede estar mandando cualquiera de ellas.
+  const tokenRegistro = req.body?.tokenRegistro ?? req.body?.token_registro ?? req.body?.token;
+  const { password, tipoDoc: tipoDoc_, numeroDoc: numeroDoc_, telefono: telefono_ } = req.body || {};
+  try {
+    // 1. Token: válido, no vencido y con el propósito correcto.
+    const resultado = validarTokenRegistroGoogle(tokenRegistro);
+    if (!resultado.ok) {
+      return res.status(400).json({
+        error: mensajeMotivoTokenRegistro(resultado.motivo),
+        motivo: resultado.motivo,
+        // Le dice al frontend, sin ambigüedad, cuándo mandar al usuario de
+        // vuelta al botón de Google en vez de dejarlo corrigiendo el
+        // formulario a ciegas.
+        requiereReiniciarGoogle: true,
+      });
+    }
+    const correo = resultado.correo;
+    const nombre = nombreNormalizado(resultado.nombre) || correo.split('@')[0];
+
+    // 2. Contraseña: misma política que el registro normal y el reset.
+    if (!passwordValida(password)) return res.status(400).json({ error: errorPassword(password) });
+
+    // 3. Datos del formulario. Son OBLIGATORIOS acá (es justamente lo que
+    //    el formulario de completar registro vino a pedir), y se validan
+    //    con los MISMOS validadores que el resto de la API.
+    const tipoDoc = textoLimpio(tipoDoc_);
+    if (!tipoDoc) return res.status(400).json({ error: 'El tipo de documento es obligatorio.' });
+    // Igual que en /cliente/registro: "Otros" siempre debe llegar ya
+    // resuelto al nombre real que escribió el usuario (ej. "Pasaporte").
+    if (tipoDoc === 'Otros') return res.status(400).json({ error: 'Debes especificar el tipo de documento.' });
+
+    const numeroDoc = textoLimpio(numeroDoc_);
+    if (!numeroDoc) return res.status(400).json({ error: 'El número de documento es obligatorio.' });
+    const errorDoc = errorDocumento(numeroDoc);
+    if (errorDoc) return res.status(400).json({ error: errorDoc });
+
+    const telefono = textoLimpio(telefono_);
+    if (!telefono) return res.status(400).json({ error: 'El teléfono es obligatorio.' });
+    const errorTel = errorTelefono(telefono);
+    if (errorTel) return res.status(400).json({ error: errorTel });
+
+    // 4. El correo pudo registrarse por otra vía MIENTRAS el usuario llenaba
+    //    el formulario (registro normal en otra pestaña, por ejemplo). Se
+    //    revisa antes de insertar para dar un mensaje claro en vez del error
+    //    crudo de llave única.
+    const { rows: yaExiste } = await pool.query(
+      'SELECT id FROM clientes WHERE lower(correo)=lower($1)', [correo]
+    );
+    if (yaExiste[0]) {
+      return res.status(409).json({
+        error: 'Ese correo ya tiene una cuenta. Inicia sesión con Google o con tu contraseña.',
+        motivo: 'correo_ya_registrado',
+        correo,
+      });
+    }
+
+    // 5. Crear el cliente COMPLETO, de una sola vez.
+    //    verificado = true  → Google ya confirmó que el correo es suyo, no
+    //                         hace falta el código de 6 dígitos.
+    //    estado = 'Activo'  → explícito, aunque la columna ya tenga ese
+    //                         default: es un requisito del flujo, no un
+    //                         detalle de la tabla que alguien pueda cambiar.
+    //    NO se guarda dirección/departamento/municipio/comuna: esas columnas
+    //    se dieron de baja y la dirección de entrega pertenece al PEDIDO
+    //    (pedidos.direccion_alternativa), no al cliente.
+    const hash = await bcrypt.hash(password, 10);
+    const { rows } = await pool.query(
+      `INSERT INTO clientes(nombre,correo,password,telefono,tipo_doc,numero_doc,verificado,estado)
+       VALUES($1,$2,$3,$4,$5,$6,true,'Activo') RETURNING id`,
+      [nombre, correo, hash, telefono, tipoDoc, numeroDoc]
+    );
+    const clienteId = rows[0].id;
+
+    // 6. Sesión normal, con EXACTAMENTE el mismo formato que /cliente/login
+    //    y /cliente/google, para que el frontend reuse su manejo de sesión
+    //    sin un camino especial para este caso.
+    const token = sign({ id: clienteId, correo, rol: 'Cliente' });
+    const { rows: perfil } = await pool.query(
+      `SELECT ${CLIENTE_COLS}, username FROM clientes WHERE id=$1`, [clienteId]
+    );
+    res.status(201).json({ token, cliente: perfil[0] });
+  } catch (e) {
+    // Carrera real: dos peticiones simultáneas con el mismo token pasan el
+    // chequeo del paso 4 a la vez y una de las dos choca con el UNIQUE de
+    // clientes.correo. Se traduce al mismo mensaje del paso 4 en vez de un
+    // 500 crudo.
+    if (e.code === '23505') {
+      return res.status(409).json({
+        error: 'Ese correo ya tiene una cuenta. Inicia sesión con Google o con tu contraseña.',
+        motivo: 'correo_ya_registrado',
+      });
+    }
+    return errorServidor(res, e, 'POST /auth/cliente/google/completar');
   }
 });
 

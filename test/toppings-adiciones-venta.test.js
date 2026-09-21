@@ -18,6 +18,23 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:4000/api';
+
+// ── Comprobante de prueba ────────────────────────────────────────────────
+// El backend ahora VALIDA que el comprobante sea de verdad un archivo de
+// imagen (o PDF), mirando sus bytes — ver normalizarArchivoComprobante en
+// src/services/comprobante.js. Antes no se validaba nada y estos tests
+// mandaban "data:text/plain;base64,..." (un texto cualquiera), que hoy se
+// rechaza con 400. Se usa un PNG 1×1 REAL, con bytes finales únicos por
+// llamada para que cada pedido tenga un comprobante distinto y no choque
+// con el control de "este comprobante ya se usó en otro pedido".
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+const comprobantePrueba = (marca) =>
+  'data:image/png;base64,' +
+  Buffer.concat([PNG_1X1, Buffer.from(String(marca))]).toString('base64');
+
 const ADMIN_USER = process.env.TEST_ADMIN_USER || 'Admin_Sicaber';
 const ADMIN_PASS = process.env.TEST_ADMIN_PASS || 'admin2024#';
 
@@ -239,7 +256,15 @@ test('venta: descuenta el topping y la adición (con y sin insumo) del LOCAL cor
     method: 'POST',
     body: {
       cliente: 'Cliente test topping-adicion', alias: `alias-topping-adicion-${Date.now()}`, tipo: 'local', pago: 'nequi',
-      comprobante_img: `data:text/plain;base64,topping-adicion-${Date.now()}`, total: 15500,
+      // 13.500 = producto 10.000 + adición con insumo 2.000 + adición sin
+      // insumo 1.500. El test decía 15.500 (2.000 de más) desde antes de
+      // esta ronda y fallaba con "el total no corresponde a los precios
+      // vigentes": venía de cuando los TOPPINGS tenían precio propio, una
+      // columna que ya se eliminó (`ALTER TABLE toppings DROP COLUMN IF
+      // EXISTS precio` en config/db.js — la regla vigente es que un topping
+      // nunca cuesta). El backend calculaba bien; la expectativa del test
+      // era la que había quedado vieja.
+      comprobante_img: comprobantePrueba(`topping-adicion-${Date.now()}`), total: 13500,
       items: [{
         id: productoId, nombre: productoNombre, cantidad: 1, precio: 10000,
         toppings: [toppingId],

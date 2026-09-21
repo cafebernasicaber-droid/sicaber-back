@@ -16,6 +16,24 @@ const path = require('path');
 // (productos.precio, adiciones.precio, toppings.cantidad, compras.total,
 // insumos.stock, fichas_tecnicas.costo_estimado, etc.), en vez de andar
 // convirtiéndolo a mano ruta por ruta.
+//
+// ⚠️ BUG REAL ENCONTRADO EN ESTA RONDA: este comentario describía la
+// conversión con todo detalle… pero la conversión NUNCA se registró. `types`
+// se importaba de 'pg' en la línea de arriba y no se usaba en ningún lado
+// del archivo. Es decir: toda columna NUMERIC seguía viajando como string
+// ("13000.00", "3.50", "0.00") pese a que el propio archivo afirmaba lo
+// contrario. Se detectó porque 4 tests de la suite (los que comparan
+// `pedido.total === 13000`, `insumo.stock === 3.5`, etc.) fallaban desde
+// antes de esta ronda, con el mismo síntoma: '13000.00' !== 13000.
+// Afecta directo a lo que se pidió revisar en esta ronda: ventas.total,
+// devoluciones.monto y pedidos.total son todos NUMERIC, así que el
+// frontend los recibía como texto.
+//
+// Con esto, el contrato queda como el archivo siempre dijo que era.
+// Number() sobre un string numérico ya funcionaba, así que cualquier
+// consumidor que hiciera Number(x)/parseFloat(x) sigue igual de bien.
+types.setTypeParser(1700, (valor) => (valor === null ? null : Number(valor)));
+
 // ── Cómo se arma la conexión ─────────────────────────────────────────────
 // BUG REAL corregido acá: desde que el proyecto pasó a Neon, este archivo
 // leía ÚNICAMENTE `DATABASE_URL`. Pero scripts/run-tests.js arranca el
@@ -246,6 +264,75 @@ const migrar = async () => {
     `ALTER TABLE ventas ALTER COLUMN estado SET DEFAULT 'vendido'`,
     `UPDATE ventas SET estado='vendido'  WHERE estado='Activa'`,
     `UPDATE ventas SET estado='devuelto' WHERE estado IN ('Anulada','Inactiva')`,
+    // ── VENTAS: datos propios, para que una venta no dependa del pedido ──
+    // CAUSA RAÍZ del requisito 5 ("una venta procesada desaparece del flujo
+    // del cajero"): la tabla `ventas` solo guardaba pedido_id, total y
+    // estado. TODO lo demás (cliente, sede, método de pago, tipo,
+    // productos) salía del pedido por JOIN — ver VENTA_SELECT en
+    // routes/index.js. Dos consecuencias REALES, no hipotéticas:
+    //   1. El listado del cajero filtra por local con `WHERE p.sede = $1`.
+    //      Un pedido sin sede (o al que se le borró) hace que su venta no
+    //      aparezca en NINGÚN filtro por local — existe en la tabla, pero
+    //      es invisible en la pantalla donde se la busca.
+    //   2. DELETE /pedidos/:id borra el pedido y, por la FK ON DELETE SET
+    //      NULL, deja la venta con pedido_id = NULL: la fila sobrevive pero
+    //      queda sin cliente, sin productos y sin sede — una venta vacía.
+    // Se guarda una FOTO de esos datos EN la venta. El JOIN se conserva
+    // (el pedido sigue siendo el dato vivo mientras exista); esto es el
+    // respaldo que hace que la venta nunca se quede sin información.
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS cliente_id  INTEGER`,
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS cliente     VARCHAR(150)`,
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS sede        VARCHAR(20)`,
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS metodo_pago VARCHAR(30)`,
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS tipo_venta  VARCHAR(30)`,
+    `ALTER TABLE ventas ADD COLUMN IF NOT EXISTS items       JSONB DEFAULT '[]'`,
+    // Relleno de las ventas que ya existían: se copian los datos del pedido
+    // asociado, una sola vez. Solo toca las columnas que todavía están en
+    // NULL, así que repetirlo en cada arranque no pisa nada.
+    `UPDATE ventas v
+        SET cliente_id  = COALESCE(v.cliente_id,  p.cliente_id),
+            cliente     = COALESCE(v.cliente,     p.cliente),
+            sede        = COALESCE(v.sede,        p.sede),
+            metodo_pago = COALESCE(v.metodo_pago, p.pago),
+            tipo_venta  = COALESCE(v.tipo_venta,  p.tipo),
+            items       = CASE WHEN v.items IS NULL OR v.items = '[]'::jsonb
+                               THEN COALESCE(p.items, '[]'::jsonb) ELSE v.items END
+       FROM pedidos p
+      WHERE p.id = v.pedido_id
+        AND (v.cliente_id IS NULL OR v.cliente IS NULL OR v.sede IS NULL
+             OR v.metodo_pago IS NULL OR v.tipo_venta IS NULL
+             OR v.items IS NULL OR v.items = '[]'::jsonb)`,
+    // ── DEVOLUCIONES: relación DIRECTA con la venta original ─────────────
+    // Requisito 4: "Debe existir una relación clara entre venta original →
+    // devolución". Hasta ahora la única referencia era pedido_id y la venta
+    // se adivinaba con un JOIN por pedido — suficiente para mostrarla en
+    // una lista, insuficiente para EXIGIR la regla de negocio de "una sola
+    // devolución por venta" (que necesita una columna sobre la que poner
+    // un índice único).
+    `ALTER TABLE devoluciones ADD COLUMN IF NOT EXISTS venta_id INTEGER`,
+    // Relleno de las devoluciones ya existentes: cada una se enlaza con la
+    // venta de su propio pedido. Si un pedido llegara a tener más de una
+    // venta (no debería: registrarVentaDePedido es idempotente), se toma la
+    // más antigua — la venta original.
+    //
+    // El NOT EXISTS del final NO es decorativo: sin él, en un pedido que
+    // histórico tenga DOS devoluciones, este UPDATE intenta darles a las
+    // dos el mismo venta_id y choca con el índice único en CADA arranque
+    // («duplicate key value violates unique constraint»). Se detectó
+    // probando el segundo arranque seguido sobre la misma base: la
+    // migración fallaba en silencio, con una advertencia en el log, todos
+    // los días. Con esta condición, una venta que YA tiene su devolución
+    // enlazada no vuelve a intentarse, y la segunda devolución del mismo
+    // pedido se queda sin venta_id — pero conserva su fila, su motivo y su
+    // estado, visible en el historial.
+    `UPDATE devoluciones d
+        SET venta_id = (SELECT v.id FROM ventas v WHERE v.pedido_id = d.pedido_id ORDER BY v.id ASC LIMIT 1)
+      WHERE d.venta_id IS NULL AND d.pedido_id IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM devoluciones otra
+           WHERE otra.venta_id = (SELECT v.id FROM ventas v WHERE v.pedido_id = d.pedido_id ORDER BY v.id ASC LIMIT 1)
+        )
+        AND d.id = (SELECT MIN(d2.id) FROM devoluciones d2 WHERE d2.pedido_id = d.pedido_id AND d2.venta_id IS NULL)`,
     // toppings: nunca tienen costo (se quita precio) y ahora se pueden
     // asociar a productos específicos. productos_ids = [] significa
     // "aplica a todos los productos".
@@ -1063,6 +1150,66 @@ const migrar = async () => {
     console.error('⚠️  No se pudo crear la FK fichas_tecnicas_producto_id_fkey (la columna producto_id sigue utilizable sin ella):', e.message);
   }
 
+  // ── FK + índice único de la relación VENTA → DEVOLUCIÓN (requisito 4) ──
+  // Las columnas nuevas (ventas.cliente_id, devoluciones.venta_id) se
+  // agregaron arriba como INTEGER simple, igual que el resto de columnas
+  // nuevas de este archivo: sus FK se crean acá aparte, cada una con su
+  // propio try/catch, para que un dato viejo inconsistente (una venta que
+  // apunta a un cliente ya borrado, por ejemplo) no impida arrancar la API
+  // entera — la columna sigue funcionando igual sin la FK.
+  for (const [tabla, constraint, columna, referencia] of [
+    ['ventas',       'ventas_cliente_id_fkey',      'cliente_id', 'clientes(id)'],
+    ['devoluciones', 'devoluciones_venta_id_fkey',  'venta_id',   'ventas(id)'],
+  ]) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = $1`,
+        [constraint]
+      );
+      if (rows.length === 0) {
+        await pool.query(
+          `ALTER TABLE ${tabla} ADD CONSTRAINT ${constraint}
+             FOREIGN KEY (${columna}) REFERENCES ${referencia} ON DELETE SET NULL`
+        );
+      }
+    } catch (e) {
+      console.error(`⚠️  No se pudo crear la FK ${constraint} (la columna ${columna} sigue utilizable sin ella):`, e.message);
+    }
+  }
+
+  // "UNA venta, UNA devolución" garantizado por la base de datos, no solo
+  // por el if del controlador: dos peticiones simultáneas pasarían las dos
+  // el chequeo "¿ya existe una?" y crearían dos filas. El índice es PARCIAL
+  // (WHERE venta_id IS NOT NULL) porque las devoluciones históricas que
+  // quedaron sin venta asociada no deben chocar entre sí.
+  //
+  // Antes de crearlo hay que resolver los duplicados que ya existan: si una
+  // misma venta tiene varias devoluciones (posible, porque hasta ahora nada
+  // lo impedía), se CONSERVA la primera con su venta_id y a las demás se
+  // les deja venta_id en NULL — NINGUNA se borra: siguen ahí con su
+  // pedido_id, su motivo y su estado, visibles en el historial.
+  try {
+    const { rows: sobrantes } = await pool.query(
+      `UPDATE devoluciones d
+          SET venta_id = NULL
+        WHERE d.venta_id IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM devoluciones otra
+             WHERE otra.venta_id = d.venta_id AND otra.id < d.id
+          )
+        RETURNING d.id`
+    );
+    if (sobrantes.length) {
+      console.log(`🔧 Devoluciones: ${sobrantes.length} devolución(es) repetida(s) sobre una misma venta quedaron sin venta_id (ids: ${sobrantes.map(r => r.id).join(', ')}) — no se borró ninguna, solo se conservó el vínculo de la primera.`);
+    }
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS devoluciones_venta_uidx
+         ON devoluciones (venta_id) WHERE venta_id IS NOT NULL`
+    );
+  } catch (e) {
+    console.error('⚠️  No se pudo crear el índice único devoluciones_venta_uidx (la regla sigue aplicándose en el controlador):', e.message);
+  }
+
   // ── CONSOLIDACIÓN insumo_local / EMPAQUES ────────────────────────────
   // Hasta esta ronda, "insumos" tenía UNA fila por insumo POR LOCAL (mismo
   // nombre, filas separadas) — de ahí que el catálogo mostrara "Pitillos",
@@ -1114,8 +1261,15 @@ const migrar = async () => {
   // toca pedidos 'entregado' que todavía no tengan su venta.
   try {
     const { rows } = await pool.query(
-      `INSERT INTO ventas(pedido_id, total, estado, created_at)
-         SELECT p.id, p.total, 'vendido', p.created_at
+      // Las columnas propias de la venta (cliente, sede, método de pago,
+      // tipo, productos) se copian del pedido en el MISMO insert. Antes
+      // solo se ponía pedido_id/total/estado/created_at, así que una venta
+      // recuperada por este backfill nacía sin sede — y con eso volvía a
+      // caer justo en el problema que el requisito 5 viene a arreglar:
+      // invisible en cualquier listado filtrado por local.
+      `INSERT INTO ventas(pedido_id, total, estado, created_at, cliente_id, cliente, sede, metodo_pago, tipo_venta, items)
+         SELECT p.id, p.total, 'vendido', p.created_at,
+                p.cliente_id, p.cliente, p.sede, p.pago, p.tipo, COALESCE(p.items, '[]'::jsonb)
            FROM pedidos p
           WHERE p.estado = 'entregado'
             AND NOT EXISTS (SELECT 1 FROM ventas v WHERE v.pedido_id = p.id)

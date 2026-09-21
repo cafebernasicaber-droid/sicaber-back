@@ -14,6 +14,23 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:4000/api';
+
+// ── Comprobante de prueba ────────────────────────────────────────────────
+// El backend ahora VALIDA que el comprobante sea de verdad un archivo de
+// imagen (o PDF), mirando sus bytes — ver normalizarArchivoComprobante en
+// src/services/comprobante.js. Antes no se validaba nada y estos tests
+// mandaban "data:text/plain;base64,..." (un texto cualquiera), que hoy se
+// rechaza con 400. Se usa un PNG 1×1 REAL, con bytes finales únicos por
+// llamada para que cada pedido tenga un comprobante distinto y no choque
+// con el control de "este comprobante ya se usó en otro pedido".
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+const comprobantePrueba = (marca) =>
+  'data:image/png;base64,' +
+  Buffer.concat([PNG_1X1, Buffer.from(String(marca))]).toString('base64');
+
 const ADMIN_USER = process.env.TEST_ADMIN_USER || 'Admin_Sicaber';
 const ADMIN_PASS = process.env.TEST_ADMIN_PASS || 'admin2024#';
 const DIRECCION_CUBIERTA = 'Calle 57B # 7-71, Medellín'; // Comuna 8 — ver test-geocoding.js
@@ -84,7 +101,7 @@ test('GET /pedidos: al marcarse "entregado" el pedido sale del listado, con o si
     method: 'POST',
     body: {
       cliente: `Cliente listado ${Date.now()}`, alias: `alias-listado-${Date.now()}`, tipo: 'local', local_id: localA, origen: 'admin',
-      pago: 'nequi', comprobante_img: `data:text/plain;base64,listado-${Date.now()}`, total: 5000,
+      pago: 'nequi', comprobante_img: comprobantePrueba(`listado-${Date.now()}`), total: 5000,
       items: [{ id: 'prod-listado', nombre: 'Producto', precio: 5000, cantidad: 1 }],
     },
   });
@@ -127,7 +144,7 @@ test('GET /pedidos: una devolución PARCIAL tampoco lo regresa al listado (ya es
     method: 'POST',
     body: {
       cliente: `Cliente listado parcial ${Date.now()}`, alias: `alias-listado-parcial-${Date.now()}`, tipo: 'local', local_id: localA, origen: 'admin',
-      pago: 'nequi', comprobante_img: `data:text/plain;base64,listado-parcial-${Date.now()}`, total: 10000,
+      pago: 'nequi', comprobante_img: comprobantePrueba(`listado-parcial-${Date.now()}`), total: 10000,
       items: [{ id: 'prod-a', nombre: 'A', precio: 5000, cantidad: 2 }],
     },
   });
@@ -275,7 +292,7 @@ test('POST /pedidos: un alias vuelve a estar libre una vez el pedido que lo usab
     method: 'POST',
     body: {
       cliente: 'Ana', alias, tipo: 'local', local_id: localA, origen: 'admin',
-      pago: 'nequi', comprobante_img: `data:text/plain;base64,alias-libre-${Date.now()}`, total: 3000, items: [],
+      pago: 'nequi', comprobante_img: comprobantePrueba(`alias-libre-${Date.now()}`), total: 3000, items: [],
     },
   });
   assert.equal(primero.status, 201, JSON.stringify(primero.data));

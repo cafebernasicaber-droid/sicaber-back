@@ -483,12 +483,33 @@ CREATE TABLE IF NOT EXISTS ventas (
   pedido_id    INTEGER REFERENCES pedidos(id) ON DELETE SET NULL,
   total        NUMERIC(12,2) DEFAULT 0,
   estado       VARCHAR(30) NOT NULL DEFAULT 'vendido', -- 'vendido' | 'devuelto'
+  -- DATOS PROPIOS DE LA VENTA (requisito 5). Antes, TODO lo que mostraba
+  -- el módulo de Ventas (cliente, sede, método de pago, tipo, productos)
+  -- se leía del pedido por JOIN — así que la venta "desaparecía" de
+  -- cualquier listado filtrado por local si el pedido perdía su sede, y se
+  -- quedaba sin cliente ni productos si el pedido se borraba (la FK es ON
+  -- DELETE SET NULL: la fila de ventas sobrevivía, pero vacía). Se guarda
+  -- una FOTO de esos datos al momento de vender: la venta deja de depender
+  -- de que el pedido siga existiendo. El JOIN se mantiene y manda cuando
+  -- el pedido está (es el dato vivo); esto es el respaldo.
+  cliente_id   INTEGER REFERENCES clientes(id) ON DELETE SET NULL,
+  cliente      VARCHAR(150),
+  sede         VARCHAR(20),
+  metodo_pago  VARCHAR(30),
+  tipo_venta   VARCHAR(30),
+  items        JSONB DEFAULT '[]',
   created_at   TIMESTAMP DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS devoluciones (
   id        SERIAL PRIMARY KEY,
   pedido_id INTEGER REFERENCES pedidos(id) ON DELETE SET NULL,
+  -- RELACIÓN DIRECTA venta original → devolución (requisito 4). Antes la
+  -- única referencia era pedido_id, así que "la venta de esta devolución"
+  -- se adivinaba con un JOIN por pedido (ventas v ON v.pedido_id =
+  -- d.pedido_id) — indirecto, y sin ninguna forma de exigir la regla de
+  -- "una sola devolución por venta".
+  venta_id  INTEGER REFERENCES ventas(id) ON DELETE SET NULL,
   motivo    TEXT,
   tipo      VARCHAR(20) DEFAULT 'total', -- 'total' | 'parcial'
   monto     NUMERIC(12,2) DEFAULT 0,
@@ -496,6 +517,23 @@ CREATE TABLE IF NOT EXISTS devoluciones (
   items     JSONB DEFAULT '[]',
   created_at TIMESTAMP DEFAULT NOW()
 );
+-- ⚠️ El índice único que hace cumplir "una devolución por venta"
+-- (devoluciones_venta_uidx) NO se crea acá a propósito, aunque este
+-- archivo sea el lugar "natural" para ponerlo.
+--
+-- MOTIVO (bug real, encontrado probando la migración sobre una base ya
+-- existente): config/db.js ejecuta TODO schema.sql en una sola sentencia
+-- de texto, así que Postgres lo corre como UNA transacción implícita — si
+-- una sola línea falla, se revierte el archivo ENTERO. En una base que ya
+-- existe, "CREATE TABLE IF NOT EXISTS devoluciones" no hace nada (la tabla
+-- ya está, sin la columna nueva), y el índice de la línea siguiente
+-- reventaba con «column "venta_id" does not exist», tumbando con él todo
+-- lo demás de schema.sql en ese arranque.
+--
+-- El índice se crea en config/db.js, DESPUÉS del ALTER que agrega la
+-- columna y después de resolver los duplicados históricos — que es el
+-- único orden en el que puede funcionar en los dos casos (base nueva y
+-- base ya poblada).
 
 CREATE TABLE IF NOT EXISTS fichas_tecnicas (
   id          SERIAL PRIMARY KEY,

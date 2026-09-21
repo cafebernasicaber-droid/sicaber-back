@@ -480,6 +480,139 @@ const validarComprobante = async ({ imagenBase64, ocrCliente, textoPlano, total 
   };
 };
 
+// ─────────────────────────────────────────────────────────────────────────
+//  ARCHIVO del comprobante: normalización y validación de FORMATO
+// ─────────────────────────────────────────────────────────────────────────
+// Esto es independiente del análisis de texto de arriba. Acá solo importa
+// que lo que llegó sea de verdad un archivo de imagen (o un PDF) y dejarlo
+// en UN formato único para guardar: data URL base64, que es lo que la
+// columna `pedidos.comprobante_img` (TEXT) ya guarda y lo que el frontend
+// ya sabe pintar en un <img src="...">.
+//
+// REGLA IMPORTANTE DEL REQUISITO: la validación NO puede depender de la
+// ENTIDAD del comprobante (Nequi, Bancolombia, Daviplata, otra...) ni de
+// su diseño. Acá solo se mira el TIPO DE ARCHIVO — los bytes iniciales —
+// nunca de qué banco viene ni qué dice adentro. Un comprobante de una
+// entidad desconocida pasa exactamente igual que uno de Nequi.
+//
+// Se reconoce por "magic bytes" (los primeros bytes reales del archivo) y
+// NO por la extensión ni por lo que declare el data URL: un navegador
+// puede mandar `data:image/png` con contenido JPEG, y al revés.
+const FIRMAS_ARCHIVO = [
+  { mime: 'image/png',  ext: 'png',  bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] },
+  { mime: 'image/jpeg', ext: 'jpg',  bytes: [0xff, 0xd8, 0xff] },
+  { mime: 'image/gif',  ext: 'gif',  bytes: [0x47, 0x49, 0x46, 0x38] },
+  { mime: 'application/pdf', ext: 'pdf', bytes: [0x25, 0x50, 0x44, 0x46] }, // "%PDF"
+  { mime: 'image/bmp',  ext: 'bmp',  bytes: [0x42, 0x4d] },
+];
+
+// Formatos con contenedor RIFF/ISO-BMFF: la firma no está al principio del
+// todo, hay que mirar un poco más adentro. Cubren los dos casos reales más
+// comunes hoy: WEBP (pantallazos de Android/Chrome) y HEIC (iPhone).
+const empiezaCon = (buffer, bytes, desde = 0) =>
+  bytes.every((b, i) => buffer[desde + i] === b);
+
+const detectarTipoArchivo = (buffer) => {
+  if (!buffer || buffer.length < 4) return null;
+  for (const firma of FIRMAS_ARCHIVO) {
+    if (empiezaCon(buffer, firma.bytes)) return { mime: firma.mime, extension: firma.ext };
+  }
+  // WEBP → "RIFF" .... "WEBP"
+  if (empiezaCon(buffer, [0x52, 0x49, 0x46, 0x46]) && empiezaCon(buffer, [0x57, 0x45, 0x42, 0x50], 8)) {
+    return { mime: 'image/webp', extension: 'webp' };
+  }
+  // HEIC/HEIF → .... "ftyp" + marca de tipo
+  if (buffer.length > 12 && empiezaCon(buffer, [0x66, 0x74, 0x79, 0x70], 4)) {
+    const marca = buffer.slice(8, 12).toString('ascii');
+    if (['heic', 'heix', 'hevc', 'heim', 'heis', 'hevm', 'mif1', 'msf1'].includes(marca)) {
+      return { mime: 'image/heic', extension: 'heic' };
+    }
+  }
+  return null;
+};
+
+// Tope de tamaño del archivo YA DECODIFICADO (bytes reales, no base64).
+// express.json() acepta hasta 15 MB de cuerpo y base64 infla ~33%, así que
+// 8 MB de archivo entran con margen de sobra. Un pantallazo de celular pesa
+// entre 100 KB y 2 MB.
+const MAX_BYTES_COMPROBANTE = Number(process.env.COMPROBANTE_MAX_BYTES || 8 * 1024 * 1024);
+
+/**
+ * Deja el comprobante recibido en un formato único y verificado.
+ *
+ * Acepta, sin distinción (el frontend puede mandar cualquiera de las tres):
+ *   • data URL  → "data:image/png;base64,iVBORw0KG..."
+ *   • base64 a secas → "iVBORw0KG..."
+ *   • Buffer    → subida binaria directa (Content-Type: image/*)
+ *
+ * @returns {{ok: true, dataUrl: string, mime: string, extension: string, bytes: number}}
+ *        | {ok: false, motivo: string, mensaje: string}
+ */
+const normalizarArchivoComprobante = (entrada) => {
+  if (entrada === undefined || entrada === null || entrada === '') {
+    return { ok: false, motivo: 'sin_archivo', mensaje: 'No se recibió ninguna imagen del comprobante.' };
+  }
+
+  let buffer;
+  if (Buffer.isBuffer(entrada)) {
+    buffer = entrada;
+  } else if (typeof entrada === 'string') {
+    const texto = entrada.trim();
+    if (!texto) {
+      return { ok: false, motivo: 'sin_archivo', mensaje: 'No se recibió ninguna imagen del comprobante.' };
+    }
+    // Se separa el prefijo del data URL si viene, pero NO se confía en el
+    // mime que declara: el tipo real se decide abajo por los bytes.
+    const sinPrefijo = texto.replace(/^data:[^;,]*;base64,/i, '').replace(/^data:[^,]*,/i, '');
+    // Un data URL puede traer saltos de línea/espacios al viajar por JSON.
+    const limpio = sinPrefijo.replace(/\s+/g, '');
+    if (!limpio) {
+      return { ok: false, motivo: 'sin_archivo', mensaje: 'No se recibió ninguna imagen del comprobante.' };
+    }
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(limpio)) {
+      return {
+        ok: false, motivo: 'formato_no_reconocido',
+        mensaje: 'El comprobante no llegó como una imagen válida. Vuelve a adjuntarlo.',
+      };
+    }
+    // base64url (- y _) también se acepta: algunos clientes lo generan así.
+    buffer = Buffer.from(limpio.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+  } else {
+    return {
+      ok: false, motivo: 'formato_no_reconocido',
+      mensaje: 'El comprobante no llegó como una imagen válida. Vuelve a adjuntarlo.',
+    };
+  }
+
+  if (!buffer.length) {
+    return { ok: false, motivo: 'archivo_vacio', mensaje: 'El archivo del comprobante llegó vacío. Vuelve a adjuntarlo.' };
+  }
+  if (buffer.length > MAX_BYTES_COMPROBANTE) {
+    const mb = (MAX_BYTES_COMPROBANTE / (1024 * 1024)).toFixed(0);
+    return {
+      ok: false, motivo: 'archivo_muy_grande',
+      mensaje: `La imagen del comprobante pesa demasiado (máximo ${mb} MB). Sube una captura más liviana.`,
+    };
+  }
+
+  const tipo = detectarTipoArchivo(buffer);
+  if (!tipo) {
+    return {
+      ok: false, motivo: 'formato_no_reconocido',
+      mensaje: 'El archivo adjunto no es una imagen (ni un PDF) que podamos mostrar. Sube una captura de pantalla o una foto del comprobante.',
+    };
+  }
+
+  return {
+    ok: true,
+    mime: tipo.mime,
+    extension: tipo.extension,
+    bytes: buffer.length,
+    // Formato único de almacenamiento: data URL con el mime REAL detectado.
+    dataUrl: `data:${tipo.mime};base64,${buffer.toString('base64')}`,
+  };
+};
+
 module.exports = {
   validarComprobante,
   analizarTexto,
@@ -491,4 +624,7 @@ module.exports = {
   normalizar,
   ocrDisponible,
   CONFIANZA_MINIMA,
+  normalizarArchivoComprobante,
+  detectarTipoArchivo,
+  MAX_BYTES_COMPROBANTE,
 };

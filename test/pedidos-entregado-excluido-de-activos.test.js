@@ -18,6 +18,23 @@ const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 
 const BASE = process.env.TEST_BASE_URL || 'http://localhost:4000/api';
+
+// ── Comprobante de prueba ────────────────────────────────────────────────
+// El backend ahora VALIDA que el comprobante sea de verdad un archivo de
+// imagen (o PDF), mirando sus bytes — ver normalizarArchivoComprobante en
+// src/services/comprobante.js. Antes no se validaba nada y estos tests
+// mandaban "data:text/plain;base64,..." (un texto cualquiera), que hoy se
+// rechaza con 400. Se usa un PNG 1×1 REAL, con bytes finales únicos por
+// llamada para que cada pedido tenga un comprobante distinto y no choque
+// con el control de "este comprobante ya se usó en otro pedido".
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+);
+const comprobantePrueba = (marca) =>
+  'data:image/png;base64,' +
+  Buffer.concat([PNG_1X1, Buffer.from(String(marca))]).toString('base64');
+
 const ADMIN_USER = process.env.TEST_ADMIN_USER || 'Admin_Sicaber';
 const ADMIN_PASS = process.env.TEST_ADMIN_PASS || 'admin2024#';
 
@@ -60,7 +77,7 @@ const crearPedido = async (sufijo, estadoInicial) => {
     method: 'POST',
     body: {
       cliente: `Cliente ventas test ${sufijo}`, alias: `alias-ventas-${sufijo}`, tipo: 'local', local_id: localA, origen: 'admin',
-      pago: 'nequi', comprobante_img: `data:text/plain;base64,ventas-${sufijo}`, total: 9000,
+      pago: 'nequi', comprobante_img: comprobantePrueba(`ventas-${sufijo}`), total: 9000,
       items: [{ id: `prod-ventas-${sufijo}`, nombre: 'Café', precio: 9000, cantidad: 1 }],
     },
   });

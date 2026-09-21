@@ -1,5 +1,190 @@
 # Cambios aplicados
 
+## Ronda 32 — Registro con Google en dos pasos, comprobante enviado desde la página, ventas que no desaparecen y devoluciones con relación real a la venta
+
+Analizado primero todo lo que ya existía (autenticación con Google,
+clientes, pagos, comprobantes, pedidos, ventas y devoluciones) para
+reutilizar las estructuras vigentes: **no se creó ningún sistema
+paralelo**. Las tablas `pedidos`, `ventas` y `devoluciones` siguen
+siendo las mismas; lo que se agregó son columnas sobre ellas y dos
+endpoints que faltaban.
+
+### 1. Completar cuenta mediante Google (requisito 1)
+
+**Causa raíz:** `POST /auth/cliente/google` creaba el cliente EN EL ACTO
+cuando el correo no existía, con una contraseña aleatoria que nadie
+conoce y sin teléfono ni documento. Si el usuario cerraba la pestaña,
+quedaba una cuenta incompleta e inutilizable (no puede iniciar sesión
+con contraseña porque no la tiene) que además bloqueaba el registro
+normal con "ese correo ya está registrado".
+
+- `POST /auth/cliente/google` con correo NUEVO ya **no toca la base**:
+  responde `registroPendiente: true` + `tokenRegistro` (token temporal
+  firmado, con propósito propio `registro_google`, vencimiento de 20
+  min y el correo/nombre que Google ya verificó) + `camposRequeridos`.
+- `POST /auth/cliente/google/completar` (nuevo): valida el token
+  (vigencia y propósito), la contraseña con la política existente
+  (`config/passwordPolicy.js`) y documento/teléfono con los validadores
+  existentes (`config/validaciones.js`); hashea con bcrypt(10), crea el
+  cliente **completo** con `verificado=true` y `estado='Activo'`, y
+  devuelve `{ token, cliente }` con el MISMO formato que
+  `/cliente/login`.
+- El correo y el nombre salen del token firmado, nunca del body: si
+  vinieran del body, cualquiera podría crear una cuenta a nombre de otro.
+- Correo YA existente: flujo de login intacto.
+- No se volvió a agregar dirección/departamento/municipio/comuna al
+  cliente — la dirección de domicilio sigue siendo del pedido.
+- Recuperación de contraseña: sin cambios, verificada por test.
+
+### 2 y 3. Comprobantes de pago enviados desde la página (requisitos 2 y 3)
+
+**Causa raíz:** el comprobante solo se podía adjuntar al CREAR el pedido
+(`POST /pedidos`) o con `PUT /pedidos/:id`, que empieza con
+`if (req.user?.rol === 'Cliente') return 403`. Un cliente que ya había
+hecho el pedido **no tenía ninguna ruta** para enviarlo — ese hueco es
+justamente el que tapaba WhatsApp.
+
+- `POST /pedidos/:id/comprobante` (nuevo): lo puede usar el DUEÑO del
+  pedido (rol Cliente) y también Cajero/Administrador. Acepta el archivo
+  como data URL, base64 suelto o **binario crudo** (`image/*`,
+  `application/pdf`), bajo varios nombres de campo.
+- `GET /pedidos/:id/comprobante` (nuevo): recupera el comprobante como
+  JSON o, con `?raw=1`, como archivo binario con su `Content-Type` real.
+- `normalizarArchivoComprobante` (en `services/comprobante.js`): valida
+  el archivo por sus **bytes iniciales** (PNG, JPEG, WEBP, HEIC, GIF,
+  BMP, PDF) y lo guarda siempre como data URL con el mime real. **No
+  mira la entidad ni el diseño del comprobante**: uno de un banco
+  desconocido entra igual que uno de Nequi.
+- `GET /pedidos/:id` ahora informa `tieneComprobante`,
+  `comprobanteValido`, `comprobanteMime`, `comprobanteBytes` y
+  `comprobanteUrl`, y devuelve la imagen ya normalizada — antes entregaba
+  la cadena tal cual y, si no servía, el `<img>` quedaba roto sin
+  explicación.
+- El mismo control se aplica en `POST /pedidos` y `PUT /pedidos/:id`,
+  así la columna guarda siempre un archivo válido entre por donde entre.
+- Sigue vigente lo que ya existía: anti-reutilización por hash y por
+  número de aprobación, y la aprobación/rechazo manual del cajero.
+- WhatsApp: no había ninguna referencia en el backend. Lo que faltaba
+  era la ruta que lo reemplaza, y es la que se agregó.
+
+### 4. Devoluciones (requisito 4)
+
+**Causa raíz:** `POST /devoluciones` exigía literalmente `pedido_id` y
+respondía `400 pedido_id es requerido` ante cualquier otro nombre. Pero
+la devolución se hace desde la pantalla de **Ventas**, donde lo que hay
+a mano es la venta — y el propio `GET /ventas` devuelve la clave como
+`id_venta`. El backend pedía un dato que la pantalla que lo llama no
+tiene con ese nombre.
+
+- Se acepta `venta_id` / `id_venta` / `pedido_id` / `id_pedido`; el que
+  falte se resuelve contra la base, y si mandan los dos y no concuerdan
+  se dice explícitamente.
+- Columna nueva `devoluciones.venta_id` → relación DIRECTA venta
+  original → devolución (antes se adivinaba con un JOIN por pedido).
+- **Una venta solo puede tener UNA devolución**: chequeo en el
+  controlador (409 con el id de la que ya existe) + índice único parcial
+  `devoluciones_venta_uidx` en la base, para que dos peticiones
+  simultáneas no creen dos filas.
+- No se puede devolver un pedido que todavía no tiene venta registrada
+  (409 `pedido_sin_venta`), caso que antes creaba una devolución
+  colgando de un pedido nunca vendido.
+- `GET /devoluciones/:id` y `GET /devoluciones/por-venta/:ventaId`
+  (nuevos): antes solo existía el listado completo.
+- El monto se calcula desde las líneas devueltas cuando no lo mandan
+  (antes quedaba en 0).
+- La venta original **nunca se borra**: solo cambia de estado.
+
+### 5. Ventas del cajero (requisito 5)
+
+**Causa raíz (dos, ambas reales):**
+1. `ventas` solo guardaba `pedido_id`, `total` y `estado`; cliente,
+   sede, método de pago, tipo y productos salían del pedido por JOIN. El
+   listado del cajero filtra con `WHERE p.sede = $1`, así que una venta
+   cuyo pedido no tuviera sede **no coincidía con ningún local** y
+   desaparecía de la pantalla donde se la busca.
+2. `DELETE /pedidos/:id` borraba el pedido y, por la FK `ON DELETE SET
+   NULL`, dejaba la venta viva pero **vacía**: sin cliente, sin
+   productos y sin sede.
+
+- Columnas nuevas en `ventas`: `cliente_id`, `cliente`, `sede`,
+  `metodo_pago`, `tipo_venta`, `items` — una foto de los datos al
+  momento de vender. El JOIN se mantiene y manda mientras el pedido
+  exista; esto es el respaldo.
+- `VENTA_SELECT` usa `COALESCE(pedido, venta)` en cada campo, y el
+  filtro por local también.
+- `DELETE /pedidos/:id` rechaza con 409 un pedido que ya tiene venta o
+  devolución registrada — mismo criterio que ya protege insumos y
+  productos con historial real.
+- `PATCH /ventas/:id/estado` valida el estado (antes aceptaba cualquier
+  texto, y un estado que ningún filtro reconoce es una venta que
+  desaparece) y responde 404 si la venta no existe (antes: 200 vacío).
+- `GET /ventas/stats` acepta el filtro por local (antes sumaba siempre
+  todos).
+
+### 6. Integridad de datos (requisito 6)
+
+No se rehízo el esquema: se agregaron columnas con `ADD COLUMN IF NOT
+EXISTS`, sus FK con `ON DELETE SET NULL` (cada una en su propio
+try/catch, como el resto del archivo) y un índice único parcial. Todos
+los datos existentes se rellenan con una migración idempotente.
+
+Bugs encontrados al probar la migración sobre una base YA existente:
+
+- `schema.sql` corre como UNA transacción implícita: el
+  `CREATE UNIQUE INDEX` sobre la columna nueva reventaba con «column
+  "venta_id" does not exist» y **tumbaba el archivo entero** en ese
+  arranque. El índice se movió a `config/db.js`, después del ALTER.
+- El relleno de `devoluciones.venta_id` chocaba con el índice único en
+  CADA arranque cuando un pedido histórico tenía dos devoluciones. Se
+  agregó la condición que lo hace idempotente.
+- El backfill de ventas faltantes (que ya existía) creaba la venta **sin
+  sede**, volviendo a caer en el problema del requisito 5. Ahora copia
+  también cliente, sede, método de pago, tipo y productos.
+
+### Bug aparte, encontrado de paso
+
+`config/db.js` documentaba en 18 líneas de comentario que convierte toda
+columna `NUMERIC` a número… pero **la conversión nunca se registró**:
+`types` se importaba de `pg` y no se usaba en ningún lado. Todo importe
+(`ventas.total`, `devoluciones.monto`, `pedidos.total`, `productos.precio`,
+`insumos.stock`…) viajaba al frontend como texto `"13000.00"`. Se detectó
+porque 4 tests de la suite fallaban desde antes de esta ronda con el mismo
+síntoma (`'13000.00' !== 13000`). Corregido con `types.setTypeParser(1700, …)`.
+
+### Archivos
+
+- `src/routes/auth.js` — flujo de Google en dos pasos + `/cliente/google/completar`.
+- `src/services/tokenRegistro.js` (nuevo) — token temporal de registro.
+- `src/services/comprobante.js` — `normalizarArchivoComprobante` y detección de formato.
+- `src/routes/index.js` — comprobante desde la página, detalle del pedido,
+  ventas, devoluciones, borrado de pedidos.
+- `src/config/db.js` — migraciones, FK, índice único, backfill y el
+  `setTypeParser` de NUMERIC.
+- `src/config/schema.sql` — columnas nuevas para instalaciones desde cero.
+- `scripts/stub-google-pruebas.js` (nuevo) — sustituto de la verificación
+  de Google, SOLO para pruebas; no lo carga ni `npm start` ni `npm test`.
+- Tests nuevos: `test/google-registro-completar.test.js` y
+  `test/comprobantes-ventas-devoluciones.test.js`.
+- Tests actualizados: los 8 archivos que mandaban un comprobante de
+  texto falso (`data:text/plain;…`) ahora usan un PNG real, y
+  `toppings-adiciones-venta.test.js` corrige un total que había quedado
+  viejo (contaba un topping con precio, columna ya eliminada).
+
+### Verificación
+
+Suite completa: **213/218 verdes**. Las 5 restantes son pruebas de
+pedidos a domicilio que llaman a Geoapify, inalcanzable desde el entorno
+donde se corrió (la red de salida lo bloquea) — fallan igual con el
+código original, sin ninguno de estos cambios. Punto de partida medido
+sobre el código original: 181/191, con 10 fallas; 4 de ellas eran el bug
+de NUMERIC y 1 el total viejo del test de toppings, ambos corregidos.
+
+Además, verificado aparte: migración sobre una base con el esquema y los
+datos VIEJOS (incluidas dos devoluciones sobre la misma venta), con
+segundo arranque para confirmar idempotencia, y una auditoría de
+integridad sobre la base que dejó la suite (huérfanos, duplicados,
+reglas de negocio y validez de los 20 comprobantes guardados).
+
 ## Ronda 31 — Comprobante de compra opcional en los dos flujos + señal explícita en el detalle
 
 Investigado a fondo antes de tocar nada: el **backend nunca exigió**

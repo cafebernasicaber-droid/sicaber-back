@@ -20,7 +20,10 @@ const { determinarSedePorDireccion } = require('../services/geocoding');
 // Lectura y validación del comprobante de pago en el SERVIDOR (valor,
 // entidad y referencia extraídos del propio comprobante, sin depender del
 // diseño de cada banco). Ver services/comprobante.js.
-const { validarComprobante } = require('../services/comprobante');
+// normalizarArchivoComprobante: deja el archivo recibido (data URL, base64
+// suelto o binario crudo) en UN solo formato verificado, mirando los bytes
+// reales — nunca la entidad ni el diseño del comprobante (requisito 2).
+const { validarComprobante, normalizarArchivoComprobante } = require('../services/comprobante');
 
 const r = express.Router();
 
@@ -3720,9 +3723,39 @@ const registrarVentaDePedido = async (pedido) => {
     // Ya no aborta por insumos faltantes: devuelve la lista para avisar.
     const { faltantes } = await descontarInventarioPorVenta(pedido.items, local.localId, client, pedido.id);
 
+    // La venta guarda su PROPIA copia de los datos del pedido (requisito 5:
+    // "Mantener su información" / "Mantener relación con su pedido/cliente").
+    // Antes solo se guardaba pedido_id + total, y todo lo demás se leía del
+    // pedido por JOIN — así que la venta quedaba invisible en los listados
+    // filtrados por local si el pedido perdía su sede, y se vaciaba por
+    // completo si alguien borraba el pedido (FK ON DELETE SET NULL: la fila
+    // sobrevivía sin cliente, sin productos y sin sede).
+    //
+    // Se releen del pedido con una consulta propia en vez de confiar en el
+    // objeto recibido: quien llama puede haber traído solo algunas columnas
+    // (PATCH /:id/estado hace un SELECT acotado), y una venta a la que le
+    // falta el cliente por eso sería justo el bug que esto viene a cerrar.
+    const { rows: datosPedido } = await client.query(
+      `SELECT cliente_id, cliente, sede, pago, tipo, items, total FROM pedidos WHERE id=$1`,
+      [pedido.id]
+    );
+    const dp = datosPedido[0] || {};
     const { rows } = await client.query(
-      `INSERT INTO ventas(pedido_id, total, estado) VALUES($1,$2,'vendido') RETURNING id`,
-      [pedido.id, pedido.total]
+      `INSERT INTO ventas(pedido_id, total, estado, cliente_id, cliente, sede, metodo_pago, tipo_venta, items)
+       VALUES($1,$2,'vendido',$3,$4,$5,$6,$7,$8) RETURNING id`,
+      [
+        pedido.id,
+        pedido.total ?? dp.total ?? 0,
+        dp.cliente_id ?? null,
+        dp.cliente ?? null,
+        // La sede queda congelada acá: es el local que REALMENTE vendió.
+        // Si el pedido no tenía sede escrita, se usa el nombre del local
+        // que resolvió la venta, así ninguna venta nace sin local.
+        dp.sede ?? local.localNombre ?? null,
+        dp.pago ?? null,
+        dp.tipo ?? null,
+        JSON.stringify(Array.isArray(dp.items) ? dp.items : (Array.isArray(pedido.items) ? pedido.items : [])),
+      ]
     );
     await client.query('COMMIT');
     return { ventaId: rows[0].id, faltantes };
@@ -4796,6 +4829,34 @@ pedRouter.get('/:id', auth, async (req, res) => {
   // esa línea) separados en cada ítem — ver enriquecerItemsPedido.
   const productos = await enriquecerItemsPedido(rows[0].items);
   const pedido = await conEstadoDevolucion(conEstadoPago({ ...rows[0], productos }));
+
+  // ── Comprobante (requisito 3) ──────────────────────────────────────
+  // El detalle ya traía "comprobanteImg" (PEDIDO_SELECT), pero el
+  // frontend no tenía forma de saber si lo guardado era realmente una
+  // imagen mostrable o basura de una carga vieja: se le entregaba la
+  // cadena tal cual y, si no servía, el <img> quedaba roto sin
+  // explicación. Acá se COMPRUEBA el archivo guardado (por sus bytes) y
+  // se dice explícitamente qué hay:
+  //   tieneComprobante   → hay algo guardado en este pedido
+  //   comprobanteValido  → ese algo es de verdad una imagen/PDF
+  //   comprobanteMime    → tipo real detectado (no el que declaró el
+  //                        navegador al subirlo)
+  //   comprobanteUrl     → ruta para pedir SOLO el archivo
+  // La imagen se devuelve ya normalizada, así que lo que el frontend
+  // pinta es siempre un data URL bien formado.
+  const archivoComprobante = pedido.comprobante_img
+    ? normalizarArchivoComprobante(pedido.comprobante_img)
+    : null;
+  pedido.tieneComprobante = !!pedido.comprobante_img;
+  pedido.comprobanteValido = !!archivoComprobante?.ok;
+  pedido.comprobanteMime = archivoComprobante?.ok ? archivoComprobante.mime : null;
+  pedido.comprobanteBytes = archivoComprobante?.ok ? archivoComprobante.bytes : null;
+  pedido.comprobanteUrl = pedido.comprobante_img ? `/api/pedidos/${pedido.id}/comprobante` : null;
+  if (archivoComprobante?.ok) {
+    pedido.comprobanteImg = archivoComprobante.dataUrl;
+    pedido.comprobante_img = archivoComprobante.dataUrl;
+  }
+
   res.json(pedido);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -4869,7 +4930,22 @@ pedRouter.post('/', authOpcional, async (req, res) => {
     localIdBody = req.user.local_id;
     atendidoPorBody = req.user.id;
   }
-  const comprobanteImgFinal = comprobante_img || meta.comprobanteImg || null;
+  // El comprobante que venga en el checkout pasa por la MISMA
+  // normalización que POST /pedidos/:id/comprobante: se verifica que sea
+  // de verdad un archivo de imagen (o PDF) mirando sus bytes, y se guarda
+  // siempre como data URL con el mime real. Antes se guardaba tal cual lo
+  // que mandara el navegador, así que la columna podía terminar con un
+  // texto cualquiera — y el detalle del pedido devolvía algo que el
+  // frontend no podía pintar. La validación NO mira la entidad ni el
+  // diseño del comprobante: solo el tipo de archivo.
+  let comprobanteImgFinal = comprobante_img || meta.comprobanteImg || null;
+  if (comprobanteImgFinal) {
+    const archivoComprobante = normalizarArchivoComprobante(comprobanteImgFinal);
+    if (!archivoComprobante.ok) {
+      return res.status(400).json({ error: archivoComprobante.mensaje, motivo: archivoComprobante.motivo });
+    }
+    comprobanteImgFinal = archivoComprobante.dataUrl;
+  }
   // Lo que manda el frontend sobre el comprobante se sigue guardando, pero
   // YA NO DECIDE NADA: antes, el objeto `comprobante_ocr` que llegaba del
   // navegador era toda la "validación" que existía (el propio comentario
@@ -5363,9 +5439,20 @@ pedRouter.put('/:id', auth, async (req, res) => {
 
     let comprobanteHash = null;
     let validacionComprobante = null;
-    if (comprobante_img || comprobante_texto) {
+    // Misma normalización de archivo que POST /pedidos y
+    // POST /pedidos/:id/comprobante — para que la columna guarde siempre un
+    // data URL verificado, entre por donde entre.
+    let comprobanteImgPut = comprobante_img || null;
+    if (comprobanteImgPut) {
+      const archivoComprobante = normalizarArchivoComprobante(comprobanteImgPut);
+      if (!archivoComprobante.ok) {
+        return res.status(400).json({ error: archivoComprobante.mensaje, motivo: archivoComprobante.motivo });
+      }
+      comprobanteImgPut = archivoComprobante.dataUrl;
+    }
+    if (comprobanteImgPut || comprobante_texto) {
       const revision = await revisarComprobante({
-        imagen: comprobante_img,
+        imagen: comprobanteImgPut,
         textoPlano: comprobante_texto,
         ocrCliente: req.body?.comprobante_ocr,
         total: totalReferencia,
@@ -5437,7 +5524,7 @@ pedRouter.put('/:id', auth, async (req, res) => {
         sede ?? null,
         local_id ?? null,
         id,
-        comprobante_img ?? null,
+        comprobanteImgPut ?? null,
         comprobanteHash,
         aliasTexto || null,
         metodoPagoLocalTexto ?? null,
@@ -5792,6 +5879,283 @@ pedRouter.patch('/:id/comprobante/rechazar', auth, permitirRoles('Cajero', 'Admi
     res.status(500).json({ error: 'No se pudo rechazar el comprobante. Intenta de nuevo.' });
   }
 });
+// ─────────────────────────────────────────────────────────────────────────
+//  ENVIAR EL COMPROBANTE DE PAGO DESDE LA PÁGINA (requisito 2)
+// ─────────────────────────────────────────────────────────────────────────
+// QUÉ ESTABA MAL ANTES (hueco real, verificado en el código):
+//
+//   El comprobante SOLO se podía adjuntar en dos momentos:
+//     • dentro de POST /pedidos, al crear el pedido, o
+//     • con PUT /pedidos/:id — que empieza con
+//       `if (req.user?.rol === 'Cliente') return 403`.
+//
+//   O sea: un cliente que ya hizo el pedido y todavía no había subido el
+//   comprobante (el caso normal — primero se pide, después se transfiere)
+//   NO TENÍA NINGUNA RUTA para enviarlo. Ese hueco es exactamente el que
+//   tapaba WhatsApp: el cliente mandaba la foto por chat y alguien la
+//   adjuntaba a mano con el PUT de cajero. Sin esta ruta, quitar WhatsApp
+//   del proceso dejaba el flujo sin salida.
+//
+// QUÉ HACE:
+//   • La puede usar el DUEÑO del pedido (Cliente) — que es el punto del
+//     requisito — y también Cajero/Administrador (el caso "lo mandó por
+//     otro medio y lo adjunta el cajero", que antes iba por el PUT).
+//   • Acepta el archivo en cualquiera de las formas que puede mandar una
+//     página: data URL base64, base64 a secas, o el binario crudo
+//     (Content-Type: image/*), bajo varios nombres de campo.
+//   • Valida SOLO el formato de archivo (que sea imagen/PDF de verdad),
+//     nunca la entidad: un comprobante de un banco desconocido entra igual
+//     que uno de Nequi — ver normalizarArchivoComprobante.
+//   • Lo GUARDA en el pedido (comprobante_img + hash + análisis) y deja el
+//     pedido en 'pendiente_verificacion' para que el cajero lo revise.
+//
+// QUÉ NO HACE: no aprueba el pago. Eso sigue siendo decisión del cajero
+// (PATCH /:id/comprobante/aprobar), igual que antes.
+//
+// Nombres de campo aceptados para el archivo — el frontend ya existía
+// antes que esta ruta y puede estar usando cualquiera de ellos.
+const CAMPOS_IMAGEN_COMPROBANTE = [
+  'comprobante_img', 'comprobanteImg', 'imagen', 'image',
+  'comprobante', 'archivo', 'file', 'base64', 'data',
+];
+const imagenDelBody = (body) => {
+  if (!body || typeof body !== 'object') return null;
+  for (const campo of CAMPOS_IMAGEN_COMPROBANTE) {
+    const v = body[campo];
+    if (typeof v === 'string' && v.trim()) return v;
+    // Algunos clientes mandan { comprobante: { base64: "..." } }.
+    if (v && typeof v === 'object') {
+      for (const anidado of ['base64', 'dataUrl', 'data', 'contenido', 'url']) {
+        if (typeof v[anidado] === 'string' && v[anidado].trim()) return v[anidado];
+      }
+    }
+  }
+  return null;
+};
+
+// Estados en los que ya no tiene sentido recibir un comprobante nuevo.
+const ESTADOS_SIN_COMPROBANTE_NUEVO = ['entregado', 'cancelado'];
+
+// Parser de cuerpo BINARIO solo para esta ruta: permite que la página suba
+// el archivo tal cual (fetch con un Blob/File y Content-Type: image/png),
+// sin tener que convertirlo a base64 en el navegador. El parser JSON
+// global de src/index.js sigue atendiendo el caso base64, que es el que ya
+// usaba el checkout. `type` acota qué cuerpos toma este parser para no
+// interferir con el JSON normal.
+const cuerpoBinarioComprobante = require('express').raw({
+  type: ['image/*', 'application/pdf', 'application/octet-stream'],
+  limit: '15mb',
+});
+
+pedRouter.post('/:id/comprobante', auth, cuerpoBinarioComprobante, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
+  try {
+    const { rows: actual } = await pool.query(
+      `SELECT id, cliente_id, estado, pago, pago_confirmado, total, total_calculado, items
+         FROM pedidos WHERE id=$1`, [id]
+    );
+    if (!actual[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+    const ped = actual[0];
+
+    // ── Quién puede subirlo ────────────────────────────────────────────
+    // Un Cliente, SOLO en su propio pedido (mismo criterio que GET /:id:
+    // los id son consecutivos, sin este chequeo cualquiera podría pegarle
+    // un comprobante al pedido de otro). El personal interno, en cualquiera.
+    const esCliente = req.user?.rol === 'Cliente';
+    if (esCliente && Number(ped.cliente_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: 'No puedes enviar el comprobante de un pedido que no es tuyo.' });
+    }
+
+    if (ESTADOS_SIN_COMPROBANTE_NUEVO.includes(ped.estado)) {
+      return res.status(409).json({
+        error: `El pedido #${id} ya está "${ped.estado}": no admite un comprobante nuevo.`,
+        estadoActual: ped.estado,
+      });
+    }
+    // Un pago en efectivo/contraentrega no tiene transferencia que
+    // comprobar. Se avisa claro en vez de guardar una imagen que nadie va
+    // a revisar nunca.
+    if (esEfectivo(ped.pago)) {
+      return res.status(400).json({
+        error: 'Este pedido se paga en efectivo/contraentrega — no requiere comprobante de pago.',
+      });
+    }
+
+    // ── El archivo ─────────────────────────────────────────────────────
+    // Binario crudo (express.raw dejó un Buffer) o base64 dentro del JSON.
+    const crudo = Buffer.isBuffer(req.body) && req.body.length ? req.body : imagenDelBody(req.body);
+    const archivo = normalizarArchivoComprobante(crudo);
+    if (!archivo.ok) {
+      return res.status(400).json({ error: archivo.mensaje, motivo: archivo.motivo });
+    }
+
+    // Texto del comprobante, si el navegador lo manda aparte (OCR del
+    // cliente). Es materia prima opcional para el análisis: el veredicto
+    // lo saca el backend, nunca el cliente. Ver services/comprobante.js.
+    const textoCliente = (!Buffer.isBuffer(req.body) && (req.body?.comprobante_texto ?? req.body?.comprobanteTexto)) || null;
+    const ocrCliente = (!Buffer.isBuffer(req.body) && (req.body?.comprobante_ocr ?? req.body?.comprobanteOcr)) || null;
+
+    // Total REAL del pedido según el servidor (nunca el que mande el
+    // cliente) — es contra este número que se compara el comprobante.
+    const totalReferencia = Math.round(Number(ped.total_calculado ?? ped.total) || 0);
+
+    const revision = await revisarComprobante({
+      imagen: archivo.dataUrl,
+      textoPlano: textoCliente,
+      ocrCliente,
+      total: totalReferencia,
+      // El propio pedido no cuenta como "ya usado": volver a subir el
+      // comprobante (porque la primera foto salió cortada, por ejemplo)
+      // tiene que poder reemplazarlo.
+      excluirPedidoId: id,
+    });
+
+    // Anti-reutilización: el MISMO comprobante en OTRO pedido sigue siendo
+    // un rechazo. No depende de la entidad — es el hash del archivo y el
+    // número de aprobación del banco, que existen en cualquier formato.
+    if (revision.duplicado) {
+      return res.status(409).json({
+        error: revision.duplicado.porHash
+          ? 'Este comprobante ya fue usado en otro pedido. Cada comprobante de pago solo se puede usar una vez.'
+          : 'Ese número de comprobante ya fue usado en otro pedido. Cada pago solo se puede usar una vez.',
+        pedidoExistente: revision.duplicado.pedidoId,
+        motivo: revision.duplicado.porHash ? 'comprobante_repetido' : 'referencia_repetida',
+      });
+    }
+
+    // DECISIÓN DELIBERADA: acá el comprobante SIEMPRE se guarda, incluso
+    // si el valor leído no cuadra con el total. Motivos:
+    //   • El requisito pide "recibir, guardar y asociar" el comprobante,
+    //     sin validaciones atadas a una entidad o formato concreto.
+    //   • La lectura automática del valor es una ayuda, no una verdad: sin
+    //     OCR del servidor (OCR_BACKEND apagado por defecto) el texto lo
+    //     pone el navegador, y una foto borrosa no debería impedirle al
+    //     cliente entregar su comprobante.
+    //   • El cajero sigue teniendo la última palabra, y su pantalla de
+    //     aprobación YA bloquea el caso "valor no coincide" con el
+    //     veredicto que se guarda acá (ver /comprobante/aprobar).
+    // Lo que NO se guarda nunca es un archivo que no sea una imagen/PDF
+    // (se rechazó arriba) ni un comprobante ya usado en otro pedido.
+    const cols = columnasComprobante(revision.validacion);
+    const { rows } = await pool.query(
+      `UPDATE pedidos
+          SET comprobante_img        = $1,
+              comprobante_hash       = $2,
+              comprobante_ocr        = COALESCE($3, comprobante_ocr),
+              comprobante_validacion = $4,
+              comprobante_valor      = $5,
+              comprobante_entidad    = $6,
+              comprobante_referencia = $7,
+              comprobante_fecha      = $8,
+              -- Un comprobante NUEVO reabre la verificación: se limpia el
+              -- rechazo anterior y el pedido vuelve a la cola del cajero.
+              -- Sin esto, reenviar un comprobante corregido dejaba el
+              -- pedido marcado como rechazado para siempre.
+              comprobante_motivo_rechazo = NULL,
+              comprobante_verificado_por = NULL,
+              comprobante_verificado_en  = NULL,
+              estado = CASE WHEN pago_confirmado THEN estado ELSE 'pendiente_verificacion' END
+        WHERE id = $9
+        RETURNING *`,
+      [
+        archivo.dataUrl,
+        revision.hash,
+        ocrCliente ? JSON.stringify(ocrCliente) : null,
+        cols.validacion, cols.valor, cols.entidad, cols.referencia, cols.fecha,
+        id,
+      ]
+    );
+
+    res.status(201).json(conEstadoPago({
+      ...rows[0],
+      comprobanteImg: rows[0].comprobante_img,
+      tieneComprobante: true,
+      comprobanteValidacion: revision.validacion,
+      // Datos del archivo guardado, para que la página pueda confirmarle al
+      // usuario que llegó completo.
+      comprobanteArchivo: { mime: archivo.mime, bytes: archivo.bytes, extension: archivo.extension },
+      mensaje: 'Recibimos tu comprobante. Un cajero lo va a verificar y te confirmamos el pago.',
+    }));
+  } catch (e) {
+    console.error('💥 POST /pedidos/:id/comprobante:', e);
+    res.status(500).json({ error: 'No se pudo guardar el comprobante. Intenta de nuevo.' });
+  }
+});
+
+// Recuperar el comprobante ya guardado. GET /pedidos/:id lo devuelve
+// embebido en el detalle (comprobanteImg), pero esta ruta sirve para
+// pedirlo SOLO a él — útil para abrirlo en una pestaña o descargarlo sin
+// arrastrar todo el pedido, y para confirmar desde afuera que de verdad
+// quedó guardado y corresponde a este pedido.
+//   • por defecto → JSON { comprobanteImg: "data:image/...;base64,..." }
+//   • ?raw=1      → el archivo binario, con su Content-Type real
+pedRouter.get('/:id/comprobante', auth, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, cliente_id, comprobante_img, comprobante_hash, comprobante_entidad,
+              comprobante_referencia, comprobante_valor, comprobante_fecha,
+              comprobante_validacion, comprobante_motivo_rechazo, pago_confirmado
+         FROM pedidos WHERE id=$1`, [id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+    // Mismo candado de dueño que GET /pedidos/:id.
+    if (req.user?.rol === 'Cliente' && Number(rows[0].cliente_id) !== Number(req.user.id)) {
+      return res.status(403).json({ error: 'No tienes permiso para ver este comprobante.' });
+    }
+    if (!rows[0].comprobante_img) {
+      return res.status(404).json({
+        error: `El pedido #${id} todavía no tiene comprobante de pago adjunto.`,
+        tieneComprobante: false,
+      });
+    }
+
+    const archivo = normalizarArchivoComprobante(rows[0].comprobante_img);
+    // Que lo guardado siga siendo un archivo válido no es un supuesto: se
+    // comprueba al entregarlo. Si la columna quedó con basura (de una carga
+    // vieja hecha antes de esta validación), se dice con claridad en vez de
+    // mandarle al navegador una cadena que no puede pintar.
+    if (!archivo.ok) {
+      return res.status(422).json({
+        error: 'El comprobante guardado para este pedido no es un archivo de imagen válido. Pídele al cliente que lo envíe de nuevo.',
+        motivo: archivo.motivo,
+        tieneComprobante: true,
+        comprobanteValido: false,
+      });
+    }
+
+    if (String(req.query.raw || '') === '1' || String(req.query.raw || '').toLowerCase() === 'true') {
+      const binario = Buffer.from(archivo.dataUrl.split(',')[1], 'base64');
+      res.setHeader('Content-Type', archivo.mime);
+      res.setHeader('Content-Length', binario.length);
+      res.setHeader('Content-Disposition', `inline; filename="comprobante-pedido-${id}.${archivo.extension}"`);
+      return res.end(binario);
+    }
+
+    res.json({
+      pedido_id: rows[0].id,
+      tieneComprobante: true,
+      comprobanteValido: true,
+      comprobanteImg: archivo.dataUrl,
+      comprobanteMime: archivo.mime,
+      comprobanteBytes: archivo.bytes,
+      comprobanteHash: rows[0].comprobante_hash,
+      comprobanteEntidad: rows[0].comprobante_entidad,
+      comprobanteReferencia: rows[0].comprobante_referencia,
+      comprobanteValor: rows[0].comprobante_valor,
+      comprobanteFecha: rows[0].comprobante_fecha,
+      comprobanteValidacion: rows[0].comprobante_validacion,
+      comprobanteMotivoRechazo: rows[0].comprobante_motivo_rechazo,
+      pagoConfirmado: rows[0].pago_confirmado,
+    });
+  } catch (e) {
+    console.error('💥 GET /pedidos/:id/comprobante:', e);
+    res.status(500).json({ error: 'No se pudo recuperar el comprobante. Intenta de nuevo.' });
+  }
+});
+
 // Un cajero/bartender "toma" (reclama) un pedido que todavía NO está
 // asignado a ningún local (local_id IS NULL) — solo aplica a esos; un
 // pedido que el Admin creó ya con un local elegido nunca pasa por aquí.
@@ -5845,6 +6209,35 @@ pedRouter.delete('/:id', auth, permitirRoles('Administrador'), async (req, res) 
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'ID de pedido inválido' });
   try {
+    const { rows: existe } = await pool.query('SELECT id, estado FROM pedidos WHERE id=$1', [id]);
+    if (!existe[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+
+    // CANDADO NUEVO (requisito 5: "Procesar una venta NO significa
+    // eliminarla"). Un pedido que ya generó una venta es un registro
+    // FINANCIERO, no un borrador: borrarlo dejaba la venta viva pero
+    // vacía (la FK es ON DELETE SET NULL, así que la fila de ventas
+    // sobrevivía sin pedido, sin cliente y sin productos) y, además,
+    // desaparecida de cualquier listado filtrado por local. Mismo criterio
+    // que ya protege insumos/productos con historial real: si hay
+    // movimiento asociado, no se borra — se cancela.
+    const { rows: venta } = await pool.query('SELECT id FROM ventas WHERE pedido_id=$1 LIMIT 1', [id]);
+    if (venta[0]) {
+      return res.status(409).json({
+        error: `El pedido #${id} ya tiene una venta registrada (venta #${venta[0].id}) y no se puede eliminar: borraría el registro de una venta real. Si hay que anularlo, registra la devolución correspondiente.`,
+        ventaId: venta[0].id,
+        motivo: 'pedido_con_venta',
+      });
+    }
+    // Igual con una devolución ya registrada sobre este pedido.
+    const { rows: dev } = await pool.query('SELECT id FROM devoluciones WHERE pedido_id=$1 LIMIT 1', [id]);
+    if (dev[0]) {
+      return res.status(409).json({
+        error: `El pedido #${id} tiene una devolución registrada (devolución #${dev[0].id}) y no se puede eliminar.`,
+        devolucionId: dev[0].id,
+        motivo: 'pedido_con_devolucion',
+      });
+    }
+
     await pool.query('DELETE FROM pedidos WHERE id=$1', [id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -5858,23 +6251,40 @@ const ventRouter = require('express').Router();
 // tipo_venta, productos y estado en minúscula ('vendido' / 'devuelto').
 // Esos datos no vivían todos en la tabla `ventas`: cliente/método de
 // pago/tipo/productos se derivan del pedido asociado mediante el JOIN.
+// CAMBIO (requisito 5): cada campo sale de COALESCE(pedido, venta). El
+// pedido sigue mandando mientras exista (es el dato vivo: si al pedido se
+// le corrige el cliente o la sede, la lista lo refleja), pero si el pedido
+// ya no está —o nunca tuvo sede— la venta responde con SU PROPIA copia en
+// vez de devolver NULL. Antes, todos estos campos venían solo del JOIN, y
+// por eso una venta podía "desaparecer" del listado del cajero (que filtra
+// por sede) o aparecer vacía, sin dejar de existir en la tabla.
 const VENTA_SELECT = `
   SELECT
     v.id,
     v.id                              AS id_venta,
     v.pedido_id,
     v.pedido_id                       AS id_pedido,
-    p.cliente,
+    COALESCE(p.cliente, v.cliente)    AS cliente,
+    COALESCE(p.cliente_id, v.cliente_id) AS cliente_id,
     v.created_at                      AS fecha,
     v.total,
-    p.pago                            AS metodo_pago,
-    p.tipo                            AS tipo_venta,
+    COALESCE(p.pago, v.metodo_pago)   AS metodo_pago,
+    COALESCE(p.tipo, v.tipo_venta)    AS tipo_venta,
     v.estado,
     p.mesa,
-    p.sede,
-    COALESCE(p.items, '[]'::jsonb)    AS productos
+    COALESCE(p.sede, v.sede)          AS sede,
+    COALESCE(p.items, v.items, '[]'::jsonb) AS productos,
+    -- Deja explícito si el pedido original todavía existe, para que la
+    -- pantalla sepa cuándo puede enlazar al detalle del pedido.
+    (p.id IS NOT NULL)                AS "pedidoDisponible",
+    -- Devolución asociada (relación directa venta → devolución). Una venta
+    -- tiene como MUCHO una (índice único devoluciones_venta_uidx).
+    d.id                              AS devolucion_id,
+    d.estado                          AS devolucion_estado,
+    (d.id IS NOT NULL)                AS "tieneDevolucion"
   FROM ventas v
   LEFT JOIN pedidos p ON v.pedido_id = p.id
+  LEFT JOIN devoluciones d ON d.venta_id = v.id
 `;
 // Filtro opcional por local (?sede=Local 1 / Local 2), igual que en
 // /pedidos: el cajero/bartender de un local solo debe ver sus propias
@@ -5887,7 +6297,12 @@ ventRouter.get('/', auth, async (req, res) => {
   if (errorRango) return res.status(400).json({ error: errorRango });
   const params = [];
   const conds = [];
-  if (sede) { params.push(sede); conds.push(`p.sede = $${params.length}`); }
+  // El filtro por local mira la sede del pedido O la que la venta guardó al
+  // registrarse. CAUSA RAÍZ del requisito 5: con `p.sede = $1` a secas, una
+  // venta cuyo pedido perdió la sede (o fue borrado) no coincidía con
+  // NINGÚN local y desaparecía de la pantalla del cajero — seguía en la
+  // tabla, pero era imposible verla desde donde se la busca.
+  if (sede) { params.push(sede); conds.push(`COALESCE(p.sede, v.sede) = $${params.length}`); }
   conds.push(...condicionRangoFechas('v.created_at', desde, hasta, params));
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(`${VENTA_SELECT} ${where} ORDER BY v.id DESC`, params);
@@ -5896,12 +6311,22 @@ ventRouter.get('/', auth, async (req, res) => {
 });
 ventRouter.get('/stats', auth, async (req, res) => {
   try {
+  // Mismo filtro opcional por local que el listado (antes no lo tenía: las
+  // estadísticas sumaban SIEMPRE las ventas de todos los locales, aunque
+  // la pantalla estuviera acotada a uno).
+  const { sede } = req.query;
+  const params = [];
+  let where = '';
+  if (sede) { params.push(sede); where = `WHERE COALESCE(p.sede, v.sede) = $1`; }
   const { rows } = await pool.query(
     `SELECT COUNT(*) as total,
-            COUNT(*) FILTER (WHERE estado='vendido')  as vendido,
-            COUNT(*) FILTER (WHERE estado='devuelto') as devuelto,
-            COALESCE(SUM(total) FILTER (WHERE estado='vendido'),0) as ingresos
-     FROM ventas`
+            COUNT(*) FILTER (WHERE v.estado='vendido')  as vendido,
+            COUNT(*) FILTER (WHERE v.estado='devuelto') as devuelto,
+            COALESCE(SUM(v.total) FILTER (WHERE v.estado='vendido'),0) as ingresos
+     FROM ventas v
+     LEFT JOIN pedidos p ON v.pedido_id = p.id
+     ${where}`,
+    params
   );
   res.json(rows[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -5940,11 +6365,25 @@ ventRouter.post('/desde-pedido', auth, async (req, res) => {
     res.status(r.yaExistia ? 200 : 201).json(avisoInv ? { ...full[0], avisoInventario: avisoInv } : full[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+// Estados reales de una venta. Antes esta ruta aceptaba CUALQUIER texto
+// ('Anulada', 'xyz', vacío) y lo guardaba tal cual — una venta con un
+// estado que ningún filtro reconoce es, en la práctica, una venta que
+// desaparece de todas las pantallas (requisito 5). Y si el id no existía,
+// respondía 200 con un cuerpo vacío en vez de 404.
+const ESTADOS_VENTA_VALIDOS = ['vendido', 'devuelto'];
 ventRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
-  const { estado } = req.body;
-  const { rows } = await pool.query('UPDATE ventas SET estado=$1 WHERE id=$2 RETURNING *', [estado, req.params.id]);
-  res.json(rows[0]);
+  const estado = String(req.body?.estado || '').trim().toLowerCase();
+  if (!ESTADOS_VENTA_VALIDOS.includes(estado)) {
+    return res.status(400).json({
+      error: `Estado de venta inválido. Los valores válidos son: ${ESTADOS_VENTA_VALIDOS.join(', ')}.`,
+      valoresValidos: ESTADOS_VENTA_VALIDOS,
+    });
+  }
+  const { rows } = await pool.query('UPDATE ventas SET estado=$1 WHERE id=$2 RETURNING id', [estado, req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Venta no encontrada' });
+  const { rows: full } = await pool.query(`${VENTA_SELECT} WHERE v.id=$1`, [rows[0].id]);
+  res.json(full[0]);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 r.use('/ventas', ventRouter);
@@ -5952,19 +6391,29 @@ r.use('/ventas', ventRouter);
 
 const devRouter = require('express').Router();
 
+// CAMBIO (requisito 4): la venta se toma de la RELACIÓN DIRECTA
+// d.venta_id, no de un JOIN adivinado por pedido. El JOIN viejo
+// (`ventas v ON v.pedido_id = d.pedido_id`) devolvía CUALQUIER venta de
+// ese pedido y no servía para exigir "una devolución por venta".
+// Se conserva un segundo JOIN por pedido solo como respaldo para las
+// devoluciones históricas que quedaron sin venta_id.
 const DEV_SELECT = `
   SELECT
     d.id,
     d.id                       AS id_dev,
     d.pedido_id,
-    p.cliente,
+    d.pedido_id                AS id_pedido,
+    COALESCE(p.cliente, ven.cliente)       AS cliente,
     -- cliente_id: sin esta columna el frontend no tenía a quién notificar
     -- cuando se aprueba o rechaza una devolución (notificacionesService
     -- descarta la notificación si no recibe clienteId). Es solo una columna
     -- más en el SELECT: no cambia ninguna fila ni ningún filtro existente.
-    p.cliente_id,
-    p.sede,
-    v.id                       AS id_venta,
+    COALESCE(p.cliente_id, ven.cliente_id) AS cliente_id,
+    COALESCE(p.sede, ven.sede)             AS sede,
+    COALESCE(d.venta_id, vlegacy.id)       AS venta_id,
+    COALESCE(d.venta_id, vlegacy.id)       AS id_venta,
+    COALESCE(ven.total, vlegacy.total)     AS total_venta,
+    COALESCE(ven.estado, vlegacy.estado)   AS estado_venta,
     d.motivo,
     d.motivo_rechazo,
     d.tipo,
@@ -5973,8 +6422,9 @@ const DEV_SELECT = `
     d.items                    AS productos_devueltos,
     d.created_at                AS fecha
   FROM devoluciones d
-  LEFT JOIN pedidos p ON d.pedido_id = p.id
-  LEFT JOIN ventas  v ON v.pedido_id = d.pedido_id
+  LEFT JOIN pedidos p   ON d.pedido_id = p.id
+  LEFT JOIN ventas  ven ON ven.id = d.venta_id
+  LEFT JOIN ventas  vlegacy ON d.venta_id IS NULL AND vlegacy.pedido_id = d.pedido_id
 `;
 // Mismo filtro opcional por local que /ventas (ver comentario arriba).
 devRouter.get('/', auth, async (req, res) => {
@@ -5982,9 +6432,41 @@ devRouter.get('/', auth, async (req, res) => {
   const { sede } = req.query;
   const params = [];
   let where = '';
-  if (sede) { params.push(sede); where = 'WHERE p.sede = $1'; }
+  // Igual que en /ventas: la sede sale del pedido O de la copia guardada en
+  // la venta, para que una devolución no desaparezca del filtro por local
+  // cuando el pedido ya no tiene sede.
+  if (sede) { params.push(sede); where = 'WHERE COALESCE(p.sede, ven.sede) = $1'; }
   const { rows } = await pool.query(`${DEV_SELECT} ${where} ORDER BY d.id DESC`, params);
   res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Consultar UNA devolución. No existía: el frontend solo podía traer la
+// lista completa y filtrarla en memoria, así que "consultar la devolución"
+// después de crearla no tenía endpoint propio.
+devRouter.get('/:id', auth, async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'ID de devolución inválido' });
+  try {
+    const { rows } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Devolución no encontrada' });
+    res.json(rows[0]);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// Devolución asociada a una venta — la consulta natural desde la pantalla
+// de Ventas ("¿esta venta ya tiene devolución?"), que antes exigía traer
+// TODAS las devoluciones y buscar a mano.
+devRouter.get('/por-venta/:ventaId', auth, async (req, res) => {
+  const ventaId = parseInt(req.params.ventaId);
+  if (isNaN(ventaId)) return res.status(400).json({ error: 'ID de venta inválido' });
+  try {
+    const { rows: venta } = await pool.query('SELECT id FROM ventas WHERE id=$1', [ventaId]);
+    if (!venta[0]) return res.status(404).json({ error: 'Venta no encontrada' });
+    const { rows } = await pool.query(`${DEV_SELECT} WHERE d.venta_id=$1`, [ventaId]);
+    res.json({
+      venta_id: ventaId,
+      tieneDevolucion: !!rows[0],
+      devolucion: rows[0] || null,
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 // Tope de 20 palabras en el motivo de la devolución — igual que ya exige la
@@ -6027,11 +6509,102 @@ const normalizarItemsSolicitados = (body) => {
   return [];
 };
 
+// Identificador de la VENTA o del PEDIDO tal como lo puede mandar cada
+// pantalla. CAUSA RAÍZ del requisito 4 ("las devoluciones no están pasando"):
+// esta ruta exigía literalmente `pedido_id` y respondía
+// `400 pedido_id es requerido` ante cualquier otro nombre. Pero la
+// devolución se hace DESDE la pantalla de Ventas, donde lo que hay a mano es
+// la venta — y el propio listado de ventas de esta API devuelve la clave como
+// `id_venta` (ver VENTA_SELECT), no como `pedido_id`. Es decir: el backend
+// pedía un dato que la pantalla que lo llama no tiene con ese nombre.
+// Ahora se acepta cualquiera de los dos, con los alias reales que usan las
+// pantallas, y el que falte se resuelve contra la base.
+const numeroOpcional = (v) => {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v === 'object') return numeroOpcional(v.id ?? v.id_venta ?? v.venta_id ?? v.pedido_id ?? v.id_pedido);
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+const identificadorVenta = (body) =>
+  numeroOpcional(body?.venta_id) ?? numeroOpcional(body?.id_venta) ??
+  numeroOpcional(body?.ventaId)  ?? numeroOpcional(body?.venta);
+const identificadorPedido = (body) =>
+  numeroOpcional(body?.pedido_id) ?? numeroOpcional(body?.id_pedido) ??
+  numeroOpcional(body?.pedidoId)  ?? numeroOpcional(body?.pedido);
+
 devRouter.post('/', auth, async (req, res) => {
   try {
 
-  const { pedido_id, monto, tipo } = req.body;
-  if (!pedido_id) return res.status(400).json({ error: 'pedido_id es requerido' });
+  const { monto, tipo } = req.body;
+
+  // ── 1. Resolver LA VENTA (y su pedido) ─────────────────────────────
+  // Una devolución es siempre la devolución de UNA VENTA. Se admite que
+  // llegue identificada por la venta (lo normal desde la pantalla de
+  // Ventas) o por el pedido (compatibilidad con lo que ya llamaba así).
+  let ventaId = identificadorVenta(req.body);
+  let pedido_id = identificadorPedido(req.body);
+
+  if (!ventaId && !pedido_id) {
+    return res.status(400).json({
+      error: 'Debes indicar de qué venta es la devolución (venta_id) o, en su defecto, de qué pedido (pedido_id).',
+      motivo: 'falta_identificador',
+      camposAceptados: ['venta_id', 'id_venta', 'pedido_id', 'id_pedido'],
+    });
+  }
+
+  let venta = null;
+  if (ventaId) {
+    const { rows } = await pool.query('SELECT id, pedido_id, total, estado FROM ventas WHERE id=$1', [ventaId]);
+    if (!rows[0]) return res.status(404).json({ error: `No existe la venta #${ventaId}.`, motivo: 'venta_no_encontrada' });
+    venta = rows[0];
+    // Si mandaron los dos y no concuerdan, es un error del cliente que hay
+    // que decir en voz alta — no elegir uno en silencio.
+    if (pedido_id && venta.pedido_id && Number(venta.pedido_id) !== Number(pedido_id)) {
+      return res.status(400).json({
+        error: `La venta #${ventaId} no corresponde al pedido #${pedido_id}.`,
+        motivo: 'venta_y_pedido_no_coinciden',
+      });
+    }
+    pedido_id = venta.pedido_id ?? pedido_id;
+  } else {
+    // Llegó solo el pedido: se busca SU venta. Sin venta registrada no hay
+    // nada que devolver — antes esto no se revisaba y se creaba una
+    // devolución colgando de un pedido que nunca llegó a venderse.
+    const { rows } = await pool.query(
+      'SELECT id, pedido_id, total, estado FROM ventas WHERE pedido_id=$1 ORDER BY id ASC LIMIT 1', [pedido_id]
+    );
+    venta = rows[0] || null;
+    if (!venta) {
+      const { rows: ped } = await pool.query('SELECT id, estado FROM pedidos WHERE id=$1', [pedido_id]);
+      if (!ped[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
+      return res.status(409).json({
+        error: `El pedido #${pedido_id} todavía no tiene una venta registrada (está "${ped[0].estado}"), así que no se le puede registrar una devolución. La venta se registra al marcarlo como entregado.`,
+        motivo: 'pedido_sin_venta',
+        estadoPedido: ped[0].estado,
+      });
+    }
+    ventaId = venta.id;
+  }
+
+  // ── 2. REGLA: una venta solo puede tener UNA devolución ─────────────
+  // Se revisa antes de validar el resto para dar el mensaje correcto de
+  // una (y el índice único devoluciones_venta_uidx lo garantiza además a
+  // nivel de base de datos, por si dos peticiones llegan a la vez).
+  const { rows: yaHay } = await pool.query(
+    `SELECT id, estado, created_at FROM devoluciones WHERE venta_id=$1 LIMIT 1`, [ventaId]
+  );
+  if (yaHay[0]) {
+    return res.status(409).json({
+      error: `La venta #${ventaId} ya tiene una devolución registrada (devolución #${yaHay[0].id}, estado "${yaHay[0].estado}"). Una venta solo puede tener una devolución.`,
+      motivo: 'devolucion_ya_existe',
+      devolucionExistente: {
+        id: yaHay[0].id,
+        estado: yaHay[0].estado,
+        fecha: yaHay[0].created_at,
+      },
+      venta_id: ventaId,
+    });
+  }
 
   const motivoLimpio = textoLimpio(req.body.motivo);
   if (!motivoLimpio) {
@@ -6055,9 +6628,26 @@ devRouter.post('/', auth, async (req, res) => {
   // la fuente de verdad de qué y cuánto se compró en este pedido), así un
   // cliente no puede inventar un producto que no estaba en el pedido ni
   // pedir devolver más unidades de las que realmente compró.
-  const { rows: pedidoRows } = await pool.query('SELECT id, items FROM pedidos WHERE id=$1', [pedido_id]);
-  if (!pedidoRows[0]) return res.status(404).json({ error: 'Pedido no encontrado' });
-  const pedidoItems = Array.isArray(pedidoRows[0].items) ? pedidoRows[0].items : [];
+  //
+  // Respaldo: si el pedido ya no está (se borró antes de que existiera el
+  // candado de DELETE /pedidos/:id), se usan los items que la propia VENTA
+  // guardó al registrarse. Antes, ese caso daba "Pedido no encontrado" y la
+  // devolución de una venta real se volvía imposible.
+  let pedidoItems = [];
+  if (pedido_id) {
+    const { rows: pedidoRows } = await pool.query('SELECT id, items FROM pedidos WHERE id=$1', [pedido_id]);
+    if (pedidoRows[0]) pedidoItems = Array.isArray(pedidoRows[0].items) ? pedidoRows[0].items : [];
+  }
+  if (pedidoItems.length === 0) {
+    const { rows: ventaItems } = await pool.query('SELECT items FROM ventas WHERE id=$1', [ventaId]);
+    if (Array.isArray(ventaItems[0]?.items)) pedidoItems = ventaItems[0].items;
+  }
+  if (pedidoItems.length === 0) {
+    return res.status(409).json({
+      error: `No hay productos registrados en la venta #${ventaId} contra los cuales validar la devolución.`,
+      motivo: 'venta_sin_items',
+    });
+  }
 
   const itemsResueltos = [];
   const acumuladoPorId = new Map(); // suma lo pedido en ESTA devolución por identificador, para el tope de "no exceder lo comprado" cuando el mismo producto aparece más de una vez en la solicitud
@@ -6125,24 +6715,73 @@ devRouter.post('/', auth, async (req, res) => {
     });
   }
 
-  const { rows } = await pool.query(
-    // El default de la columna quedó en 'Pendiente' (con mayúscula) pero
-    // todo el frontend compara contra 'pendiente' en minúscula; sin este
-    // INSERT explícito la devolución recién creada no coincidía con
-    // ningún filtro ni mostraba los botones de aprobar/rechazar.
-    `INSERT INTO devoluciones(pedido_id,motivo,monto,items,tipo,estado)
-     VALUES($1,$2,$3,$4,$5,'pendiente') RETURNING id`,
-    [pedido_id, motivo, monto || 0, JSON.stringify(itemsResueltos), tipo || (itemsResueltos.length > 1 ? 'parcial' : 'total')]
+  // El monto: si no lo mandan, se calcula desde las líneas devueltas
+  // (precio × cantidad) en vez de guardar 0. Un monto en 0 hacía que la
+  // devolución quedara registrada sin valor y no cuadrara con la venta.
+  const montoCalculado = itemsResueltos.reduce(
+    (suma, it) => suma + (Number(it.precio) || 0) * (Number(it.cantidad) || 0), 0
   );
-  const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [rows[0].id]);
+  const montoFinal = (monto !== undefined && monto !== null && monto !== '' && Number(monto) > 0)
+    ? Number(monto)
+    : montoCalculado;
+
+  let creada;
+  try {
+    const { rows } = await pool.query(
+      // El default de la columna quedó en 'Pendiente' (con mayúscula) pero
+      // todo el frontend compara contra 'pendiente' en minúscula; sin este
+      // INSERT explícito la devolución recién creada no coincidía con
+      // ningún filtro ni mostraba los botones de aprobar/rechazar.
+      //
+      // venta_id: relación DIRECTA con la venta original (requisito 4). Se
+      // guarda junto a pedido_id — los dos, porque la venta es el registro
+      // financiero y el pedido es de dónde salen los productos devueltos.
+      `INSERT INTO devoluciones(pedido_id,venta_id,motivo,monto,items,tipo,estado)
+       VALUES($1,$2,$3,$4,$5,$6,'pendiente') RETURNING id`,
+      [
+        pedido_id, ventaId, motivo, montoFinal,
+        JSON.stringify(itemsResueltos),
+        tipo || (itemsResueltos.length > 1 ? 'parcial' : 'total'),
+      ]
+    );
+    creada = rows[0];
+  } catch (e) {
+    // 23505 = violación del índice único devoluciones_venta_uidx. Es la
+    // carrera real: dos peticiones simultáneas pasaron las dos el chequeo
+    // del paso 2. Se responde igual que ese chequeo, nunca con un 500.
+    if (e.code === '23505') {
+      const { rows: existente } = await pool.query(
+        `SELECT id, estado FROM devoluciones WHERE venta_id=$1 LIMIT 1`, [ventaId]
+      );
+      return res.status(409).json({
+        error: `La venta #${ventaId} ya tiene una devolución registrada${existente[0] ? ` (devolución #${existente[0].id})` : ''}. Una venta solo puede tener una devolución.`,
+        motivo: 'devolucion_ya_existe',
+        devolucionExistente: existente[0] || null,
+        venta_id: ventaId,
+      });
+    }
+    throw e;
+  }
+
+  // Se responde con la devolución YA LEÍDA DE LA BASE (no con lo que se
+  // mandó): así la respuesta 201 es prueba de que quedó persistida de
+  // verdad, no un eco del body.
+  const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [creada.id]);
   res.status(201).json(full[0]);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('💥 POST /devoluciones:', e);
+    res.status(500).json({ error: 'No se pudo registrar la devolución. Intenta de nuevo.' });
+  }
 });
 devRouter.patch('/:id/estado', auth, async (req, res) => {
   try {
-  const estado = (req.body.estado || '').toLowerCase();
-  if (!['pendiente','aprobada','rechazada'].includes(estado)) {
-    return res.status(400).json({ error: 'Estado inválido' });
+  const estado = String(req.body?.estado || '').trim().toLowerCase();
+  const ESTADOS_DEVOLUCION = ['pendiente', 'aprobada', 'rechazada'];
+  if (!ESTADOS_DEVOLUCION.includes(estado)) {
+    return res.status(400).json({
+      error: `Estado de devolución inválido. Los valores válidos son: ${ESTADOS_DEVOLUCION.join(', ')}.`,
+      valoresValidos: ESTADOS_DEVOLUCION,
+    });
   }
 
   // Rechazar SIEMPRE exige un motivo. Antes el rechazo solo cambiaba el
@@ -6177,17 +6816,37 @@ devRouter.patch('/:id/estado', auth, async (req, res) => {
   // una venta real. Se recalcula siempre (no solo al aprobar): rechazar o
   // reabrir una devolución que hacía que el total quedara cubierto debe
   // poder devolver la venta a 'vendido' otra vez.
-  if (rows[0].pedido_id) {
-    const { rows: pedidoRows } = await pool.query('SELECT items FROM pedidos WHERE id=$1', [rows[0].pedido_id]);
-    const pedidoItems = Array.isArray(pedidoRows[0]?.items) ? pedidoRows[0].items : [];
-    const { rows: devsAprobadas } = await pool.query(
-      `SELECT items FROM devoluciones WHERE pedido_id=$1 AND estado='aprobada'`, [rows[0].pedido_id]
-    );
+  // La venta a actualizar se toma de la RELACIÓN DIRECTA (venta_id). Antes
+  // se hacía `UPDATE ventas ... WHERE pedido_id = $` — que tocaba
+  // CUALQUIER venta de ese pedido, sin saber cuál. Con venta_id el vínculo
+  // es explícito. Se conserva el camino por pedido solo como respaldo para
+  // devoluciones históricas creadas antes de que existiera la columna.
+  const ventaIdDev = rows[0].venta_id ?? null;
+  if (ventaIdDev || rows[0].pedido_id) {
+    // Items contra los que se mide "¿se devolvió todo?": los del pedido si
+    // sigue existiendo, o la copia que guardó la venta.
+    let pedidoItems = [];
+    if (rows[0].pedido_id) {
+      const { rows: pedidoRows } = await pool.query('SELECT items FROM pedidos WHERE id=$1', [rows[0].pedido_id]);
+      pedidoItems = Array.isArray(pedidoRows[0]?.items) ? pedidoRows[0].items : [];
+    }
+    if (pedidoItems.length === 0 && ventaIdDev) {
+      const { rows: ventaRows } = await pool.query('SELECT items FROM ventas WHERE id=$1', [ventaIdDev]);
+      pedidoItems = Array.isArray(ventaRows[0]?.items) ? ventaRows[0].items : [];
+    }
+    const { rows: devsAprobadas } = ventaIdDev
+      ? await pool.query(`SELECT items FROM devoluciones WHERE venta_id=$1 AND estado='aprobada'`, [ventaIdDev])
+      : await pool.query(`SELECT items FROM devoluciones WHERE pedido_id=$1 AND estado='aprobada'`, [rows[0].pedido_id]);
     const { estado_devolucion } = calcularEstadoDevolucion(pedidoItems, devsAprobadas);
-    await pool.query(
-      'UPDATE ventas SET estado=$1 WHERE pedido_id=$2',
-      [estado_devolucion === 'total' ? 'devuelto' : 'vendido', rows[0].pedido_id]
-    );
+    const nuevoEstadoVenta = estado_devolucion === 'total' ? 'devuelto' : 'vendido';
+    // La venta NUNCA se borra: solo cambia de estado. Sigue consultable en
+    // /ventas y /ventas/:id con toda su información (requisito 4: "La venta
+    // original debe permanecer registrada aunque tenga una devolución").
+    if (ventaIdDev) {
+      await pool.query('UPDATE ventas SET estado=$1 WHERE id=$2', [nuevoEstadoVenta, ventaIdDev]);
+    } else {
+      await pool.query('UPDATE ventas SET estado=$1 WHERE pedido_id=$2', [nuevoEstadoVenta, rows[0].pedido_id]);
+    }
   }
 
   const { rows: full } = await pool.query(`${DEV_SELECT} WHERE d.id=$1`, [rows[0].id]);
