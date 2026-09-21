@@ -8,3 +8,4 @@ node_modules/
 # Respaldos de datos reales generados por migraciones de baja (ver
 # config/db.js) — contienen PII de clientes, nunca deben versionarse.
 /respaldo-migraciones/
+toques *
